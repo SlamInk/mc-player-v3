@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<title>MC Player — 极简黑白</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #f0eee9; font-family: "Segoe UI", system-ui, sans-serif; }
+  #root { height: 100vh; }
+</style>
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" src="design-canvas.jsx"></script>
+<script type="text/babel" src="app.jsx"></script>
+<script type="text/babel" src="direction-c.jsx"></script>
+<script type="text/babel" data-presets="env,react">
+const W = 1120, H = 720;
+const frame = (node) => <Win11Frame>{node}</Win11Frame>;
+
+function App() {
+  return (
+    <DesignCanvas>
+      <DCSection id="intro" title="MC Player · Windows 超低延时播放器"
+        subtitle="黑白极简 · 极值性能 · 零噪声 · Win10/11 x64">
+      </DCSection>
+
+      <DCSection id="mono" title="极简黑白" subtitle="Pure monochrome · the number IS the brand">
+        <DCArtboard id="m-empty"      label="01 · 就绪"       width={W} height={H}>{frame(<CEmpty/>)}</DCArtboard>
+        <DCArtboard id="m-connecting" label="02 · 连接中"     width={W} height={H}>{frame(<CConnecting/>)}</DCArtboard>
+        <DCArtboard id="m-playing"    label="03 · 播放中"     width={W} height={H}>{frame(<CPlaying/>)}</DCArtboard>
+        <DCArtboard id="m-stats"      label="04 · 详情面板"   width={W} height={H}>{frame(<CPlaying showStats/>)}</DCArtboard>
+        <DCArtboard id="m-error"      label="05 · 连接失败"   width={W} height={H}>{frame(<CError/>)}</DCArtboard>
+        <DCArtboard id="m-add"        label="06 · 添加流"     width={W} height={H}>{frame(<CAddModal/>)}</DCArtboard>
+      </DCSection>
+    </DesignCanvas>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
+</script>
+</body>
+</html>

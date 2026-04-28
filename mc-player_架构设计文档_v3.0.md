@@ -605,6 +605,8 @@ DCOMP 多 visual + ALLOW_TEARING + freeze last frame + 设备/显示器切换共
 
 shader 内查表选 YUV→RGB 矩阵；range 由 shader 内 unscale。`color_meta_known` bit（§5.13）在三级中任一级锁定后置位，否则该帧由 Frame Validity Gate 丢弃。
 
+**HDR transfer 当前行为（PQ / HLG，v1 不做 tone mapping）**：检出 `transfer_characteristics ∈ {16, 18}` 时按 BT.2020 矩阵解 YUV→RGB（避免色度旋转错误），但 EOTF 留作线性近似不做 PQ/HLG → SDR 的 tone mapping，输出在 SDR 显示器上整体偏暗、亮部细节压缩；不拒绝该流，保证可见。stats 暴露 `hdr_downgrade=true` + 实际 transfer 编号，用户可感知该流需要后续 HDR milestone 才能正确显示。HDR 输出（Independent Flip + scRGB / HDR10）整体留 milestone，与 §5.10 渲染档位升级同步推进。
+
 ### 5.13 Frame Validity Gate（输出门控）
 
 Codec 与 Render 之间的协议无关闸门。所有花屏预防机制（refs / GDR anchor / VUI / B 帧 reorder / dual-bind fence）的执行点收口于此，避免散落在多个模块各自 freeze 各自兜底导致竞态。
@@ -622,9 +624,28 @@ Codec 与 Render 之间的协议无关闸门。所有花屏预防机制（refs /
 
 **判定**：所有 bit set → emit 给 §5.10 renderer；任一 bit 0 → 丢帧 + 保留 last-good，不推进视频 PTS（音频时钟独立前进）。
 
+**状态生命周期与污染传播**：bit 不是孤立的 per-frame 标志，而是分两类生命周期：
+
+- **Stream 级（一次锁定后常驻）**：`color_meta_known`。VUI 自洽 / 启发式 / 用户覆盖三级中任一锁定后整流稳定，仅在分辨率变化或 SPS 重协商时重评。
+- **Frame 级 + 污染传播**：`refs_resolved` / `params_present` / `recovery_complete` / `reorder_resolved` / `gpu_fence_signaled`。这五个 bit 共享同一污染规则——**任一参考链断裂事件触发后，所有后续帧默认 invalid，直至下一 refresh anchor（§5.5.3）才解除**。
+
+污染源（任一触发即进入污染态）：
+
+- depack 检出 sequence number gap 命中参考帧 / FrameNum gap > 0 / POC 不连续（mc-libcodec §5.7.3 路径）。
+- MFT sample 携带 decode error flag 或 ProcessOutput 返回 FAILED（§5.6.5）。
+- Device Lost 全恢复（§7.2.2），所有 outstanding 帧旧 fence 失效。
+- 跨屏 soft adapter switch（§7.3.3）过渡中提交的帧。
+- ResizeBuffers 前未完成的 in-flight 帧。
+
+恢复点（**唯一统一入口**）：refresh anchor 的 `recovery_complete` bit 在 depack 层置位 —— IDR / IRAP 或 `recovery_point SEI && recovery_frame_cnt == 0`。anchor 帧自身要求其他 frame 级 bit 也独立 set 才 emit，并不因为是 anchor 就豁免 fence 或 reorder 校验。anchor emit 之后，污染态才解除，后续 P/B 帧按各自 bit 独立判定。
+
+> 反例：把"参考帧丢就 freeze 一帧再继续"作为兜底是花屏常见根因——非 anchor 的 P 帧无论间隔多远都不解污染。GDR 流尤其敏感，refresh window 内的 P 帧必须保持 invalid 直到 `recovery_frame_cnt` 计到 0。
+
+bit 之间的隐含偏序：`refs_resolved` 是 `reorder_resolved` 的前置（reorder 排序前提是 ref 链完整）；其他 bit 互相独立。Gate 实现不依赖该偏序，五个 frame 级 bit 平等 AND；偏序仅用于诊断 stats 输出"哪个 bit 先丢"以定位根因。
+
 **与延时的折中**：错误恢复 / 首帧 / VUI 缺失场景下会多 freeze 1~3 帧。这是文档级明文权衡——**正确性优先于延时**（§2 设计原则 #12），延时让位于"画面不出错"。
 
-**统计**：每个 bit 累计 drop 计数 + 最近一次 drop 的帧 PTS，由 stats 暴露，用于诊断"为什么这一帧没显示"。
+**统计**：每个 bit 累计 drop 计数 + 最近一次 drop 的帧 PTS + 当前是否处于污染态 + 最近一次进入污染的触发源，由 stats 暴露，用于诊断"为什么这一帧没显示"以及"还要等多久才解 freeze"。
 
 ### 5.14 平台抽象层（PAL）
 
@@ -805,6 +826,7 @@ Win10/11 retail 默认无 HEVC Video Extension。检测到 HEVC MFT 枚举为空
 | Intel UHD 730（ADL，12 代+） | HW ✓ | HW ✓ | HW ✓ | HW ✓ | HW ✓ | HW ✓ |
 | Intel UHD 770（ADL，12 代+） | HW ✓ | HW ✓ | HW ✓ | HW ✓ | HW ✓ | HW ✓ |
 | Intel Iris Xe（TGL，11 代）★ | HW ✓ | HW ✓ | HW ✓ | HW ✓ | HW ✓ | HW ✓ |
+| Intel Arc Alchemist / Battlemage（A380/A750/A770/B580） | HW ✓ | HW ✓ | HW ✓ | HW ✓ | HW ✓ | HW ✓ |
 | AMD Vega 8/11（Ryzen APU） | HW ✓ | HW ✓ | HW ✓ | HW ✓ | HW ✓ | ✗ |
 | AMD Radeon 660M+（Rembrandt APU，2022-01） | HW ✓ | HW ✓ | HW ✓ | HW ✓ | HW ✓ | HW ✓（APU 维度首代 AV1；dGPU 维度 Navi 21 / RX 6000，2020-11，VCN 3.0 在前） |
 | NVIDIA GTX 1050（Pascal） | HW ✓ | HW ✓ | HW ✓ | HW ✓ | HW ✓ | ✗ |

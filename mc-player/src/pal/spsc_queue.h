@@ -1,0 +1,94 @@
+/*
+ * 单生产单消费 (SPSC) 无锁环形队列。
+ *
+ * ADD §6.1 强约束：
+ *   - cache-line padding 必做（false-sharing 性能降 3-5×）
+ *   - 深度极低；满时丢最老（由 caller 决定丢弃策略，本队列只暴露 try_push 失败信号）
+ *
+ * 设计：经典 single-producer / single-consumer 环形缓冲，head/tail 各占一个 cache line。
+ * 容量必须是 2 的幂（取模优化）。
+ */
+
+#ifndef MC_PLAYER_PAL_SPSC_QUEUE_H_
+#define MC_PLAYER_PAL_SPSC_QUEUE_H_
+
+#include <atomic>
+#include <bit>
+#include <cassert>
+#include <cstddef>
+#include <type_traits>
+#include <utility>
+#include <vector>
+
+#include "pal/cache_line.h"
+
+namespace mcp::pal {
+
+template <typename T>
+class SpscQueue {
+    static_assert(std::is_nothrow_move_constructible_v<T> || std::is_nothrow_copy_constructible_v<T>,
+                  "SpscQueue<T> requires nothrow movable or copyable element type");
+
+public:
+    explicit SpscQueue(std::size_t capacity_pow2)
+        : capacity_{capacity_pow2}, mask_{capacity_pow2 - 1}, slots_(capacity_pow2) {
+        assert(capacity_pow2 >= 2 && std::has_single_bit(capacity_pow2) &&
+               "SpscQueue capacity must be a power of two and >= 2");
+    }
+
+    SpscQueue(const SpscQueue&)            = delete;
+    SpscQueue& operator=(const SpscQueue&) = delete;
+
+    /// 仅生产者线程调用。
+    template <typename U>
+    bool try_push(U&& value) noexcept(std::is_nothrow_assignable_v<T&, U&&>) {
+        const std::size_t head = head_.load(std::memory_order_relaxed);
+        const std::size_t next = head + 1;
+        if (next - tail_.load(std::memory_order_acquire) > capacity_) {
+            return false;  // full
+        }
+        slots_[head & mask_] = std::forward<U>(value);
+        head_.store(next, std::memory_order_release);
+        return true;
+    }
+
+    /// 仅消费者线程调用。
+    bool try_pop(T& out) noexcept(std::is_nothrow_move_assignable_v<T>) {
+        const std::size_t tail = tail_.load(std::memory_order_relaxed);
+        if (tail == head_.load(std::memory_order_acquire)) {
+            return false;  // empty
+        }
+        out = std::move(slots_[tail & mask_]);
+        tail_.store(tail + 1, std::memory_order_release);
+        return true;
+    }
+
+    /// 仅消费者线程调用——丢最老一项。返回是否丢弃成功。
+    bool try_drop_oldest() noexcept {
+        T sink{};
+        return try_pop(sink);
+    }
+
+    /// 任意线程调用，返回近似值（仅诊断用）。
+    [[nodiscard]] std::size_t approx_size() const noexcept {
+        const std::size_t head = head_.load(std::memory_order_acquire);
+        const std::size_t tail = tail_.load(std::memory_order_acquire);
+        return head - tail;
+    }
+
+    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
+
+private:
+    const std::size_t capacity_;
+    const std::size_t mask_;
+    std::vector<T>    slots_;
+
+    alignas(kCacheLineSize) std::atomic<std::size_t> head_{0};
+    alignas(kCacheLineSize) std::atomic<std::size_t> tail_{0};
+    // 用末尾 padding 占据剩余 cache line，确保下一个 SpscQueue / 邻接结构独立。
+    char pad_tail_[kCacheLineSize - sizeof(std::atomic<std::size_t>)]{};
+};
+
+}  // namespace mcp::pal
+
+#endif  // MC_PLAYER_PAL_SPSC_QUEUE_H_

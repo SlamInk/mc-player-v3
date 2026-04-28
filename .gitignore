@@ -1,0 +1,35 @@
+# Build artifacts
+build/
+out/
+.vs/
+.vscode/
+CMakeUserPresets.json
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.exp
+*.lib
+*.pdb
+*.idb
+*.ilk
+*.obj
+*.exe
+*.dll
+
+# IDE
+*.user
+*.suo
+*.userprefs
+
+# UI prototype state sidecar (per CLAUDE.md it is a runtime persistence file)
+mc-player-ui-ux/.design-canvas.state.json
+
+# Runtime artifacts
+mc-player.log
+mc-player-dump.h264
+mc-player-dump.h265
+
+# OS noise
+Thumbs.db
+desktop.ini
+.DS_Store

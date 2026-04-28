@@ -1,0 +1,68 @@
+/*
+ * H.265 Depacketizer — RFC 7798。
+ *
+ * NAL header 是 2 字节（F(1) + Type(6) + LayerId(6) + TID(3) = 16 bits）。
+ * FU 重组与 H.264 区别：FU 携带 1B FU header，重组时前置 2B 重建 NAL header；
+ * 必须保留 LayerId/TID，按 FU header 内的 type 字段重组 Type 域。
+ *
+ * NAL Type 归属（ITU-T H.265 Table 7-1）：
+ *   0-40: ITU-T 定义；41-47: 保留；48-63: unspecified。
+ *   RFC 7798 占用 48 (AP) / 49 (FU) / 50 (PACI)。本模块不支持 50。
+ *
+ * Refresh anchor：IDR_W_RADL(19) / IDR_N_LP(20) / CRA_NUT(21) / BLA_W_LP(16) / BLA_W_RADL(17) / BLA_N_LP(18)
+ * 视为 IRAP；recovery_point SEI(prefix 39) 含 recovery_frame_cnt==0 也视为 anchor。
+ */
+
+#ifndef MC_PLAYER_MEDIA_DEPACK_H265_H_
+#define MC_PLAYER_MEDIA_DEPACK_H265_H_
+
+#include <cstdint>
+#include <functional>
+#include <span>
+#include <string_view>
+#include <vector>
+
+namespace mcp::media {
+
+struct H265AccessUnit {
+    int64_t              pts_us           = 0;
+    std::vector<uint8_t> annexb_bytes;
+    bool                 has_irap         = false;
+    bool                 has_recovery_sei = false;
+    bool                 refs_lost        = false;
+    bool                 params_present   = false;
+};
+
+class DepackH265 {
+public:
+    using EmitFn = std::function<void(H265AccessUnit&&)>;
+    explicit DepackH265(EmitFn emit) noexcept;
+
+    /// SDP fmtp sprop-vps / sprop-sps / sprop-pps 任一三个分别注入（base64）。
+    void set_sprop_vps(std::string_view base64) noexcept;
+    void set_sprop_sps(std::string_view base64) noexcept;
+    void set_sprop_pps(std::string_view base64) noexcept;
+
+    void on_rtp(int64_t pts_us, bool marker, std::span<const uint8_t> payload) noexcept;
+    void mark_reference_lost() noexcept;
+    void reset() noexcept;
+
+private:
+    void emit_au(int64_t pts_us, bool with_extradata) noexcept;
+
+    EmitFn               emit_;
+    std::vector<uint8_t> vps_, sps_, pps_;
+    std::vector<uint8_t> au_buffer_;
+    std::vector<uint8_t> fu_buffer_;
+    bool                 fu_in_progress_     = false;
+    bool                 saw_irap_in_au_     = false;
+    bool                 saw_recovery_in_au_ = false;
+    bool                 refs_lost_          = true;
+    int64_t              current_pts_us_     = 0;
+    uint8_t              fu_layer_id_        = 0;
+    uint8_t              fu_tid_             = 0;
+};
+
+}  // namespace mcp::media
+
+#endif  // MC_PLAYER_MEDIA_DEPACK_H265_H_
