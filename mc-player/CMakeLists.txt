@@ -79,6 +79,8 @@ set(MCP_MEDIA_SOURCES
     src/media/codec_dxva_video.cpp
     src/media/codec_mft_audio.h
     src/media/codec_mft_audio.cpp
+    src/media/codec_g711.h
+    src/media/codec_g711.cpp
     src/media/color_meta.h
     src/media/color_meta.cpp
     src/media/frame_validity_gate.h

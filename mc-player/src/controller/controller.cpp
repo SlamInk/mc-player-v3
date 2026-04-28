@@ -16,6 +16,7 @@
 #include "controller/adapter_picker.h"
 #include "media/audio_render_wasapi.h"
 #include "media/codec_dxva_video.h"
+#include "media/codec_g711.h"
 #include "media/codec_libcodec.h"
 #include "media/codec_mft_audio.h"
 #include "media/codec_mft_video.h"
@@ -295,13 +296,35 @@ struct Controller::Impl {
         audio_clock_rate = rt.clock_rate_hz;
         audio_channels   = rt.channels ? rt.channels : 1;
 
-        if (audio_codec != MC_AUDIO_CODEC_AAC) {
+        if (audio_codec != MC_AUDIO_CODEC_AAC &&
+            audio_codec != MC_AUDIO_CODEC_G711_ALAW &&
+            audio_codec != MC_AUDIO_CODEC_G711_ULAW) {
             MCP_LOGF(pal::LogLevel::warn,
                      "Controller: audio codec '%s' not implemented in v1; skip audio render",
                      rt.codec_name.c_str());
             return MC_OK;
         }
 
+        // 渲染端先起，不论 codec 路径，避免后面 setup 失败时漏 cleanup。
+        audio_render = std::make_unique<media::AudioRenderWasapi>();
+        if (mc_status_t s = audio_render->start(audio_clock_rate, audio_channels); s != MC_OK) {
+            MCP_LOGF(pal::LogLevel::warn,
+                     "Controller: audio render start failed status=%d (silent playback)",
+                     static_cast<int>(s));
+            audio_render.reset();
+            return MC_OK;     // 视频继续，无声不阻塞
+        }
+
+        if (audio_codec == MC_AUDIO_CODEC_G711_ALAW || audio_codec == MC_AUDIO_CODEC_G711_ULAW) {
+            // G.711 走 LUT，无 depack / MFT；on_rtp 直接喂解码。
+            MCP_LOGF(pal::LogLevel::info,
+                     "Controller: audio pipeline ready (G.711 %s %u Hz / %u ch LUT)",
+                     audio_codec == MC_AUDIO_CODEC_G711_ALAW ? "A-law" : "u-law",
+                     audio_clock_rate, audio_channels);
+            return MC_OK;
+        }
+
+        // —— AAC 路径 —————————————————————————————————————
         // fmtp: config=hex / sizelength / indexlength。
         std::string asc_hex;
         uint32_t size_len = 13, index_len = 3;
@@ -311,15 +334,6 @@ struct Controller::Impl {
                 size_len = static_cast<uint32_t>(std::strtoul(it->second.c_str(), nullptr, 10));
             if (auto it = fmtp.params.find("indexlength"); it != fmtp.params.end())
                 index_len = static_cast<uint32_t>(std::strtoul(it->second.c_str(), nullptr, 10));
-        }
-
-        audio_render = std::make_unique<media::AudioRenderWasapi>();
-        if (mc_status_t s = audio_render->start(audio_clock_rate, audio_channels); s != MC_OK) {
-            MCP_LOGF(pal::LogLevel::warn,
-                     "Controller: audio render start failed status=%d (silent playback)",
-                     static_cast<int>(s));
-            audio_render.reset();
-            return MC_OK;     // 视频继续，无声不阻塞
         }
 
         media::CodecMftAudio::Config acfg;
@@ -589,9 +603,25 @@ struct Controller::Impl {
                          static_cast<unsigned long long>(cnt),
                          dg.bytes.size(), marker ? 1 : 0);
             }
-            if (!depack_aac || audio_clock_rate == 0) return;
+            if (audio_clock_rate == 0) return;
             const int64_t pts_us = static_cast<int64_t>(ts) * 1'000'000 / audio_clock_rate;
-            depack_aac->on_rtp(pts_us, payload);
+
+            if (audio_codec == MC_AUDIO_CODEC_G711_ALAW ||
+                audio_codec == MC_AUDIO_CODEC_G711_ULAW) {
+                if (!audio_render) return;
+                media::AudioFrame af;
+                af.pts_us         = pts_us;
+                af.sample_rate_hz = audio_clock_rate;
+                af.channels       = audio_channels;
+                if (audio_codec == MC_AUDIO_CODEC_G711_ALAW) {
+                    media::g711_alaw_decode(payload, af.pcm_interleaved);
+                } else {
+                    media::g711_ulaw_decode(payload, af.pcm_interleaved);
+                }
+                audio_render->submit(std::move(af));
+            } else if (depack_aac) {
+                depack_aac->on_rtp(pts_us, payload);
+            }
         }
     }
 
