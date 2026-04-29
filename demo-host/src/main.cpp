@@ -39,8 +39,9 @@ constexpr int     kInitWidth        = 1280;
 constexpr int     kInitHeight       = 720;
 
 // v1 默认 RTSP URL — 用户提供的测试摄像头。可通过 argv / 环境变量 MCP_DEFAULT_RTSP_URL 覆盖。
-constexpr char    kBuiltinDefaultUrl[] =
-    "rtsp://admin:qwerasdf1@192.168.1.110:554/h264/ch1/main/av_stream";
+// constexpr char    kBuiltinDefaultUrl[] =
+//     "rtsp://admin:qwerasdf1@192.168.1.110:554/h264/ch1/main/av_stream";
+constexpr char    kBuiltinDefaultUrl[] ="rtsp://192.168.1.171/live/11";
 
 std::atomic<mc_state_t> g_last_state{MC_STATE_IDLE};
 FILE*                   g_log_file = nullptr;
