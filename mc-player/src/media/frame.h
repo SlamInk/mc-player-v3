@@ -53,6 +53,11 @@ struct VideoFrame {
     uint32_t                                dxva_array_slice    = 0;
     Microsoft::WRL::ComPtr<ID3D11Fence>     dxva_fence;                    // dual-bind fence
     uint64_t                                dxva_fence_value    = 0;
+    /// 真零拷贝路径（P0-1 fast path）：MFT 自分配 sample 直接透给 render 时，
+    /// 持 IMFSample 引用阻止 MFT internal pool recycle 该 slice。Render 释放
+    /// frame → ComPtr 减引用 → MFT 可 recycle。slow path / DXVA-direct / libcodec
+    /// 路径下保持 nullptr。用 IUnknown 避让 frame.h 暴露 IMFSample 头依赖。
+    Microsoft::WRL::ComPtr<IUnknown>        mft_sample;
 
     std::vector<uint8_t>                    nv12_ram;                       // 软解路径 (Y+UV interleaved)
     uint32_t                                nv12_y_stride       = 0;

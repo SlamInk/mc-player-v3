@@ -119,6 +119,17 @@ struct CodecMftVideo::Impl {
     DWORD                           output_sample_align = 0;
     bool                            sync_streaming_started = false;
 
+    // P0-1 真零拷贝（fast path）：MFT sample 直接喂 render，省去 SR-only 私有 pool 的
+    // CopySubresourceRegion blit (~0.1-0.2 ms/帧)。runtime 决定是否启用：
+    //   1) startup hint   — SetUINT32(MF_SA_D3D11_BINDFLAGS, BIND_DECODER|BIND_SHADER_RESOURCE)
+    //                        告诉 MFT 内部 sample pool 创建带 SR bind 的 texture（driver 可忽略）
+    //   2) runtime probe  — 第一次 ProcessOutput 出 sample 时检查 src_tex.BindFlags 是否带 SR；
+    //                        + 烟测创建 R8 plane SRV（防 driver 接受 BindFlags 但 SRV 创建失败的陷阱）
+    //   3) 失败回退       — fast_path_enabled = false，沿用 v1 路径（自管 SR-only pool + CopySub + mt 锁）
+    // 决策只做一次（fast_path_decided），之后所有帧走同一分支。
+    bool                            fast_path_decided = false;
+    bool                            fast_path_enabled = false;
+
     // sync 路径用：RAM NV12 → dynamic texture
     ComPtr<ID3D11Texture2D>         upload_tex;
     UINT                            upload_w = 0;
@@ -361,8 +372,9 @@ HRESULT CodecMftVideo::Impl::on_have_output() noexcept {
     hr = transform->ProcessOutput(0, 1, &out, &status);
     if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
         update_output_dims();
+        // STREAM_CHANGE 时 fast_path 还未决定（需要看真 sample 的 BindFlags），保留
+        // ensure_out_pool 让 slow path 可立即工作；fast path 启用后该 pool 不被使用。
         ensure_out_pool();
-        // MFT 要求 set output type 后重试；按事件驱动，直接 return。
         return S_OK;
     }
     if (FAILED(hr)) return hr;
@@ -374,9 +386,6 @@ HRESULT CodecMftVideo::Impl::on_have_output() noexcept {
 
     if (out_width == 0 || out_height == 0) {
         update_output_dims();
-    }
-    if (!out_pool) {
-        if (FAILED(ensure_out_pool())) return E_FAIL;
     }
 
     // 取 D3D 纹理 + slice。
@@ -394,17 +403,41 @@ HRESULT CodecMftVideo::Impl::on_have_output() noexcept {
     UINT src_slice = 0;
     dbuf->GetSubresourceIndex(&src_slice);
 
-    // 拷到私有 pool（避免 MFT recycle 时 SRV 还在采样）。
-    const UINT dst_slice = out_pool_next;
-    out_pool_next        = (out_pool_next + 1) % out_pool_size;
-
-    {
-        // 多线程保护：MFT 在 worker 线程做内部 GPU 提交，与 ctx 共享 device。
-        ComPtr<ID3D10Multithread> mt;
-        if (SUCCEEDED(cfg.device.As(&mt))) mt->Enter();
-        ctx->CopySubresourceRegion(out_pool.Get(), dst_slice, 0, 0, 0,
-                                    src_tex.Get(), src_slice, nullptr);
-        if (mt) mt->Leave();
+    // P0-1 fast-path 决策（一次性，第一帧）：检查 MFT 自分配 texture 是否带 SR bind +
+    // 烟测 R8 plane SRV 创建（防 driver 接受 BindFlags hint 但实际 SRV 创建失败的陷阱）。
+    if (!fast_path_decided) {
+        fast_path_decided = true;
+        D3D11_TEXTURE2D_DESC td{};
+        src_tex->GetDesc(&td);
+        const bool has_sr_bind = (td.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
+        bool srv_ok = false;
+        if (has_sr_bind) {
+            D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+            sd.Format = DXGI_FORMAT_R8_UNORM;
+            if (td.ArraySize > 1) {
+                sd.ViewDimension                  = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+                sd.Texture2DArray.MipLevels       = 1;
+                sd.Texture2DArray.FirstArraySlice = src_slice;
+                sd.Texture2DArray.ArraySize       = 1;
+            } else {
+                sd.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
+                sd.Texture2D.MipLevels = 1;
+            }
+            ComPtr<ID3D11ShaderResourceView> probe_srv;
+            const HRESULT probe_hr =
+                cfg.device->CreateShaderResourceView(src_tex.Get(), &sd, &probe_srv);
+            srv_ok = SUCCEEDED(probe_hr) && probe_srv;
+            if (!srv_ok) {
+                MCP_LOGF(pal::LogLevel::warn,
+                         "CodecMftVideo: fast-path SRV smoke fail bind=0x%X arr=%u hr=0x%08lX",
+                         td.BindFlags, td.ArraySize, probe_hr);
+            }
+        }
+        fast_path_enabled = has_sr_bind && srv_ok;
+        MCP_LOGF(pal::LogLevel::info,
+                 "CodecMftVideo: P0-1 fast_path=%d (BindFlags=0x%X has_sr=%d srv_ok=%d arr=%u %ux%u)",
+                 fast_path_enabled, td.BindFlags, has_sr_bind, srv_ok,
+                 td.ArraySize, td.Width, td.Height);
     }
 
     LONGLONG t100 = 0;
@@ -420,15 +453,39 @@ HRESULT CodecMftVideo::Impl::on_have_output() noexcept {
     f.width               = out_width;
     f.height              = out_height;
     f.source              = FrameSource::mft_dxva;
-    f.dxva_texture        = out_pool;
-    f.dxva_array_slice    = dst_slice;
     f.is_keyframe         = (clean_point != 0);
     f.color_primaries     = cfg.color.primaries;
     f.color_range         = cfg.color.range;
     f.color_matrix        = cfg.color.matrix;
-    // v1 简化：CopySubresourceRegion 已在 immediate context 上序列化，无 dual-bind 跨队列读写
-    // → 把 fence bit 视作已 signal；此处仍由 FrameValidityGate 校验六类合一。
     f.validity_mask       = kValidityAll;
+
+    if (fast_path_enabled) {
+        // 真零拷贝：直接透出 MFT 自分配 sample 的 texture + slice。frame 持 IMFSample
+        // 引用阻止 MFT internal pool recycle 该 slice；frame 析构（render 用完）后
+        // ComPtr 减引用 → MFT 可 recycle。MFT 已保证 ProcessOutput 出来的 sample
+        // 是 GPU-ready，host 端无需额外 fence wait（同 immediate context 串行）。
+        f.dxva_texture     = src_tex;
+        f.dxva_array_slice = src_slice;
+        sample.As(&f.mft_sample);
+    } else {
+        // slow path（v1 路径）：CopySub 到自管 SR-only pool，避免 MFT 直接 SR 采样不可用。
+        if (!out_pool) {
+            if (FAILED(ensure_out_pool())) return E_FAIL;
+        }
+        const UINT dst_slice = out_pool_next;
+        out_pool_next        = (out_pool_next + 1) % out_pool_size;
+        {
+            // 多线程保护：MFT 在 worker 线程做内部 GPU 提交，与 ctx 共享 device。
+            ComPtr<ID3D10Multithread> mt;
+            if (SUCCEEDED(cfg.device.As(&mt))) mt->Enter();
+            ctx->CopySubresourceRegion(out_pool.Get(), dst_slice, 0, 0, 0,
+                                        src_tex.Get(), src_slice, nullptr);
+            if (mt) mt->Leave();
+        }
+        f.dxva_texture     = out_pool;
+        f.dxva_array_slice = dst_slice;
+    }
+
     // 端到端延时探针：先尝试 sample attribute（快路径），失败回退 PTS ring 查询。
     {
         UINT64 arr = 0;
@@ -751,6 +808,19 @@ mc_status_t CodecMftVideo::start(std::span<const uint8_t> /*extradata*/) noexcep
             MCP_LOGF(pal::LogLevel::warn,
                      "CodecMftVideo: SET_D3D_MANAGER failed hr=0x%08lX", hr);
             return pal::status_from_hresult(hr);
+        }
+
+        // P0-1 fast-path hint：要求 MFT 内部 sample pool 的 NV12 texture 带 SR bind，
+        // 让 render 端直接 SRV 采样、不再 CopySub 到自管 pool。driver 可忽略此提示
+        // （Intel 较新驱动响应良好；AMD/NV 行为不一），runtime probe 在 on_have_output
+        // 第一次时按 src_tex.BindFlags 决定 fast vs slow path。设置失败不阻断启动。
+        ComPtr<IMFAttributes> mft_attrs;
+        if (SUCCEEDED(impl_->transform->GetAttributes(&mft_attrs)) && mft_attrs) {
+            const UINT32 bind_hint = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
+            HRESULT hh = mft_attrs->SetUINT32(MF_SA_D3D11_BINDFLAGS, bind_hint);
+            MCP_LOGF(SUCCEEDED(hh) ? pal::LogLevel::info : pal::LogLevel::warn,
+                     "CodecMftVideo: MF_SA_D3D11_BINDFLAGS hint=0x%X hr=0x%08lX",
+                     bind_hint, hh);
         }
     }
 
