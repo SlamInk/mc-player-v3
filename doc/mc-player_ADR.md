@@ -15,7 +15,7 @@
 ## ADR-002 硬件 MFT 走 async 事件驱动模型（正文 §5.6.2.3）
 
 - **决策**：被 ADR-015 选中走 MFT 第 3 档时，激活硬件 MFT 必启用 async unlock，用事件生成器驱动 NeedInput / HaveOutput 循环。
-- **依据**：Microsoft 文档明确 "hardware MFT always process data asynchronously" —— 协议要求而非性能选择；sync 调用模式会 stall。
+- **依据**：Microsoft Learn 'Hardware MFTs' 文档原文 "Hardware MFTs must use the new asynchronous processing model" —— 协议要求而非性能选择；sync 调用模式不被支持。
 - **范围澄清（追加）**：本 ADR 仅约束 hardware MFT (`hw_url=1`) 路径。sync software MFT (`hw_url=0 && async=0`，如 OS 内置 `Microsoft H264 Video Decoder MFT`) 不在约束范围——它由 ADR-015 直接降到第 4 档软解，不再被当作"硬件 MFT 的同枚举兜底"。
 
 ## ADR-003 dual-bind 通过 BindFlags 显式启用（正文 §4.3）
@@ -89,7 +89,7 @@
 - **依据**：
   - **Microsoft Learn 明示 hardware MFT 是 DXVA-DDI 的协议封装**（"Direct3D 11 uses the same data structures as DXVA 2.0 for decoding operations"；"DXVA integrates with Media Foundation and allows DXVA pipelines to be exposed as Media Foundation Transforms"）——硬件路径上 MFT 与 DXVA-direct 等价，MFT 多出的开销纯在 host 侧（ProcessInput/Output 协议、内部 reorder buffer / DPB 黑盒管理）。
   - **vendor SDK path 最短**：直接对 vendor 私有 driver DDI（NVDEC 自带 LowLatency mode + 4-frame pipeline 但首帧立即解；Intel oneVPL 自带 LowDelay mode；AMD AMF 同理），绕过 OS MFT 与通用 DXVA-DDI 两层抽象。
-  - **DXVA-direct 优于 MFT 的工程理由**：`(a)` MFT 内部 DPB / reorder buffer 在 SPS `max_num_reorder_frames > 0` 时强制累积 ≥3 帧延时（实测 +100ms vs VLC，本仓库 commit 历史已记录），且 driver 实装是黑盒不可调；`(b)` D3D11VA frame 留在 video memory 与 §4.3 dual-bind 零拷贝原生兼容（DXVA2 / cuvid copyback 不兼容）；`(c)` Chromium 主线已从 MFT 迁到 D3D11VideoDecoder，主驱动是控制深度 + 摆脱 MFT 注册依赖。
+  - **DXVA-direct 优于 MFT 的工程理由**：`(a)` MFT 内部 DPB / reorder buffer 在 SPS `max_num_reorder_frames > 0` 时强制累积 ≥3 帧延时（实测 +100ms vs VLC，本仓库 commit 历史已记录），且 driver 实装是黑盒不可调；`(b)` D3D11VA frame 留在 video memory 与 §4.3 dual-bind 零拷贝原生兼容（DXVA2 / cuvid copyback 不兼容）；`(c)` Chromium 主线选择 `D3D11VideoDecoder` 直驱（绕过 OS MFT），印证 DXVA-direct 路径的工程可行性；主驱动是控制深度 + 摆脱 MFT 注册依赖（Edge 因 license 约束仍走 `DXVAVideoDecodeAccelerator` 即 MFT 路径，与 Chromium 主线分支不同）。
   - **MFT 仍保留的理由**：driver 暴露 hardware MFT 但 DXVA DDI 不暴露的边缘场景；OS 标准抽象兼容档（见修订后的 ADR-001）。
   - **sync software MFT 排除**：实测 SPS reorder=2 时硬性缓 ≥3 帧才输出第一帧（30fps ⇒ ~100ms），在"极限低延时 + 极限解码速度"目标下不可接受；走 mc-libcodec SIMD 软解也比 software MFT 更可控。
   - **mc-libcodec 兜底承认风险**：极限场景下若前三档全失败、且 §5.7.5 SIMD 实装尚未达标，则系统延时无法保证——文档级权衡，运维需在 stats 上监测 `decoder_kind` 与 `e2e_latency_p95`。
