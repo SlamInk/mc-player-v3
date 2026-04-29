@@ -26,6 +26,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <mutex>
 #include <string>
@@ -37,6 +38,7 @@
 #include "pal/error.h"
 #include "pal/log.h"
 #include "pal/raii.h"
+#include "pal/thread.h"
 #include "transport/rtsp_client.h"
 #include "transport/sdp_parser.h"
 #include "transport/rtcp.h"
@@ -175,6 +177,11 @@ public:
             channel_map_[next_ch]                            = ci_rtp;
             channel_map_[static_cast<uint8_t>(next_ch + 1)]  = ci_rtcp;
             channel_kinds_.push_back(m.kind);
+
+            // 缓存 RTCP 上行 channel：上层 send_rtcp(kind, bytes) 不需感知 SDP 顺序。
+            const MediaKind mk = (m.kind == SdpMedia::Kind::video)
+                                    ? MediaKind::video : MediaKind::audio;
+            rtcp_ch_by_kind_[mk] = static_cast<uint8_t>(next_ch + 1);
             MCP_LOGF(pal::LogLevel::info,
                      "TsRtspTcp: SETUP %s ok, interleaved ch=%u/%u session=%s",
                      m.kind == SdpMedia::Kind::video ? "video" : "audio",
@@ -214,9 +221,23 @@ public:
         close_unlocked();
     }
 
-    mc_status_t send_rtcp(MediaKind /*kind*/, std::span<const uint8_t> /*bytes*/) noexcept override {
-        // RTCP-over-interleaved 上行 v1 暂不实装（流入向才是关键路径）。
-        return MC_ERR_UNSUPPORTED;
+    mc_status_t send_rtcp(MediaKind kind, std::span<const uint8_t> bytes) noexcept override {
+        if (bytes.empty() || bytes.size() > 0xFFFF) return MC_ERR_INVALID_ARG;
+        if (!running_.load(std::memory_order_acquire)) return MC_ERR_INVALID_STATE;
+        uint8_t ch;
+        {
+            auto it = rtcp_ch_by_kind_.find(kind);
+            if (it == rtcp_ch_by_kind_.end()) return MC_ERR_UNSUPPORTED;
+            ch = it->second;
+        }
+        // RFC 2326 §10.12 interleaved 帧：'$' + 1B channel + 2B BE length + payload。
+        std::vector<uint8_t> frame(4 + bytes.size());
+        frame[0] = kInterleavedSentinel;
+        frame[1] = ch;
+        frame[2] = static_cast<uint8_t>((bytes.size() >> 8) & 0xFF);
+        frame[3] = static_cast<uint8_t>(bytes.size() & 0xFF);
+        std::memcpy(frame.data() + 4, bytes.data(), bytes.size());
+        return tcp_send(frame) ? MC_OK : MC_ERR_IO;
     }
 
 private:
@@ -318,9 +339,24 @@ private:
     }
 
     void run_rx_loop() noexcept {
+        // T2 Network RX (ADD §3.3)：TIME_CRITICAL + P-core 绑定。TCP 路径与 UDP 同等关键
+        // ——RTP/RTCP interleaved 帧也必须低 jitter 接收，否则进入 jitter buffer 的到达时间
+        // 抖动直接污染 Kalman 估计。
+        pal::ThreadRegistration reg;
+        pal::ThreadOptions opt;
+        opt.name          = "mc-player T2 RTSP-TCP-RX";
+        opt.base_priority = THREAD_PRIORITY_TIME_CRITICAL;
+        opt.affinity      = pal::ThreadAffinityHint::pcore_only;
+        reg.apply(opt);
+
         std::vector<uint8_t> buf(64 * 1024);
+        // demux_buf 用 read offset 替代每帧 erase from front：burst 关键帧 100KB+ 时
+        // 原 erase 触发整段 memmove ~100μs/次。read_pos 只在 buffer 已全消费 或
+        // 偏移过半时整体 compact，把 memmove 频率从每帧 1 次降到每 N 帧 1 次。
         std::vector<uint8_t> demux_buf;
         demux_buf.reserve(128 * 1024);
+        std::size_t read_pos = 0;
+        constexpr std::size_t kCompactThreshold = 32 * 1024;
 
         while (running_.load(std::memory_order_acquire)) {
             int n = ::recv(sock_.get(), reinterpret_cast<char*>(buf.data()),
@@ -333,37 +369,46 @@ private:
                 }
                 break;
             }
+            // recv 入站：append 到尾部；若缓冲已被消费过半则先 compact 防止无限增长。
+            if (read_pos > kCompactThreshold) {
+                demux_buf.erase(demux_buf.begin(), demux_buf.begin() + read_pos);
+                read_pos = 0;
+            }
             demux_buf.insert(demux_buf.end(), buf.begin(), buf.begin() + n);
 
             // 拆 demux_buf：按规则取一段 RTSP 文本或一帧 interleaved。
             for (;;) {
-                if (demux_buf.empty()) break;
-                if (demux_buf.front() != kInterleavedSentinel) {
+                const std::size_t avail = demux_buf.size() - read_pos;
+                if (avail == 0) break;
+                const uint8_t* p = demux_buf.data() + read_pos;
+                if (p[0] != kInterleavedSentinel) {
                     // 找下一个 '$' 之前的所有字节作为 RTSP 文本块。
                     std::size_t end = 0;
-                    while (end < demux_buf.size() &&
-                           demux_buf[end] != kInterleavedSentinel) ++end;
+                    while (end < avail && p[end] != kInterleavedSentinel) ++end;
                     {
                         std::scoped_lock lk{recv_mu_};
-                        rtsp_inbox_.insert(rtsp_inbox_.end(),
-                                            demux_buf.begin(),
-                                            demux_buf.begin() + end);
+                        rtsp_inbox_.insert(rtsp_inbox_.end(), p, p + end);
                     }
                     recv_cv_.notify_all();
-                    demux_buf.erase(demux_buf.begin(), demux_buf.begin() + end);
-                    if (demux_buf.empty()) break;
+                    read_pos += end;
+                    if (read_pos == demux_buf.size()) break;
                     // 余下以 '$' 起头，进入下一轮处理。
                     continue;
                 }
                 // interleaved 帧：'$' + ch(1) + len(2 BE) + payload(len)
-                if (demux_buf.size() < 4) break;
-                const uint8_t  ch  = demux_buf[1];
+                if (avail < 4) break;
+                const uint8_t  ch  = p[1];
                 const uint16_t len = static_cast<uint16_t>(
-                    (static_cast<uint16_t>(demux_buf[2]) << 8) | demux_buf[3]);
-                if (demux_buf.size() < static_cast<std::size_t>(4) + len) break;
+                    (static_cast<uint16_t>(p[2]) << 8) | p[3]);
+                if (avail < static_cast<std::size_t>(4) + len) break;
 
-                dispatch_interleaved(ch, std::span<const uint8_t>(demux_buf.data() + 4, len));
-                demux_buf.erase(demux_buf.begin(), demux_buf.begin() + 4 + len);
+                dispatch_interleaved(ch, std::span<const uint8_t>(p + 4, len));
+                read_pos += static_cast<std::size_t>(4) + len;
+            }
+            // 缓冲全部消费完时直接 reset，避免 vector 持续增长。
+            if (read_pos == demux_buf.size()) {
+                demux_buf.clear();
+                read_pos = 0;
             }
         }
     }
@@ -434,6 +479,8 @@ private:
     // interleaved channel → media 路由
     std::unordered_map<uint8_t, ChannelInfo> channel_map_;
     std::vector<SdpMedia::Kind>              channel_kinds_;
+    // 出站 RTCP 路由：MediaKind → interleaved channel
+    std::unordered_map<MediaKind, uint8_t>   rtcp_ch_by_kind_;
 };
 
 }  // namespace
