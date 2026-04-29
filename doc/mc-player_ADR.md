@@ -113,6 +113,50 @@
   - 下载源限定 vendor 官网直链 + 校验 SHA-256；不引第三方 redistributable 仓库。
 - **关系**：执行 ADR-015 档 1 的工程化前置；与 §2 #10 "平台原生优先"的关系参考 ADR-005/009 的 "为关键能力可引第三方" 例外口子，本 ADR 进一步细化"可选增强档"的引入方式。
 
+## ADR-017 Capability-Driven Adaptive Preset 架构（顶层决策机制；正文 §3.5 / §7.5.4 / §8.4）
+
+- **决策**：放弃"每个子系统独立按 ADR 静态决策"模式，引入**三维 capability probe（硬件 ∩ 网络 ∩ 编码器）→ Preset 匹配 → 跨子系统协同配置**的运行期适配机制。Preset 是一组同时覆盖 decoder tier / jitter mode / render profile / present 调度 / RTCP 模式 / Frame Validity Gate 严格度的协同参数集；启动期一次性 apply，运行期由 ADR-020 热切。
+- **依据**：
+  - **跨子系统耦合**：当前各 ADR（007 GPU 选 / 008 DCOMP 档 / 012 render profile / 015 decoder 档 / Kalman jitter target）独立决策，最坏情况叠加；如 jitter buffer 不知道下游是否 ULTIMATE_DCOMP、RTCP 不知道编码器 zerolatency。在追求"客户端 8~12ms"极限延时时，子系统决策必须**联合优化**。
+  - **应机适宜原则**：硬件能力 / 网络条件 / 编码器特征三者**只有运行期才能确知**——出厂时无法预测用户的 NIC、显示器、链路质量、对端编码器配置。把决策点推迟到启动期 + 运行期 telemetry，比静态绑定更优。
+  - **行业对照**：NVIDIA Holoscan SDK / Microsoft Teams ZeroJitter / Cisco Webex / NVIDIA Maxine 均采用 capability-driven 自适应架构，是低延时实时影像领域行业最高水平模式。
+  - **保留各子 ADR 不 Supersede**：原 ADR-007/008/012/015 等的"档位定义"作为 Preset 的可选输入仍有效；只是**最终决策点**从分散转移到 Preset Selector。
+- **关系**：
+  - 与 ADR-018（Network Probe）/ ADR-019（Encoder Probe）：两者是 Preset Selector 的输入维度；硬件维度复用 ADR-007 + ADR-015 caps_probe。
+  - 与 ADR-020（Live Reload + Self-Upgrade）：本 ADR 定义启动期一次性 apply，Live Reload 定义运行期热切。
+  - 与 ADR-014（Frame Validity Gate）：Gate 严格度可被 Preset 影响（极端低延时 preset 可放宽 fence/color 子集），但 refs / params / recovery / reorder 四 bit 永远 strict（正确性硬约束）。
+
+## ADR-018 Network Capability Probe（运行期网络维度采集；正文 §7.5.2）
+
+- **决策**：启动后 1-3 秒内（与 RTSP 握手 / WHEP ICE 并行）采集网络维度 capability：RTT p50/p95/p99、iat 抖动分布、短期丢包率、链路类型推断（LAN-switched / LAN-routed / Wi-Fi / WAN）、ECN 标记可用性、带宽 headroom。结果作为 ADR-017 Preset Selector 的输入维度。
+- **依据**：
+  - **网络维度对 jitter target 决策性影响**：LAN-switched RTT<1ms + jitter<0.5ms 场景下 jitter target 可压到 0~1ms（ZeroJitter 模式）；Wi-Fi jitter 5-30ms 突发场景必须 ≥15ms。当前 ADD §5.3.1 Kalman estimator 只看 iat，看不到链路特征——导致 LAN 场景过保守、Wi-Fi 场景偶尔过激进。
+  - **链路类型推断启发式**：RTT + jitter pattern 区分链路（LAN-switched RTT<1ms + jitter<0.5ms / LAN-routed RTT 1-5ms + jitter 1-3ms / Wi-Fi RTT 1-10ms + jitter 5-30ms 突发 / WAN RTT>20ms 长尾）已被 Microsoft Teams / WebRTC 实践验证。
+  - **延后到信令握手期采集**：probe 采集与 RTSP DESCRIBE/SETUP/PLAY 并行不增加首帧延时；首 GOP 数据足够给出 p95 估计。
+- **关系**：与 ADR-019（Encoder Probe）/ ADR-007（GPU 选）一起构成 ADR-017 Preset Selector 的输入。
+
+## ADR-019 Encoder Capability Probe（编码器维度采集；正文 §7.5.3）
+
+- **决策**：从 SDP `profile-level-id` + SPS VUI（`max_num_reorder_frames`）+ 第一 GOP 实测（NAL type 序列、IDR/GDR 周期、bitrate 模式）推导编码器特征：codec/profile / reorder depth / GOP 类型 / IDR 周期 / bitrate 模式（CBR/VBR）/ zerolatency 提示 / 编码端 capture-to-send 延时估测。
+- **依据**：
+  - **B-Frame Policy 已部分采集**（ADD §5.6.4 优先级 1-2 解析 SDP + SPS reorder），但 mc-player 当前没把这些信息**联合**作为顶层决策输入。
+  - **GDR-only 流的判别**：编码器仅发 GDR 不发 IDR 的 zerolatency 模式越来越普遍（x264 `--intra-refresh` / x265 `--refresh-rate`）；运行期检测前 N 帧 NAL type 即可识别。
+  - **zerolatency 提示推断**：SDP fmtp + 实测无 reorder + 短 GOP 联合可推断对端是否 zerolatency 编码——这直接决定 mc-player 能否启用 SDI_REPLACEMENT preset。
+- **关系**：与 ADR-018 / ADR-007 一起喂入 ADR-017 Preset Selector。
+
+## ADR-020 Preset Live Reload + Self-Upgrade Loop（运行期适配协议；正文 §7.5.4 / §7.5.5）
+
+- **决策**：运行期持续 telemetry 反馈，当**假设破坏**触发即立即热切到下一档 Preset；当**长期延时低于设计阈值**且无 tainted 事件，主动尝试**自驱升档**到更激进 Preset。失败立即降级 + 加入本会话 blacklist 不再尝试。
+- **依据**：
+  - **网络环境运行期变化**：Wi-Fi 信号强度 / WAN 拥塞 / 用户跨网络（家网→热点→蜂窝）。Preset 一次性绑定无法应对。
+  - **设计裕度可被自动消化**：性能量度规范每个 metric 的 warm_steady 阈值是保守值；实际 LAN 场景延时常远低于阈值，主动升档可拿到额外 5~10ms 收益。
+  - **失败回退 + blacklist**：避免在边界条件附近反复抖动（hysteresis）；本会话 blacklist 不持久化（下次 mc_open 重新评估）。
+  - **正确性闸不变**：Preset 切换期间 Frame Validity Gate 永远 strict，热切自身不引入花屏；切换涉及子系统 reset（如 ZeroJitter→Kalman 切换）按"flush + 标 in-flight 帧 invalid → recovery_complete 解 freeze"的 Gate 路径处理（ADD §5.13）。
+- **关系**：
+  - 与 ADR-017：本 ADR 定义运行期热切协议；ADR-017 定义启动期一次性 apply。
+  - 与 ADR-014（Frame Validity Gate）：切换路径所有 in-flight 帧标 invalid，等下一 refresh anchor 解 freeze——这是 Gate 污染态生命周期已规定的标准路径。
+  - 与性能量度规范 §11.3：Preset 切换次数 / blacklist 命中作为新增 metric 上报（具体字段在性能规范实施期补完）。
+
 ---
 
 > 当一条决策因实证或新约束被推翻，新增 ADR 引用旧 ADR 编号并标 Superseded，不修改历史条目。
