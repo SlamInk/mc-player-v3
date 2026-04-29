@@ -2,14 +2,17 @@
 
 #include <Windows.h>
 #include <d3d11.h>
+#include <d3d11_4.h>          // ID3D11Multithread（同 device 上的并发保护开关）
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -20,6 +23,7 @@
 #include "media/codec_libcodec.h"
 #include "media/codec_mft_audio.h"
 #include "media/codec_mft_video.h"
+#include "media/color_meta.h"
 #include "media/depack_aac.h"
 #include "media/depack_h264.h"
 #include "media/depack_h265.h"
@@ -28,6 +32,7 @@
 #include "media/ui_overlay.h"
 #include "pal/dxgi_caps_probe.h"
 #include "pal/log.h"
+#include "transport/sdp_parser.h"
 #include "transport/transport_session.h"
 
 #pragma comment(lib, "d3d11.lib")
@@ -143,9 +148,29 @@ struct Controller::Impl {
     std::atomic<uint64_t>                      au_count{0};
     std::atomic<uint64_t>                      idr_count{0};
 
+    // RTCP 上行：本端 sender SSRC（每会话随机一次） + 视频远端 SSRC（首个视频 RTP 学到）。
+    // pli_sent 走 atomic_flag — 只允许首帧到达时发一次 PLI，触发摄像头立即推 IDR。
+    uint32_t                                   local_sender_ssrc = 0;
+    std::atomic_flag                           pli_sent = ATOMIC_FLAG_INIT;
+
     mc_video_codec_t                           video_codec   = MC_VIDEO_CODEC_UNKNOWN;
     mc_decoder_kind_t                          decoder_kind  = MC_DECODER_NONE;
     AdapterPick                                adapter_pick{};
+
+    // ADD §5.6.4 / §5.12：B-Frame Policy + Color VUI 三级兜底的输出。
+    // on_stream_ready 内根据 SDP profile-level-id + depack 解出的 SPS 综合判定，
+    // 在 start_decode_pipeline 创建 codec 时灌入。
+    bool                                       decoded_no_b_frames = true;     // 默认无 B 帧
+    media::ResolvedColor                       resolved_color {
+        MC_COLOR_PRIMARIES_BT709,
+        MC_COLOR_RANGE_LIMITED,
+        MC_COLOR_MATRIX_BT709,
+    };
+
+    // 音频管线在独立线程异步启动 —— WASAPI IAudioClient::Initialize 同步耗时 100~200 ms，
+    // 若在 transport on_stream_ready 调用线程上阻塞，会推迟 depack/codec 创建及 PLI 触发，
+    // 视频首帧延时直接增加这一段。线程在 close() 阶段一无锁 join，避免与 close_unlocked 竞争。
+    std::thread                                audio_start_thread;
 
     void emit_state_change(mc_state_t prev, mc_state_t now) noexcept {
         if (prev == now) return;
@@ -248,7 +273,25 @@ struct Controller::Impl {
                      "Controller: D3D11CreateDevice failed hr=0x%08lX", hr);
             return MC_ERR_INTERNAL;
         }
+        enable_multithread_protection();
         return MC_OK;
+    }
+
+    // CLAUDE.md 硬约束："MFT 与 renderer 共享同一 ID3D11Device 并启用多线程保护"。
+    // codec_dxva（transport 线程驱动）与 render（同线程 + tick_ui 主线程）会并发使用同一
+    // immediate context。AMD/NV 部分驱动在并发时进入 race window 导致进程崩溃，必须设。
+    void enable_multithread_protection() noexcept {
+        if (!d3d_device) return;
+        ComPtr<ID3D11DeviceContext> imm;
+        d3d_device->GetImmediateContext(&imm);
+        if (!imm) return;
+        ComPtr<ID3D11Multithread> mt;
+        if (SUCCEEDED(imm.As(&mt)) && mt) {
+            mt->SetMultithreadProtected(TRUE);
+            MCP_LOG_INFO("Controller: D3D11 multi-thread protect enabled");
+        } else {
+            MCP_LOG_WARN("Controller: ID3D11Multithread query failed; concurrent ctx access may crash");
+        }
     }
 
     void submit_au_to_decoder(std::span<const uint8_t> bytes, int64_t pts_us) noexcept {
@@ -287,6 +330,120 @@ struct Controller::Impl {
 
     void on_admitted(const media::VideoFrame& f) noexcept {
         if (render) render->on_admitted(f);
+    }
+
+    // ADD §5.6.4 B-Frame Policy + §5.12 Color VUI 三级兜底：
+    // 在 start_decode_pipeline 创建 codec 之前必须已计算 decoded_no_b_frames + resolved_color。
+    //
+    // B-frame 判定优先级（任一确认无 B 帧即可放心开 LowLatencyMode）：
+    //   1. SDP profile-level-id（H.264 only） — Constrained Baseline / Baseline /
+    //      Constrained High 必无 B 帧。零成本，握手期就拿到。
+    //   2. SPS VUI — H.264 max_num_reorder_frames / H.265 sps_max_num_reorder_pics。
+    //      depack 在 sprop-parameter-sets 设置时即解析。
+    //   3. 任一信号未声明排除 B 帧 → 保守置 false（关 LowLatency，多缓 reorder）。
+    //
+    // Color 三级兜底（color_meta::resolve_color）：VUI 自洽 → 启发式 → 用户覆盖。
+    // 高度未知时高度默认 1080（启发式落 BT.709，符合现网 IPC 主流）。
+    void decide_codec_policy(const transport::SdpMedia* video) noexcept {
+        decoded_no_b_frames = false;
+        media::VuiInputs vui;
+        uint32_t height_hint = 1080;
+
+        if (video_codec == MC_VIDEO_CODEC_H264) {
+            // 1) SDP profile-level-id
+            if (video) {
+                for (const auto& fmtp : video->fmtp) {
+                    auto it = fmtp.params.find("profile-level-id");
+                    if (it == fmtp.params.end()) continue;
+                    if (auto plid = transport::parse_h264_profile_level_id(it->second); plid) {
+                        if (transport::h264_profile_excludes_b_frames(*plid)) {
+                            decoded_no_b_frames = true;
+                            MCP_LOGF(pal::LogLevel::info,
+                                     "Controller: SDP profile-level-id=%s → no B-frames",
+                                     it->second.c_str());
+                        }
+                    }
+                }
+            }
+            // 2) SPS VUI（depack 已经解析）
+            if (depack_h264) {
+                const auto& info = depack_h264->sps_info();
+                if (info.parsed) {
+                    if (info.bitstream_restriction && info.max_num_reorder_frames == 0) {
+                        decoded_no_b_frames = true;
+                    }
+                    if (info.colour_primaries >= 0) {
+                        vui.colour_primaries = info.colour_primaries;
+                        vui.matrix_coefficients = info.matrix_coefficients;
+                        vui.transfer_characteristics = info.transfer_characteristics;
+                        vui.video_full_range_flag = info.video_full_range_flag;
+                    }
+                    if (info.pic_height_in_map_units > 0) {
+                        height_hint = info.pic_height_in_map_units * 16u;
+                    }
+                    MCP_LOGF(pal::LogLevel::info,
+                             "Controller: H.264 SPS reorder=%u brfp=%d vui_pri=%d mat=%d trc=%d full=%d",
+                             info.max_num_reorder_frames,
+                             info.bitstream_restriction ? 1 : 0,
+                             info.colour_primaries, info.matrix_coefficients,
+                             info.transfer_characteristics,
+                             info.video_full_range_flag ? 1 : 0);
+                }
+            }
+        } else if (video_codec == MC_VIDEO_CODEC_H265) {
+            if (depack_h265) {
+                const auto& info = depack_h265->sps_info();
+                if (info.parsed) {
+                    if (info.max_num_reorder_pics == 0) decoded_no_b_frames = true;
+                    if (info.pic_height > 0) height_hint = info.pic_height;
+                    MCP_LOGF(pal::LogLevel::info,
+                             "Controller: H.265 SPS reorder=%u h=%u",
+                             info.max_num_reorder_pics, info.pic_height);
+                }
+            }
+        }
+
+        // Color：三级兜底由 resolve_color 内部完成。
+        media::ColorOverride no_override{};
+        resolved_color = media::resolve_color(vui, height_hint, no_override);
+        MCP_LOGF(pal::LogLevel::info,
+                 "Controller: codec policy: low_latency=%d color(pri=%d range=%d mat=%d) h_hint=%u",
+                 decoded_no_b_frames ? 1 : 0,
+                 static_cast<int>(resolved_color.primaries),
+                 static_cast<int>(resolved_color.range),
+                 static_cast<int>(resolved_color.matrix),
+                 height_hint);
+    }
+
+    // 构造 RFC 4585 §3.1 兼容的复合包（RR + SDES + PLI）并下发到 transport。
+    // 仅 RTSP-TCP interleaved 路径会真的把 RTCP 送回摄像头；UDP / WHEP transport 当前
+    // send_rtcp 返回 MC_ERR_UNSUPPORTED，调用方静默丢弃。
+    void send_video_pli(uint32_t media_ssrc) noexcept {
+        if (!transport) return;
+        std::array<uint8_t, 64> buf{};
+        std::size_t off = 0;
+        const auto rr_len = transport::RtcpWriter::write_receiver_report(
+            local_sender_ssrc, {}, std::span<uint8_t>{buf.data() + off, buf.size() - off});
+        if (rr_len == 0) return;
+        off += rr_len;
+        constexpr char kCname[] = "mc-player";
+        const auto sdes_len = transport::RtcpWriter::write_sdes_cname(
+            local_sender_ssrc,
+            std::span<const char>{kCname, sizeof(kCname) - 1},
+            std::span<uint8_t>{buf.data() + off, buf.size() - off});
+        if (sdes_len == 0) return;
+        off += sdes_len;
+        const auto pli_len = transport::RtcpWriter::write_pli(
+            local_sender_ssrc, media_ssrc,
+            std::span<uint8_t>{buf.data() + off, buf.size() - off});
+        if (pli_len == 0) return;
+        off += pli_len;
+        const mc_status_t s = transport->send_rtcp(
+            transport::MediaKind::video,
+            std::span<const uint8_t>{buf.data(), off});
+        MCP_LOGF(pal::LogLevel::info,
+                 "Controller: sent video PLI media_ssrc=0x%08X status=%d",
+                 media_ssrc, static_cast<int>(s));
     }
 
     // 音频管线启动（v1：仅 AAC；G.711 LUT 后续接入）。
@@ -422,6 +579,8 @@ struct Controller::Impl {
         media::CodecMftVideo::Config ccfg;
         ccfg.codec  = video_codec;
         ccfg.device = d3d_device;
+        ccfg.prefer_low_latency = decoded_no_b_frames;     // ADD §5.6.4 B-Frame Policy
+        ccfg.color  = resolved_color;                       // ADD §5.12 三级兜底结果
         ccfg.emit   = [this](media::VideoFrame&& f) { on_decoded_frame(std::move(f)); };
         codec_video = std::make_unique<media::CodecMftVideo>(std::move(ccfg));
         if (mc_status_t s = codec_video->start({}); s == MC_OK) {
@@ -521,6 +680,10 @@ struct Controller::Impl {
             return;
         }
 
+        // depack 已注入 sprop（H.264 sps/pps 或 H.265 vps/sps/pps），SPS 已解析就绪。
+        // 综合 SDP profile-level-id + SPS VUI 决定 LowLatencyMode 是否启用 + 色彩三级兜底。
+        decide_codec_policy(video);
+
         if (mc_status_t s = start_decode_pipeline(); s != MC_OK) {
             std::string msg = "decode pipeline start failed";
             if (s == MC_ERR_NO_HARDWARE && video_codec == MC_VIDEO_CODEC_H265) {
@@ -560,7 +723,16 @@ struct Controller::Impl {
             else if (a.codec_name == "PCMA")            e.stream_info.audio_codec = MC_AUDIO_CODEC_G711_ALAW;
             else if (a.codec_name == "PCMU")            e.stream_info.audio_codec = MC_AUDIO_CODEC_G711_ULAW;
             audio_codec = e.stream_info.audio_codec;
-            (void)start_audio_pipeline(*audio);
+            // 异步启动音频管线：把 ~100-200 ms 的 WASAPI Initialize 移出 transport 线程，
+            // depack_h264/265 + codec_video 在本函数返回后立即可服务视频 RTP；audio_render /
+            // depack_aac / codec_audio 由子线程稍后填充，on_rtp 中已有 nullptr 兜底。
+            // 写入 unique_ptr 成员在 x64 上是 word-aligned atomic store，与 on_rtp 的读取不会撕裂；
+            // 唯一需要确保的是 close() 在持 mu 前先 join 该线程，避免双写竞争。
+            transport::SdpMedia audio_copy = *audio;
+            if (audio_start_thread.joinable()) audio_start_thread.join();
+            audio_start_thread = std::thread([this, am = std::move(audio_copy)]() {
+                (void)start_audio_pipeline(am);
+            });
         }
         // 把 stream_info 也推到 UI overlay：playing stage 的 codec / 分辨率 / fps / GPU 标签来源。
         if (render && render->ui_overlay()) {
@@ -592,6 +764,16 @@ struct Controller::Impl {
         if (dg.kind == transport::MediaKind::video) {
             // 视频时钟固定 90 kHz：us = ts * 1e6 / 90000 = ts * 100 / 9
             const int64_t pts_us = static_cast<int64_t>(ts) * 100 / 9;
+            // 首个视频 RTP 触发 PLI：摄像头收到立即下发 IDR，缩短首帧延时。
+            // 多数低延时摄像头 GOP 几秒，进流时若位于 GOP 中段，无 PLI 时要等下一个
+            // 周期性 IDR；PLI 把这段空窗压到一帧 RTT 之内（RFC 4585 §6.3.1）。
+            if (!pli_sent.test_and_set(std::memory_order_acq_rel)) {
+                const uint32_t media_ssrc = (static_cast<uint32_t>(p[8])  << 24) |
+                                              (static_cast<uint32_t>(p[9])  << 16) |
+                                              (static_cast<uint32_t>(p[10]) <<  8) |
+                                               static_cast<uint32_t>(p[11]);
+                send_video_pli(media_ssrc);
+            }
             if (depack_h264)      depack_h264->on_rtp(pts_us, marker, payload);
             else if (depack_h265) depack_h265->on_rtp(pts_us, marker, payload);
         } else if (dg.kind == transport::MediaKind::audio) {
@@ -638,6 +820,15 @@ struct Controller::Impl {
         const mc_state_t prev = state.exchange(MC_STATE_CONNECTING, std::memory_order_acq_rel);
         emit_state_change(prev, MC_STATE_CONNECTING);
 
+        // 每会话随机化本端 sender SSRC（RFC 3550 §8.1：避免与远端冲突）。
+        {
+            std::random_device rd;
+            std::mt19937 gen(rd());
+            std::uniform_int_distribution<uint32_t> dis(1, 0xFFFFFFFFu);
+            local_sender_ssrc = dis(gen);
+        }
+        pli_sent.clear(std::memory_order_release);
+
         if (mc_status_t s = caps_probe.probe(); s != MC_OK) {
             emit_error(s, "DxgiCapsProbe failed");
             return s;
@@ -673,6 +864,8 @@ struct Controller::Impl {
     }
 
     void close_unlocked() noexcept {
+        // 注意：调用此函数前 caller 必须已无锁 join audio_start_thread（见 Controller::close），
+        // 否则 audio start 子线程对 audio_render / codec_audio / depack_aac 的写入会与下方 reset 竞争。
         if (transport) {
             transport->close();
             transport.reset();
@@ -725,6 +918,14 @@ mc_status_t Controller::open(const mc_open_options_t& options) noexcept {
 }
 
 void Controller::close() noexcept {
+    // 阶段一：无锁 join 异步音频启动线程（可能正在 WASAPI Initialize 中），避免持 mu 时与之死锁。
+    std::thread t;
+    {
+        std::scoped_lock lk{impl_->mu};
+        t = std::move(impl_->audio_start_thread);
+    }
+    if (t.joinable()) t.join();
+    // 阶段二：常规 cleanup。
     std::scoped_lock lk{impl_->mu};
     impl_->close_unlocked();
 }
@@ -783,6 +984,8 @@ mc_status_t Controller::tick_ui() noexcept {
         ui->set_stats(s);
     }
     impl_->render->tick_ui();
+    // ADR-014 / ADD §5.10.5：Present Epoch 陈旧区域 watchdog 已由 T5 渲染线程自驱
+    // （render_thread_loop 内每 ~frame_period 唤醒一次），main 不再触发。
     return MC_OK;
 }
 

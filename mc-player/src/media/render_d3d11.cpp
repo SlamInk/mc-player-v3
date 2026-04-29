@@ -1,15 +1,20 @@
 #include "media/render_d3d11.h"
 
+#include <d3d11_4.h>          // ID3D11Multithread（codec 也提交命令到同 immediate ctx）
 #include <d3dcompiler.h>
 #include <dxgi1_6.h>
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
+#include <thread>
 
 #include "media/ui_overlay.h"
 #include "pal/clock.h"
 #include "pal/error.h"
 #include "pal/log.h"
+#include "pal/raii.h"
+#include "pal/thread.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3dcompiler.lib")
@@ -82,10 +87,22 @@ struct RenderD3d11::Impl {
     std::unique_ptr<PresentEpoch>           epoch;
     std::unique_ptr<UiOverlay>              ui;
 
-    std::mutex                              mu;        // 跨 decoder→render 线程保护
+    // ADD §3.3 T5 渲染线程：独占 swap_chain Present + DCOMP commit 调用方。
+    // 解码线程（T4 / T2）通过 post_frame() 投递最新帧 + signal wake_event 唤醒；
+    // T5 自驱 watchdog（无需 main 周期 tick）。
+    //
+    // last_good / has_last_good 仅 T5 写入与读取，无需锁。
+    // 投递槽 pending_frame 由 codec 线程写、T5 读，drop-old 语义 → 一把短锁。
     VideoFrame                              last_good;
     bool                                    has_last_good = false;
     std::atomic<int64_t>                    frame_period_ns{0};   // 0 = 未知（watchdog 走 fallback）
+
+    std::thread                             render_thread;
+    std::atomic<bool>                       render_stop{false};
+    pal::HandleGuard                        wake_event;             // auto-reset
+    std::mutex                              pending_mu;
+    VideoFrame                              pending_frame;
+    bool                                    has_pending = false;
 
     ComPtr<ID3D11DeviceContext>             ctx;
     ComPtr<ID3D11RenderTargetView>          rtv;
@@ -93,6 +110,21 @@ struct RenderD3d11::Impl {
     ComPtr<ID3D11PixelShader>               ps;
     ComPtr<ID3D11SamplerState>              samp;
     ComPtr<ID3D11RasterizerState>           raster;
+
+    // SRV 缓存（P1-8）：codec 自管 NV12 array pool 的 slice 是有限集（典型 4），
+    // 每帧都重建 SRV 浪费 driver allocation。按 (texture* + slice) 缓存 Y/UV SRV，
+    // pool 重建（dxva_texture 指针变更）或 ArraySize 变更时整组失效重建。
+    static constexpr int kSrvCacheSize = 8;
+    struct SrvSlot {
+        ID3D11Texture2D*                  tex   = nullptr;     // 仅作 identity，不持引用
+        uint32_t                          slice = 0;
+        ComPtr<ID3D11ShaderResourceView>  y;
+        ComPtr<ID3D11ShaderResourceView>  uv;
+    };
+    SrvSlot                                 srv_cache[kSrvCacheSize];
+    void invalidate_srv_cache() noexcept {
+        for (auto& s : srv_cache) { s = {}; }
+    }
 
     bool                                    pipeline_ready = false;
     std::atomic<uint64_t>                   presents{0};
@@ -159,14 +191,21 @@ struct RenderD3d11::Impl {
     void clear_views() noexcept {
         if (ui) ui->unbind_backbuffer();
         rtv.Reset();
+        // back buffer 重建时不必显式清 SRV 缓存（缓存键是 codec NV12 texture，与 swap chain 无关），
+        // 但 device-lost 路径会重建 codec pool → 下次 render_locked 命中失败自然刷新。保险起见显式清。
+        invalidate_srv_cache();
     }
 
     static void clear_views_thunk(void* user) noexcept {
         if (auto* self = static_cast<Impl*>(user)) self->clear_views();
     }
 
-    // 仅画 UI（无视频帧）；start() 后开机第一帧 / 长时间 freeze 期可调用，让用户立即看到 UI。
-    // 不持有外部锁，调用方自行同步（当前两处调用：start() 末尾、render_locked 中视频缺失时）。
+    // T5 主循环：独占 swap_chain Present + DCOMP commit；自驱 watchdog；
+    // 由 post_frame() 唤醒接收最新帧，无帧期间 ~frame_period 节拍 redraw（动画 + 陈旧防御）。
+    void render_thread_loop() noexcept;
+
+    // 以下两个 *_locked 命名沿用历史，但 T5 单线程化后不再持外部锁。
+    // 仅画 UI（无视频帧）：empty/connecting/error stage + freeze 期使用。
     void render_ui_only_locked() noexcept {
         if (!swap_chain || !pipeline_ready) return;
         if (FAILED(ensure_rtv())) return;
@@ -205,23 +244,76 @@ struct RenderD3d11::Impl {
         if (FAILED(ensure_rtv())) return;
         if (!frame.dxva_texture) return;
 
-        // 创建 array slice 上的 NV12 双 SRV（Y=R8，UV=R8G8）。
-        D3D11_SHADER_RESOURCE_VIEW_DESC y_desc{};
-        y_desc.Format                          = DXGI_FORMAT_R8_UNORM;
-        y_desc.ViewDimension                   = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-        y_desc.Texture2DArray.MostDetailedMip  = 0;
-        y_desc.Texture2DArray.MipLevels        = 1;
-        y_desc.Texture2DArray.FirstArraySlice  = frame.dxva_array_slice;
-        y_desc.Texture2DArray.ArraySize        = 1;
-        ComPtr<ID3D11ShaderResourceView> y_srv;
-        if (FAILED(cfg.device->CreateShaderResourceView(frame.dxva_texture.Get(),
-                                                          &y_desc, &y_srv))) return;
+        // 创建 NV12 双 SRV（Y=R8，UV=R8G8）。
+        // AMD 独显某些 driver 对 NV12 + BIND_DECODER + ArraySize>1 的 SRV 创建报错；
+        // 出错时降级到 TEXTURE2D（ArraySize=1）路径，由 codec 端把帧拷到单 slice 纹理。
+        D3D11_TEXTURE2D_DESC tex_desc{};
+        frame.dxva_texture->GetDesc(&tex_desc);
+        const bool is_array = tex_desc.ArraySize > 1;
 
-        D3D11_SHADER_RESOURCE_VIEW_DESC uv_desc = y_desc;
-        uv_desc.Format = DXGI_FORMAT_R8G8_UNORM;
+        // SRV 缓存：(texture identity, slice) 命中即复用，未命中则按 LRU 槽（slice 索引模容量）
+        // 创建并填入。codec pool 重建时 dxva_texture 指针变化，下一帧自然驱动重填。
+        ID3D11Texture2D* const tex_ptr = frame.dxva_texture.Get();
+        const uint32_t slice = frame.dxva_array_slice;
+        SrvSlot& slot = srv_cache[slice % kSrvCacheSize];
+        ComPtr<ID3D11ShaderResourceView> y_srv;
         ComPtr<ID3D11ShaderResourceView> uv_srv;
-        if (FAILED(cfg.device->CreateShaderResourceView(frame.dxva_texture.Get(),
-                                                         &uv_desc, &uv_srv))) return;
+        if (slot.tex == tex_ptr && slot.slice == slice && slot.y && slot.uv) {
+            y_srv  = slot.y;
+            uv_srv = slot.uv;
+        } else {
+            D3D11_SHADER_RESOURCE_VIEW_DESC y_desc{};
+            y_desc.Format         = DXGI_FORMAT_R8_UNORM;
+            if (is_array) {
+                y_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+                y_desc.Texture2DArray.MostDetailedMip = 0;
+                y_desc.Texture2DArray.MipLevels       = 1;
+                y_desc.Texture2DArray.FirstArraySlice = slice;
+                y_desc.Texture2DArray.ArraySize       = 1;
+            } else {
+                y_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                y_desc.Texture2D.MostDetailedMip = 0;
+                y_desc.Texture2D.MipLevels       = 1;
+            }
+            HRESULT hr_srv_y = cfg.device->CreateShaderResourceView(tex_ptr, &y_desc, &y_srv);
+            if (FAILED(hr_srv_y)) {
+                static std::atomic<bool> warned{false};
+                if (!warned.exchange(true, std::memory_order_relaxed)) {
+                    MCP_LOGF(pal::LogLevel::error,
+                             "RenderD3d11: CreateShaderResourceView Y failed hr=0x%08lX "
+                             "(arraySize=%u format=%d bind=0x%X) — 视频静默丢帧；"
+                             "需要 codec 改 SR-only ArraySize=1 输出",
+                             hr_srv_y, tex_desc.ArraySize, tex_desc.Format, tex_desc.BindFlags);
+                }
+                return;
+            }
+            D3D11_SHADER_RESOURCE_VIEW_DESC uv_desc = y_desc;
+            uv_desc.Format = DXGI_FORMAT_R8G8_UNORM;
+            HRESULT hr_srv_uv = cfg.device->CreateShaderResourceView(tex_ptr, &uv_desc, &uv_srv);
+            if (FAILED(hr_srv_uv)) {
+                static std::atomic<bool> warned{false};
+                if (!warned.exchange(true, std::memory_order_relaxed)) {
+                    MCP_LOGF(pal::LogLevel::error,
+                             "RenderD3d11: CreateShaderResourceView UV failed hr=0x%08lX",
+                             hr_srv_uv);
+                }
+                return;
+            }
+            slot.tex   = tex_ptr;
+            slot.slice = slice;
+            slot.y     = y_srv;
+            slot.uv    = uv_srv;
+        }
+
+        {
+            static std::atomic<uint64_t> n{0};
+            if (n.fetch_add(1, std::memory_order_relaxed) == 0) {
+                MCP_LOGF(pal::LogLevel::info,
+                         "RenderD3d11: first frame render (texSize=%ux%u arr=%u slice=%u src=%d)",
+                         tex_desc.Width, tex_desc.Height, tex_desc.ArraySize,
+                         frame.dxva_array_slice, static_cast<int>(frame.source));
+            }
+        }
 
         D3D11_VIEWPORT vp{};
         DXGI_SWAP_CHAIN_DESC1 sc_desc{};
@@ -310,8 +402,9 @@ mc_status_t RenderD3d11::start() noexcept {
         }
     }
 
+    // PresentEpoch 的 redraw / commit 回调都在 T5 上执行（force_redraw 由 T5 watchdog 触发）。
+    // last_good / has_last_good 仅 T5 写入，回调内可直接访问。
     auto redraw = [this] {
-        std::scoped_lock lk{impl_->mu};
         if (impl_->has_last_good) impl_->render_locked(impl_->last_good);
         else                       impl_->render_ui_only_locked();
     };
@@ -320,22 +413,32 @@ mc_status_t RenderD3d11::start() noexcept {
     };
     impl_->epoch = std::make_unique<PresentEpoch>(redraw, commit);
 
-    // 开机第一帧：让 UI（CEmpty）立即可见，无需等视频。
-    {
-        std::scoped_lock lk{impl_->mu};
-        impl_->render_ui_only_locked();
+    // 启动 T5 渲染线程：开机第一帧由 T5 自己画（让 connecting stage 立即可见）。
+    impl_->wake_event.reset(::CreateEventW(nullptr, FALSE /*auto-reset*/, FALSE, nullptr));
+    if (!impl_->wake_event.valid()) {
+        MCP_LOG_ERROR("RenderD3d11: CreateEvent for T5 wake failed");
+        return MC_ERR_INTERNAL;
     }
+    impl_->render_stop.store(false, std::memory_order_release);
+    impl_->render_thread = std::thread([impl = impl_.get()] { impl->render_thread_loop(); });
     return MC_OK;
 }
 
 void RenderD3d11::stop() noexcept {
     if (!impl_) return;
-    std::scoped_lock lk{impl_->mu};
+    // 阶段 1：通知 T5 退出并等其结束。在 T5 结束前不能销毁 swap_chain / epoch / dcomp。
+    impl_->render_stop.store(true, std::memory_order_release);
+    if (impl_->wake_event.valid()) ::SetEvent(impl_->wake_event.get());
+    if (impl_->render_thread.joinable()) impl_->render_thread.join();
+    impl_->wake_event.reset();
+
+    // 阶段 2：T5 已退出，single-thread cleanup，无需锁。
     impl_->epoch.reset();
     if (impl_->dcomp) impl_->dcomp->destroy();
     impl_->dcomp.reset();
     if (impl_->ui) impl_->ui->unbind_backbuffer();
     impl_->ui.reset();
+    impl_->invalidate_srv_cache();
     impl_->rtv.Reset();
     impl_->vs.Reset();
     impl_->ps.Reset();
@@ -345,27 +448,26 @@ void RenderD3d11::stop() noexcept {
     impl_->swap_chain.reset();
     impl_->has_last_good = false;
     impl_->last_good = VideoFrame{};
+    {
+        std::scoped_lock lk{impl_->pending_mu};
+        impl_->has_pending = false;
+        impl_->pending_frame = VideoFrame{};
+    }
 }
 
 void RenderD3d11::on_admitted(const VideoFrame& frame) noexcept {
-    std::scoped_lock lk{impl_->mu};
-    if (!impl_->swap_chain || !impl_->epoch) return;
-    (void)impl_->epoch->begin_epoch();
-    impl_->last_good     = frame;
-    impl_->has_last_good = true;
-    impl_->render_locked(frame);
+    // 投递最新帧（drop-old 语义）+ signal T5。不直接渲染：渲染由 T5 完成。
+    if (!impl_->wake_event.valid()) return;
+    {
+        std::scoped_lock lk{impl_->pending_mu};
+        impl_->pending_frame = frame;
+        impl_->has_pending   = true;
+    }
+    ::SetEvent(impl_->wake_event.get());
 }
 
 void RenderD3d11::tick_watchdog() noexcept {
-    if (!impl_->epoch) return;
-    int64_t period = impl_->frame_period_ns.load(std::memory_order_acquire);
-    if (period <= 0) {
-        // 显示器探测失败：刷新一次，仍失败时跳过本次 tick（保持 0 让 PresentEpoch::tick 退化为 noop）。
-        period = query_frame_period_ns(impl_->cfg.hwnd);
-        if (period > 0) impl_->frame_period_ns.store(period, std::memory_order_release);
-        if (period <= 0) return;
-    }
-    impl_->epoch->tick(pal::Clock::now_ns(), period, kWatchdogPeriodsThreshold);
+    // T5 自驱 watchdog；保留接口仅为向后兼容。
 }
 
 mc_render_profile_t RenderD3d11::active_profile() const noexcept {
@@ -385,18 +487,76 @@ uint64_t RenderD3d11::skip_count() const noexcept {
 }
 
 void RenderD3d11::tick_ui() noexcept {
+    // 仅推进 UI overlay 时间基；渲染由 T5 自驱（每 ~frame_period 唤醒一次）。
+    // 不再 trigger render —— 避免与 T5 同时拿 immediate ctx。
     if (!impl_->ui) return;
     impl_->ui->tick(pal::Clock::now_ns());
-
-    std::scoped_lock lk{impl_->mu};
-    // playing 态由视频帧自然驱动；empty/connecting/error 态需要 tick 触发 Present 才能跑动画。
-    if (!impl_->has_last_good) {
-        impl_->render_ui_only_locked();
-    }
 }
 
 UiOverlay* RenderD3d11::ui_overlay() noexcept {
     return impl_->ui.get();
+}
+
+// ─── T5 主循环 ──────────────────────────────────────────────────
+void RenderD3d11::Impl::render_thread_loop() noexcept {
+    pal::ThreadRegistration reg;
+    pal::ThreadOptions opt;
+    opt.name        = "mc-player T5 Render";
+    opt.mmcss_task  = pal::MmcssTask::playback;
+    opt.affinity    = pal::ThreadAffinityHint::pcore_only;
+    reg.apply(opt);
+
+    // 开机首帧：让 UI（CEmpty / connecting）立即可见。
+    if (epoch) (void)epoch->begin_epoch();
+    render_ui_only_locked();
+
+    while (!render_stop.load(std::memory_order_acquire)) {
+        // 唤醒周期：~frame_period（60Hz ≈ 16ms）。够频以驱动 UI 动画 +
+        // 探测陈旧区域；过短会浪费 CPU。无显示器信息时 fallback 16ms。
+        const int64_t period_ns = frame_period_ns.load(std::memory_order_acquire);
+        const DWORD timeout_ms = period_ns > 0
+            ? static_cast<DWORD>(std::clamp<int64_t>(period_ns / 1'000'000, 1, 50))
+            : 16;
+        const DWORD wr = ::WaitForSingleObject(wake_event.get(), timeout_ms);
+        (void)wr;
+        if (render_stop.load(std::memory_order_acquire)) break;
+
+        // 取最新帧（drop-old 语义）。锁仅短暂保护 pending 槽。
+        VideoFrame frame;
+        bool got_frame = false;
+        {
+            std::scoped_lock lk{pending_mu};
+            if (has_pending) {
+                frame = std::move(pending_frame);
+                has_pending = false;
+                got_frame = true;
+            }
+        }
+
+        if (got_frame) {
+            (void)epoch->begin_epoch();
+            last_good     = std::move(frame);
+            has_last_good = true;
+            render_locked(last_good);
+            continue;
+        }
+
+        // 无新帧：playing 态走 watchdog（PresentEpoch::tick 内部决定是否 force_redraw）；
+        // empty/connecting/error 态则每 wake 周期 redraw_ui_only 让动画相位前进。
+        if (has_last_good) {
+            int64_t period = frame_period_ns.load(std::memory_order_acquire);
+            if (period <= 0) {
+                period = query_frame_period_ns(cfg.hwnd);
+                if (period > 0) frame_period_ns.store(period, std::memory_order_release);
+            }
+            if (period > 0 && epoch) {
+                epoch->tick(pal::Clock::now_ns(), period, kWatchdogPeriodsThreshold);
+            }
+        } else {
+            if (epoch) (void)epoch->begin_epoch();
+            render_ui_only_locked();
+        }
+    }
 }
 
 }  // namespace mcp::media
