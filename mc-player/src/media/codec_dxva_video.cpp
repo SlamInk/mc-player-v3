@@ -537,6 +537,7 @@ struct CodecDxvaVideo::Impl {
     UINT                                  cur_dpb_idx = 0;
     uint8_t                               cur_nal_type = 0;
     int64_t                               cur_pts_us = 0;
+    int64_t                               cur_arrival_qpc_ns = 0;     // 端到端延时探针起点
     Sps*                                  cur_sps = nullptr;
     Pps*                                  cur_pps = nullptr;
 
@@ -548,9 +549,12 @@ struct CodecDxvaVideo::Impl {
     // 现在拆到独立 worker：submit 仅入队，T4 worker 取出再 on_au。
     struct PendingAu {
         std::vector<uint8_t> bytes;
-        int64_t              pts_us = 0;
+        int64_t              pts_us         = 0;
+        int64_t              arrival_qpc_ns = 0;
     };
-    static constexpr std::size_t kAuQueueMax = 16;
+    // 低延时模式下 host 端 AU 缓存 = 接力槽，3 = anchor + 1-2 P（~100 ms@30fps）；
+    // 满即丢最老，下一个 IRAP 解 freeze（与 codec_mft_video.cpp kAuQueueMax 对齐）。
+    static constexpr std::size_t kAuQueueMax = 3;
 
     std::thread                          worker_thread;
     std::atomic<bool>                    worker_stop{false};
@@ -959,6 +963,7 @@ struct CodecDxvaVideo::Impl {
         // emit
         VideoFrame f;
         f.pts_us           = cur_pts_us;
+        f.arrival_qpc_ns   = cur_arrival_qpc_ns;
         f.width            = dec_w;
         f.height           = dec_h;
         f.source           = FrameSource::mft_dxva;
@@ -997,8 +1002,8 @@ struct CodecDxvaVideo::Impl {
         return true;
     }
 
-    // 主入口：单 AU 喂入。
-    void on_au(std::span<const uint8_t> au, int64_t pts_us) noexcept {
+    // 主入口：单 AU 喂入。arrival_qpc_ns 端到端延时探针起点（first-packet RX 戳）。
+    void on_au(std::span<const uint8_t> au, int64_t pts_us, int64_t arrival_qpc_ns = 0) noexcept {
         // find_start_code 返回的是「00 00 01」三元组的起点。
         // 4 字节 SC（00 00 00 01）找到时，返回的是第二个 0 的位置 (i)，前面 i-1 还有一个 0。
         // 不论 3 或 4 字节，NAL data 都从 i+3 起；start code 块从 i-(i 前是否多一个 0) 起。
@@ -1067,6 +1072,7 @@ struct CodecDxvaVideo::Impl {
                         cur_pps      = &p;
                         cur_nal_type = nuh_type;
                         cur_pts_us   = pts_us;
+                        cur_arrival_qpc_ns = arrival_qpc_ns;
                         cur_poc      = compute_poc(nuh_type, sh.slice_pic_order_cnt_lsb,
                                                     s.log2_max_pic_order_cnt_lsb_minus4);
                         cur_dpb_idx  = alloc_dpb_slot();
@@ -1153,11 +1159,13 @@ mc_status_t CodecDxvaVideo::start() noexcept {
     return MC_OK;
 }
 
-void CodecDxvaVideo::submit(std::vector<uint8_t> au_bytes, int64_t pts_us) noexcept {
+void CodecDxvaVideo::submit(std::vector<uint8_t> au_bytes, int64_t pts_us,
+                              int64_t arrival_qpc_ns) noexcept {
     if (!impl_->video_device) return;
     Impl::PendingAu p;
-    p.bytes  = std::move(au_bytes);
-    p.pts_us = pts_us;
+    p.bytes          = std::move(au_bytes);
+    p.pts_us         = pts_us;
+    p.arrival_qpc_ns = arrival_qpc_ns;
     {
         std::scoped_lock lk{impl_->au_mu};
         // 满时丢最老（CLAUDE.md 硬约束 / ADD §6.1）
@@ -1207,7 +1215,8 @@ void CodecDxvaVideo::Impl::worker_loop() noexcept {
             au = std::move(au_queue.front());
             au_queue.pop_front();
         }
-        on_au(std::span<const uint8_t>(au.bytes.data(), au.bytes.size()), au.pts_us);
+        on_au(std::span<const uint8_t>(au.bytes.data(), au.bytes.size()),
+              au.pts_us, au.arrival_qpc_ns);
     }
 }
 

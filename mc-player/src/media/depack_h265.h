@@ -26,6 +26,7 @@ namespace mcp::media {
 
 struct H265AccessUnit {
     int64_t              pts_us           = 0;
+    int64_t              arrival_qpc_ns   = 0;              // first-packet RX 戳；端到端延时探针
     std::vector<uint8_t> annexb_bytes;
     bool                 has_irap         = false;
     bool                 has_recovery_sei = false;
@@ -57,7 +58,8 @@ public:
     void set_sprop_sps(std::string_view base64) noexcept;
     void set_sprop_pps(std::string_view base64) noexcept;
 
-    void on_rtp(int64_t pts_us, bool marker, std::span<const uint8_t> payload) noexcept;
+    void on_rtp(int64_t pts_us, bool marker, std::span<const uint8_t> payload,
+                int64_t arrival_qpc_ns = 0) noexcept;
     void mark_reference_lost() noexcept;
     void reset() noexcept;
 
@@ -77,6 +79,7 @@ private:
     bool                 saw_recovery_in_au_ = false;
     bool                 refs_lost_          = true;
     int64_t              current_pts_us_     = 0;
+    int64_t              current_arrival_qpc_ns_ = 0;       // AU 起始包的 arrival 戳
     uint8_t              fu_layer_id_        = 0;
     uint8_t              fu_tid_             = 0;
 };

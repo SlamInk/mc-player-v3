@@ -31,6 +31,7 @@ namespace mcp::media {
 
 struct H264AccessUnit {
     int64_t                  pts_us           = 0;
+    int64_t                  arrival_qpc_ns   = 0;          // first-packet RX 戳；端到端延时探针
     std::vector<uint8_t>     annexb_bytes;          // 含 start code
     bool                     has_idr          = false;
     bool                     has_recovery_sei = false;     // recovery_frame_cnt == 0
@@ -67,8 +68,10 @@ public:
     /// 缓存为 extradata；首帧解码前置入 access unit 头，避免等带内 SPS。
     void set_sprop_parameter_sets(std::string_view base64_csv) noexcept;
 
-    /// 入参：单条 RTP payload + 元信息。
-    void on_rtp(int64_t pts_us, bool marker, std::span<const uint8_t> payload) noexcept;
+    /// 入参：单条 RTP payload + 元信息。arrival_qpc_ns 透传至 emit 的 AU.arrival_qpc_ns（取
+    /// AU 起始包的戳，用作端到端延时探针的起点）。
+    void on_rtp(int64_t pts_us, bool marker, std::span<const uint8_t> payload,
+                int64_t arrival_qpc_ns = 0) noexcept;
 
     /// jitter buffer 报告 RTP 序号 gap → 标记后续所有帧 invalid 直至 anchor。
     void mark_reference_lost() noexcept;
@@ -96,6 +99,7 @@ private:
     bool                 saw_idr_in_au_      = false;
     bool                 saw_recovery_in_au_ = false;
     int64_t              current_pts_us_     = 0;
+    int64_t              current_arrival_qpc_ns_ = 0;       // AU 起始包的 arrival 戳
 };
 
 }  // namespace mcp::media

@@ -8,6 +8,7 @@
 #include <mfidl.h>
 #include <mftransform.h>
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <deque>
@@ -49,13 +50,23 @@ const char* codec_name(mc_video_codec_t c) noexcept {
 
 struct PendingAu {
     std::vector<uint8_t> bytes;
-    int64_t              pts_us = 0;
-    bool                 keyframe = false;
+    int64_t              pts_us         = 0;
+    int64_t              arrival_qpc_ns = 0;     // 端到端延时探针起点（first-packet RX 戳）
+    bool                 keyframe       = false;
 };
 
-// AU 队列上限 —— 30fps 下满代表 ~half second 积压（远超低延时阈值），保护性丢最老。
-// 4K60fps 下 0.27 s 积压触发丢弃；任何卡顿都不该超过这个量级。
-constexpr std::size_t kAuQueueMax = 16;
+// AU 队列上限 —— 低延时模式下 host 端 AU 缓存只是「让 MFT 立刻拉到下一个」的接力槽。
+// MFT 自身有内部 input buffering（async event 驱动），host 多缓 ≠ 多吞吐，反而把网络拥塞
+// 转成解码侧滞后。3 = 一个 anchor + 1-2 P，对应 ~100 ms@30fps 上限。满即丢最老让 codec
+// 抓最近内容；下一个 IDR/recovery anchor 解 freeze（与 FrameValidityGate 行为对齐）。
+constexpr std::size_t kAuQueueMax = 3;
+
+// 自定义 IMFSample attribute — 透传 arrival_qpc_ns。MFT 文档未明示
+// input→output 自定义 attribute 透传，实测 driver 行为不一；失败时回退
+// PTS-keyed ring map（见 Impl::arrival_ring_）。
+// {6E5C4A5B-2F7E-4A0B-9D3C-1A2B3C4D5E6F}
+const GUID kArrivalQpcNsAttr =
+    { 0x6E5C4A5B, 0x2F7E, 0x4A0B, { 0x9D, 0x3C, 0x1A, 0x2B, 0x3C, 0x4D, 0x5E, 0x6F } };
 
 }  // namespace
 
@@ -81,6 +92,25 @@ struct CodecMftVideo::Impl {
     std::condition_variable         au_cv;
     std::deque<PendingAu>           au_queue;
     bool                            need_input_pending = false;
+
+    // PTS-keyed arrival 戳兜底 ring（仅 T4 单线程访问，无锁）。MFT 不保证
+    // 自定义 attribute 透传；GetUINT64 失败时按 SampleTime (us) 回查 ring。
+    struct ArrivalEntry { int64_t pts_us; int64_t arrival_qpc_ns; };
+    static constexpr std::size_t   kArrivalRingSize = 16;
+    std::array<ArrivalEntry, kArrivalRingSize> arrival_ring_{};
+    std::size_t                    arrival_ring_head_ = 0;
+
+    void record_arrival(int64_t pts_us, int64_t arrival_qpc_ns) noexcept {
+        if (arrival_qpc_ns == 0) return;
+        arrival_ring_[arrival_ring_head_ % kArrivalRingSize] = {pts_us, arrival_qpc_ns};
+        ++arrival_ring_head_;
+    }
+    int64_t lookup_arrival(int64_t pts_us) const noexcept {
+        for (const auto& e : arrival_ring_) {
+            if (e.pts_us == pts_us && e.arrival_qpc_ns != 0) return e.arrival_qpc_ns;
+        }
+        return 0;
+    }
 
     bool                            sps_seen = false;
     bool                            is_sync_mft = false;             // Microsoft HEVC Extension 是 sync software MFT
@@ -311,6 +341,11 @@ HRESULT CodecMftVideo::Impl::on_need_input() noexcept {
     if (au.keyframe) {
         sample->SetUINT32(MFSampleExtension_CleanPoint, 1);
     }
+    // 端到端延时探针：双路径透传（attribute + PTS ring 兜底）。
+    record_arrival(au.pts_us, au.arrival_qpc_ns);
+    if (au.arrival_qpc_ns != 0) {
+        sample->SetUINT64(kArrivalQpcNsAttr, static_cast<UINT64>(au.arrival_qpc_ns));
+    }
     return transform->ProcessInput(kFirstStreamId, sample.Get(), 0);
 }
 
@@ -394,6 +429,15 @@ HRESULT CodecMftVideo::Impl::on_have_output() noexcept {
     // v1 简化：CopySubresourceRegion 已在 immediate context 上序列化，无 dual-bind 跨队列读写
     // → 把 fence bit 视作已 signal；此处仍由 FrameValidityGate 校验六类合一。
     f.validity_mask       = kValidityAll;
+    // 端到端延时探针：先尝试 sample attribute（快路径），失败回退 PTS ring 查询。
+    {
+        UINT64 arr = 0;
+        if (SUCCEEDED(sample->GetUINT64(kArrivalQpcNsAttr, &arr)) && arr != 0) {
+            f.arrival_qpc_ns = static_cast<int64_t>(arr);
+        } else {
+            f.arrival_qpc_ns = lookup_arrival(f.pts_us);
+        }
+    }
 
     if (cfg.emit) cfg.emit(std::move(f));
     return S_OK;
@@ -418,6 +462,11 @@ HRESULT CodecMftVideo::Impl::submit_sync(const PendingAu& au) noexcept {
     sample->AddBuffer(buf.Get());
     sample->SetSampleTime(au.pts_us * 10);
     if (au.keyframe) sample->SetUINT32(MFSampleExtension_CleanPoint, 1);
+    // 端到端延时探针：双路径透传（attribute + PTS ring 兜底）。
+    record_arrival(au.pts_us, au.arrival_qpc_ns);
+    if (au.arrival_qpc_ns != 0) {
+        sample->SetUINT64(kArrivalQpcNsAttr, static_cast<UINT64>(au.arrival_qpc_ns));
+    }
 
     hr = transform->ProcessInput(kFirstStreamId, sample.Get(), 0);
     static int submit_n = 0;
@@ -575,6 +624,15 @@ HRESULT CodecMftVideo::Impl::drain_sync_output() noexcept {
         f.color_range         = cfg.color.range;
         f.color_matrix        = cfg.color.matrix;
         f.validity_mask       = kValidityAll;
+        // 端到端延时探针：sample attribute → PTS ring 兜底。
+        {
+            UINT64 arr = 0;
+            if (SUCCEEDED(result->GetUINT64(kArrivalQpcNsAttr, &arr)) && arr != 0) {
+                f.arrival_qpc_ns = static_cast<int64_t>(arr);
+            } else {
+                f.arrival_qpc_ns = lookup_arrival(f.pts_us);
+            }
+        }
         if (cfg.emit) cfg.emit(std::move(f));
     }
 }
@@ -811,11 +869,13 @@ mc_status_t CodecMftVideo::start(std::span<const uint8_t> /*extradata*/) noexcep
     return MC_OK;
 }
 
-void CodecMftVideo::submit(std::vector<uint8_t> au_bytes, int64_t pts_us) noexcept {
+void CodecMftVideo::submit(std::vector<uint8_t> au_bytes, int64_t pts_us,
+                             int64_t arrival_qpc_ns) noexcept {
     if (!impl_->started.load(std::memory_order_acquire)) return;
     PendingAu p;
-    p.bytes = std::move(au_bytes);  // ownership 移交，无 memcpy
-    p.pts_us = pts_us;
+    p.bytes          = std::move(au_bytes);  // ownership 移交，无 memcpy
+    p.pts_us         = pts_us;
+    p.arrival_qpc_ns = arrival_qpc_ns;
     {
         std::scoped_lock lk{impl_->au_mu};
         // 满时丢最老（CLAUDE.md 硬约束 / ADD §6.1）。低延时模式下深度积压无意义，

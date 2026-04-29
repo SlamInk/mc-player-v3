@@ -41,6 +41,10 @@ enum class FrameSource {
 
 struct VideoFrame {
     int64_t                                 pts_us              = 0;     // RTP→NTP 后归一化
+    /// 端到端延时探针（P0-4）：AU 第一包 RTP 到达时刻（QPC ns）。0 表示未知。
+    /// 由 transport→depack→controller→codec 全程透传；render Present 完成后做
+    /// e2e_ns = present_now_ns - arrival_qpc_ns 用于 P50/P95/P99 统计。
+    int64_t                                 arrival_qpc_ns      = 0;
     uint32_t                                width               = 0;
     uint32_t                                height              = 0;
 

@@ -5,6 +5,7 @@
 #include <dxgi1_6.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -129,6 +130,53 @@ struct RenderD3d11::Impl {
     bool                                    pipeline_ready = false;
     std::atomic<uint64_t>                   presents{0};
 
+    // 端到端延时探针（P0-4）：frame.arrival_qpc_ns → present_now_ns 的累计 ring，
+    // 周期性输出 P50/P95/P99。仅 T5 单线程访问 ring/head/filled/last_log_ns；
+    // samples_total/samples_zero 用 atomic 是因 stats 接口可能从 UI 线程读。
+    struct LatencyProbe {
+        static constexpr std::size_t kCap            = 256;
+        static constexpr int64_t     kLogIntervalNs  = 5'000'000'000LL;   // 5 秒
+        std::array<int64_t, kCap>    ring{};
+        std::size_t                  head            = 0;
+        std::size_t                  filled          = 0;
+        int64_t                      last_log_ns     = 0;
+        std::atomic<uint64_t>        samples_total{0};
+        std::atomic<uint64_t>        samples_zero{0};
+
+        void record(int64_t e2e_ns) noexcept {
+            ring[head] = e2e_ns;
+            head       = (head + 1) % kCap;
+            if (filled < kCap) ++filled;
+        }
+        void log_if_due(int64_t now_ns) noexcept {
+            if (filled < 8) return;
+            if (last_log_ns != 0 && now_ns - last_log_ns < kLogIntervalNs) return;
+            last_log_ns = now_ns;
+            std::array<int64_t, kCap> sorted{};
+            for (std::size_t i = 0; i < filled; ++i) sorted[i] = ring[i];
+            std::sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(filled));
+            const auto pct = [&](double p) noexcept -> int64_t {
+                const auto idx = static_cast<std::size_t>(p * (filled - 1));
+                return sorted[idx];
+            };
+            const int64_t  p50   = pct(0.50);
+            const int64_t  p95   = pct(0.95);
+            const int64_t  p99   = pct(0.99);
+            const uint64_t total = samples_total.load(std::memory_order_relaxed);
+            const uint64_t zero  = samples_zero.load(std::memory_order_relaxed);
+            MCP_LOGF(pal::LogLevel::info,
+                     "RenderD3d11: e2e latency P50=%lld us P95=%lld us P99=%lld us "
+                     "(window=%zu total=%llu untraceable=%llu)",
+                     static_cast<long long>(p50 / 1000),
+                     static_cast<long long>(p95 / 1000),
+                     static_cast<long long>(p99 / 1000),
+                     filled,
+                     static_cast<unsigned long long>(total),
+                     static_cast<unsigned long long>(zero));
+        }
+    };
+    LatencyProbe                            latency_probe;
+
     HRESULT compile_shaders() noexcept {
         ComPtr<ID3DBlob> blob, err;
         HRESULT hr = ::D3DCompile(kVS, sizeof(kVS) - 1, "vs", nullptr, nullptr,
@@ -208,6 +256,12 @@ struct RenderD3d11::Impl {
     // 仅画 UI（无视频帧）：empty/connecting/error stage + freeze 期使用。
     void render_ui_only_locked() noexcept {
         if (!swap_chain || !pipeline_ready) return;
+
+        // P0-2: wait 在 record 之前。配合 SetMaximumFrameLatency(1)，让 record 工作
+        // 落在「DXGI 释放新帧」之后的窗口，避免占用前一帧 vsync 边界时间（DXGI 推荐
+        // 顺序：wait → record → Present）。timeout 50ms 防显示器异常永久 block。
+        (void)swap_chain->wait_for_frame_latency(50);
+
         if (FAILED(ensure_rtv())) return;
 
         ComPtr<ID3D11Texture2D> bb = swap_chain->back_buffer();
@@ -230,11 +284,6 @@ struct RenderD3d11::Impl {
 
         if (ui) ui->render();
 
-        // Present 前等 frame-latency waitable —— 配合 swap_chain 的 SetMaximumFrameLatency(1)，
-        // 把"管线占满到 vsync"的额外帧时延吃掉（DXGI 推荐路径）。tearing profile 下没有
-        // composition queue 同样要 wait（frame latency 控制的是 driver 提交节流），
-        // timeout 50ms 防止显示器异常时 T5 永久 block。
-        (void)swap_chain->wait_for_frame_latency(50);
         const bool tearing =
             (swap_chain->active_present_mode() == MC_PRESENT_MODE_TEARING);
         if (swap_chain->present(tearing) == MC_OK) {
@@ -245,6 +294,11 @@ struct RenderD3d11::Impl {
 
     void render_locked(const VideoFrame& frame) noexcept {
         if (!swap_chain || !pipeline_ready) return;
+
+        // P0-2: wait 在 record 之前（DXGI 推荐顺序：wait → record → Present），
+        // 让 record 工作落在「DXGI 释放新帧」之后的窗口；timeout 50ms 防永久 block。
+        // force_redraw 回调（watchdog）也走 render_locked，自然继承新顺序。
+        (void)swap_chain->wait_for_frame_latency(50);
 
         if (FAILED(ensure_rtv())) return;
         if (!frame.dxva_texture) return;
@@ -362,13 +416,28 @@ struct RenderD3d11::Impl {
         // 把"管线占满到 vsync"的额外帧时延吃掉（DXGI 推荐路径）。tearing profile 下没有
         // composition queue 同样要 wait（frame latency 控制的是 driver 提交节流），
         // timeout 50ms 防止显示器异常时 T5 永久 block。
-        (void)swap_chain->wait_for_frame_latency(50);
         const bool tearing =
             (swap_chain->active_present_mode() == MC_PRESENT_MODE_TEARING);
         if (swap_chain->present(tearing) == MC_OK) {
             presents.fetch_add(1, std::memory_order_relaxed);
         }
-        if (epoch) epoch->on_presented(pal::Clock::now_ns());
+        const int64_t now_ns = pal::Clock::now_ns();
+        if (epoch) epoch->on_presented(now_ns);
+
+        // 端到端延时统计（P0-4）：frame.arrival_qpc_ns 来自 RTP 第一包的 QPC 戳，
+        // 经 depack→controller→codec 全链透传；为 0 表示该帧无法溯源（如 codec
+        // MFT 黑盒未透传 attribute 且 PTS ring 兜底未命中）。
+        if (frame.arrival_qpc_ns > 0) {
+            const int64_t e2e_ns = now_ns - frame.arrival_qpc_ns;
+            // 防御异常 0 / clock skew 越界（>2 s 几乎必然是脏数据）。
+            if (e2e_ns > 0 && e2e_ns < 2'000'000'000LL) {
+                latency_probe.record(e2e_ns);
+            }
+        } else {
+            latency_probe.samples_zero.fetch_add(1, std::memory_order_relaxed);
+        }
+        latency_probe.samples_total.fetch_add(1, std::memory_order_relaxed);
+        latency_probe.log_if_due(now_ns);
     }
 };
 

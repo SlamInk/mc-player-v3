@@ -44,7 +44,9 @@ public:
 
     mc_status_t start() noexcept;
     /// 入异步队列；接 vector ownership 避免中间拷贝。
-    void        submit(std::vector<uint8_t> au_bytes, int64_t pts_us) noexcept;
+    /// arrival_qpc_ns 是 AU first-packet RX 戳，本类透传到 VideoFrame 用于端到端延时统计。
+    void        submit(std::vector<uint8_t> au_bytes, int64_t pts_us,
+                        int64_t arrival_qpc_ns = 0) noexcept;
     void        flush() noexcept;
     void        stop() noexcept;
 

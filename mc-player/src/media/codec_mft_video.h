@@ -83,7 +83,10 @@ public:
 
     /// 推一个 access unit 进入异步 input 队列；MFT NeedInput 事件触发时拉取。
     /// 接收 vector ownership，避免 controller→codec 链条上的额外 memcpy。
-    void submit(std::vector<uint8_t> au_bytes, int64_t pts_us) noexcept;
+    /// arrival_qpc_ns 是 AU first-packet RX 戳，本类通过 IMFSample 自定义 attribute
+    /// 透传到对应的 output sample，最终落到 VideoFrame.arrival_qpc_ns 用于端到端延时统计。
+    void submit(std::vector<uint8_t> au_bytes, int64_t pts_us,
+                int64_t arrival_qpc_ns = 0) noexcept;
 
     void flush() noexcept;
     void stop() noexcept;

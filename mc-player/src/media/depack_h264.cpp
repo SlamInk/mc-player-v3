@@ -305,12 +305,17 @@ void DepackH264::parse_sps_locked() noexcept {
     parse_h264_sps(std::span<const uint8_t>(sps_), sps_info_);
 }
 
-void DepackH264::on_rtp(int64_t pts_us, bool marker, std::span<const uint8_t> payload) noexcept {
+void DepackH264::on_rtp(int64_t pts_us, bool marker, std::span<const uint8_t> payload,
+                         int64_t arrival_qpc_ns) noexcept {
     if (payload.empty()) return;
 
     // 帧边界识别：PTS 跳变 → 切前一个 AU 出去。
     if (!au_buffer_.empty() && pts_us != current_pts_us_) {
         emit_au(current_pts_us_, /*with_extradata=*/false);
+    }
+    // 端到端延时探针：取 AU 第一包的 arrival 戳（au_buffer_ 当前为空即 AU 起始）。
+    if (au_buffer_.empty() && arrival_qpc_ns != 0) {
+        current_arrival_qpc_ns_ = arrival_qpc_ns;
     }
     current_pts_us_ = pts_us;
 
@@ -416,6 +421,7 @@ void DepackH264::emit_au(int64_t pts_us, bool with_extradata) noexcept {
     au.has_recovery_sei = saw_recovery_in_au_;
     au.refs_lost        = refs_lost_;
     au.params_present   = !sps_.empty() && !pps_.empty();
+    au.arrival_qpc_ns   = current_arrival_qpc_ns_;
 
     // refresh anchor → 解 invalid。
     if (au.has_idr || au.has_recovery_sei) {
@@ -427,6 +433,7 @@ void DepackH264::emit_au(int64_t pts_us, bool with_extradata) noexcept {
     au_buffer_.clear();
     saw_idr_in_au_      = false;
     saw_recovery_in_au_ = false;
+    current_arrival_qpc_ns_ = 0;
 }
 
 void DepackH264::mark_reference_lost() noexcept {
@@ -441,6 +448,7 @@ void DepackH264::reset() noexcept {
     saw_recovery_in_au_ = false;
     refs_lost_          = true;
     current_pts_us_     = 0;
+    current_arrival_qpc_ns_ = 0;
     // 不清 SPS/PPS：可能由 SDP set_sprop_parameter_sets 注入，重连不应丢失。
 }
 

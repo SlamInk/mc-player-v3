@@ -42,9 +42,12 @@ struct CodecLibcodecVideo::Impl {
     // 现拆到独立 worker，submit 仅入队。
     struct PendingAu {
         std::vector<uint8_t> bytes;
-        int64_t              pts_us = 0;
+        int64_t              pts_us         = 0;
+        int64_t              arrival_qpc_ns = 0;
     };
-    static constexpr std::size_t kAuQueueMax = 16;
+    // 低延时模式下 host 端 AU 缓存 = 接力槽，3 = anchor + 1-2 P（~100 ms@30fps）；
+    // 满即丢最老（与 codec_mft_video.cpp kAuQueueMax 对齐）。
+    static constexpr std::size_t kAuQueueMax = 3;
 
     std::thread                     worker_thread;
     std::atomic<bool>               worker_stop{false};
@@ -73,7 +76,7 @@ struct CodecLibcodecVideo::Impl {
         return true;
     }
 
-    void upload_and_emit(const mclc_nv12_frame_t& f) noexcept {
+    void upload_and_emit(const mclc_nv12_frame_t& f, int64_t arrival_qpc_ns) noexcept {
         if (!ensure_upload_texture(f.width, f.height)) return;
 
         // Y + UV 平面通过 UpdateSubresource 上传（DEFAULT NV12 仅支持 UpdateSubresource，不支持 Map）。
@@ -94,6 +97,7 @@ struct CodecLibcodecVideo::Impl {
 
         VideoFrame vf;
         vf.pts_us           = f.pts_us;
+        vf.arrival_qpc_ns   = arrival_qpc_ns;
         vf.width            = f.width;
         vf.height           = f.height;
         vf.source           = FrameSource::libcodec_software;
@@ -144,11 +148,13 @@ mc_status_t CodecLibcodecVideo::start() noexcept {
     return MC_OK;
 }
 
-void CodecLibcodecVideo::submit(std::vector<uint8_t> au_bytes, int64_t pts_us) noexcept {
+void CodecLibcodecVideo::submit(std::vector<uint8_t> au_bytes, int64_t pts_us,
+                                  int64_t arrival_qpc_ns) noexcept {
     if (!impl_->decoder) return;
     Impl::PendingAu p;
-    p.bytes  = std::move(au_bytes);
-    p.pts_us = pts_us;
+    p.bytes          = std::move(au_bytes);
+    p.pts_us         = pts_us;
+    p.arrival_qpc_ns = arrival_qpc_ns;
     {
         std::scoped_lock lk{impl_->au_mu};
         while (impl_->au_queue.size() >= Impl::kAuQueueMax) {
@@ -210,7 +216,7 @@ void CodecLibcodecVideo::Impl::worker_loop() noexcept {
             const mclc_status_t s = mclc_pull(decoder, &f);
             if (s == MCLC_ERR_NEED_MORE_INPUT) break;
             if (s != MCLC_OK) break;
-            upload_and_emit(f);
+            upload_and_emit(f, au.arrival_qpc_ns);
         }
     }
 }
