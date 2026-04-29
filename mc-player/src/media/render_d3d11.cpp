@@ -230,6 +230,11 @@ struct RenderD3d11::Impl {
 
         if (ui) ui->render();
 
+        // Present 前等 frame-latency waitable —— 配合 swap_chain 的 SetMaximumFrameLatency(1)，
+        // 把"管线占满到 vsync"的额外帧时延吃掉（DXGI 推荐路径）。tearing profile 下没有
+        // composition queue 同样要 wait（frame latency 控制的是 driver 提交节流），
+        // timeout 50ms 防止显示器异常时 T5 永久 block。
+        (void)swap_chain->wait_for_frame_latency(50);
         const bool tearing =
             (swap_chain->active_present_mode() == MC_PRESENT_MODE_TEARING);
         if (swap_chain->present(tearing) == MC_OK) {
@@ -353,6 +358,11 @@ struct RenderD3d11::Impl {
 
         if (ui) ui->render();
 
+        // Present 前等 frame-latency waitable —— 配合 swap_chain 的 SetMaximumFrameLatency(1)，
+        // 把"管线占满到 vsync"的额外帧时延吃掉（DXGI 推荐路径）。tearing profile 下没有
+        // composition queue 同样要 wait（frame latency 控制的是 driver 提交节流），
+        // timeout 50ms 防止显示器异常时 T5 永久 block。
+        (void)swap_chain->wait_for_frame_latency(50);
         const bool tearing =
             (swap_chain->active_present_mode() == MC_PRESENT_MODE_TEARING);
         if (swap_chain->present(tearing) == MC_OK) {
