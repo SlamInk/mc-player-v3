@@ -60,6 +60,186 @@ std::vector<uint8_t> base64_decode(std::string_view in) noexcept {
     return out;
 }
 
+// ──────────────────────────────────────────────────────────
+// 最小 ExpGolomb / RBSP unescape，仅用于 SPS 解析到 VUI 段。
+// 不做完整 SPS 语义校验——失败时设 parsed=false 不影响主路径。
+// ──────────────────────────────────────────────────────────
+struct BitReader {
+    const uint8_t* p   = nullptr;
+    std::size_t    n   = 0;
+    std::size_t    pos = 0;
+    bool           bad = false;
+    uint32_t read_bits(int k) noexcept {
+        uint32_t v = 0;
+        for (int i = 0; i < k; ++i) {
+            if (pos >= n * 8) { bad = true; return 0; }
+            v = (v << 1) | static_cast<uint32_t>((p[pos >> 3] >> (7 - (pos & 7))) & 1u);
+            ++pos;
+        }
+        return v;
+    }
+    bool     read_bit1() noexcept { return read_bits(1) != 0; }
+    void     skip_bits(int k) noexcept { (void)read_bits(k); }
+    uint32_t read_ue() noexcept {
+        int zeros = 0;
+        while (!bad && read_bits(1) == 0) {
+            ++zeros;
+            if (zeros > 32) { bad = true; return 0; }
+        }
+        if (bad) return 0;
+        if (zeros == 0) return 0;
+        uint32_t body = read_bits(zeros);
+        return (1u << zeros) - 1u + body;
+    }
+    int32_t read_se() noexcept {
+        uint32_t k = read_ue();
+        return (k & 1u) ? static_cast<int32_t>((k + 1u) >> 1) : -static_cast<int32_t>(k >> 1);
+    }
+};
+
+std::vector<uint8_t> rbsp_unescape(std::span<const uint8_t> ebsp) noexcept {
+    // 删除 emulation prevention byte 0x03 in pattern 00 00 03 → 00 00。
+    std::vector<uint8_t> out;
+    out.reserve(ebsp.size());
+    int zeros = 0;
+    for (uint8_t b : ebsp) {
+        if (zeros >= 2 && b == 0x03) { zeros = 0; continue; }
+        out.push_back(b);
+        zeros = (b == 0) ? zeros + 1 : 0;
+    }
+    return out;
+}
+
+bool profile_has_extended_chroma(uint8_t profile_idc) noexcept {
+    switch (profile_idc) {
+        case 100: case 110: case 122: case 244: case 44:
+        case 83:  case 86:  case 118: case 128: case 138:
+        case 139: case 134: case 135:
+            return true;
+        default: return false;
+    }
+}
+
+void parse_h264_sps(std::span<const uint8_t> sps_nal, H264SpsInfo& out) noexcept {
+    out = H264SpsInfo{};
+    if (sps_nal.size() < 4) return;
+    auto rbsp = rbsp_unescape(sps_nal.subspan(1));     // 跳过 1B NAL header
+    if (rbsp.size() < 3) return;
+
+    BitReader br{rbsp.data(), rbsp.size(), 0, false};
+    out.profile_idc      = static_cast<uint8_t>(br.read_bits(8));
+    out.constraint_flags = static_cast<uint8_t>(br.read_bits(8));
+    out.level_idc        = static_cast<uint8_t>(br.read_bits(8));
+    (void)br.read_ue();     // seq_parameter_set_id
+
+    if (profile_has_extended_chroma(out.profile_idc)) {
+        const uint32_t chroma_idc = br.read_ue();
+        if (chroma_idc == 3) br.skip_bits(1);
+        (void)br.read_ue();                            // bit_depth_luma_minus8
+        (void)br.read_ue();                            // bit_depth_chroma_minus8
+        br.skip_bits(1);                               // qpprime_y_zero_transform_bypass_flag
+        const bool seq_scaling_matrix_present_flag = br.read_bit1();
+        if (seq_scaling_matrix_present_flag) {
+            const int n_lists = (chroma_idc == 3) ? 12 : 8;
+            for (int i = 0; i < n_lists; ++i) {
+                if (br.read_bit1()) {
+                    // 跳过 scaling list（用 ue 序列驱动 delta_scale，最长 64）
+                    const int sz = (i < 6) ? 16 : 64;
+                    int last_scale = 8, next_scale = 8;
+                    for (int j = 0; j < sz; ++j) {
+                        if (next_scale != 0) {
+                            const int32_t delta = br.read_se();
+                            next_scale = (last_scale + delta + 256) % 256;
+                        }
+                        last_scale = (next_scale == 0) ? last_scale : next_scale;
+                    }
+                }
+            }
+        }
+    }
+
+    (void)br.read_ue();                                // log2_max_frame_num_minus4
+    const uint32_t poc_type = br.read_ue();
+    if (poc_type == 0) {
+        (void)br.read_ue();                            // log2_max_pic_order_cnt_lsb_minus4
+    } else if (poc_type == 1) {
+        br.skip_bits(1);                               // delta_pic_order_always_zero_flag
+        (void)br.read_se();                            // offset_for_non_ref_pic
+        (void)br.read_se();                            // offset_for_top_to_bottom_field
+        const uint32_t n = br.read_ue();
+        if (n > 256) { return; }                       // 防御：异常值
+        for (uint32_t i = 0; i < n; ++i) (void)br.read_se();
+    }
+    (void)br.read_ue();                                // max_num_ref_frames
+    br.skip_bits(1);                                   // gaps_in_frame_num_value_allowed_flag
+    out.pic_width_in_mbs        = br.read_ue() + 1u;
+    out.pic_height_in_map_units = br.read_ue() + 1u;
+    const bool frame_mbs_only_flag = br.read_bit1();
+    if (!frame_mbs_only_flag) br.skip_bits(1);
+    br.skip_bits(1);                                   // direct_8x8_inference_flag
+    if (br.read_bit1()) {                              // frame_cropping_flag
+        (void)br.read_ue(); (void)br.read_ue();
+        (void)br.read_ue(); (void)br.read_ue();
+    }
+
+    if (br.bad) return;
+    if (!br.read_bit1()) {                              // vui_parameters_present_flag
+        out.parsed = true;
+        return;
+    }
+
+    // VUI parameters
+    if (br.read_bit1()) {                              // aspect_ratio_info_present_flag
+        const uint32_t aspect_ratio_idc = br.read_bits(8);
+        if (aspect_ratio_idc == 255) br.skip_bits(32); // sar_width 16 + sar_height 16
+    }
+    if (br.read_bit1()) br.skip_bits(1);               // overscan_info_present_flag → overscan_appropriate_flag
+    if (br.read_bit1()) {                              // video_signal_type_present_flag
+        br.skip_bits(3);                               // video_format
+        out.video_full_range_flag = br.read_bit1();
+        if (br.read_bit1()) {                          // colour_description_present_flag
+            out.colour_primaries         = static_cast<int>(br.read_bits(8));
+            out.transfer_characteristics = static_cast<int>(br.read_bits(8));
+            out.matrix_coefficients      = static_cast<int>(br.read_bits(8));
+        }
+    }
+    if (br.read_bit1()) {                              // chroma_loc_info_present_flag
+        (void)br.read_ue();
+        (void)br.read_ue();
+    }
+    if (br.read_bit1()) {                              // timing_info_present_flag
+        br.skip_bits(32 + 32 + 1);
+    }
+    const bool nal_hrd = br.read_bit1();
+    auto skip_hrd = [&] {
+        const uint32_t cpb_cnt = br.read_ue() + 1u;
+        if (cpb_cnt > 32) { br.bad = true; return; }
+        br.skip_bits(4 + 4);                            // bit_rate_scale + cpb_size_scale
+        for (uint32_t i = 0; i < cpb_cnt; ++i) {
+            (void)br.read_ue(); (void)br.read_ue();
+            br.skip_bits(1);
+        }
+        br.skip_bits(5 + 5 + 5 + 5);                    // 4×fixed-length 5-bit
+    };
+    if (nal_hrd) skip_hrd();
+    const bool vcl_hrd = br.read_bit1();
+    if (vcl_hrd) skip_hrd();
+    if (nal_hrd || vcl_hrd) br.skip_bits(1);           // low_delay_hrd_flag
+    br.skip_bits(1);                                   // pic_struct_present_flag
+
+    if (br.read_bit1()) {                              // bitstream_restriction_flag
+        out.bitstream_restriction = true;
+        br.skip_bits(1);                               // motion_vectors_over_pic_boundaries_flag
+        (void)br.read_ue();                            // max_bytes_per_pic_denom
+        (void)br.read_ue();                            // max_bits_per_mb_denom
+        (void)br.read_ue();                            // log2_max_mv_length_horizontal
+        (void)br.read_ue();                            // log2_max_mv_length_vertical
+        out.max_num_reorder_frames = br.read_ue();
+        (void)br.read_ue();                            // max_dec_frame_buffering
+    }
+    out.parsed = !br.bad;
+}
+
 bool sei_has_recovery_point_zero(std::span<const uint8_t> nal_no_header) noexcept {
     // SEI payload sequence: each = (type, size, payload, more...). Loop until trailing 0x80 or end.
     // recovery_frame_cnt 是无符号 ue(v)；read first byte's leading zeros to estimate length.
@@ -117,6 +297,12 @@ void DepackH264::set_sprop_parameter_sets(std::string_view base64_csv) noexcept 
         if (comma == std::string_view::npos) break;
         base64_csv.remove_prefix(comma + 1);
     }
+    parse_sps_locked();
+}
+
+void DepackH264::parse_sps_locked() noexcept {
+    if (sps_.empty()) { sps_info_ = H264SpsInfo{}; return; }
+    parse_h264_sps(std::span<const uint8_t>(sps_), sps_info_);
 }
 
 void DepackH264::on_rtp(int64_t pts_us, bool marker, std::span<const uint8_t> payload) noexcept {
@@ -135,7 +321,10 @@ void DepackH264::on_rtp(int64_t pts_us, bool marker, std::span<const uint8_t> pa
         // Single NAL
         append_annexb(au_buffer_, payload);
         if (t == kNalTypeIdr) saw_idr_in_au_ = true;
-        if (t == kNalTypeSps) sps_.assign(payload.begin(), payload.end());
+        if (t == kNalTypeSps) {
+            sps_.assign(payload.begin(), payload.end());
+            parse_sps_locked();
+        }
         if (t == kNalTypePps) pps_.assign(payload.begin(), payload.end());
         if (t == kNalTypeSei && payload.size() > 1 &&
             sei_has_recovery_point_zero(payload.subspan(1))) {
@@ -153,7 +342,10 @@ void DepackH264::on_rtp(int64_t pts_us, bool marker, std::span<const uint8_t> pa
             append_annexb(au_buffer_, nal);
             const uint8_t nt = nal_type(nal.front());
             if (nt == kNalTypeIdr) saw_idr_in_au_ = true;
-            if (nt == kNalTypeSps) sps_.assign(nal.begin(), nal.end());
+            if (nt == kNalTypeSps) {
+                sps_.assign(nal.begin(), nal.end());
+                parse_sps_locked();
+            }
             if (nt == kNalTypePps) pps_.assign(nal.begin(), nal.end());
             if (nt == kNalTypeSei && nal.size() > 1 &&
                 sei_has_recovery_point_zero(nal.subspan(1))) {
@@ -181,7 +373,10 @@ void DepackH264::on_rtp(int64_t pts_us, bool marker, std::span<const uint8_t> pa
             if (end) {
                 append_annexb(au_buffer_, std::span<const uint8_t>(fu_buffer_));
                 if (in_t == kNalTypeIdr) saw_idr_in_au_ = true;
-                if (in_t == kNalTypeSps) sps_.assign(fu_buffer_.begin(), fu_buffer_.end());
+                if (in_t == kNalTypeSps) {
+                    sps_.assign(fu_buffer_.begin(), fu_buffer_.end());
+                    parse_sps_locked();
+                }
                 if (in_t == kNalTypePps) pps_.assign(fu_buffer_.begin(), fu_buffer_.end());
                 if (in_t == kNalTypeSei && fu_buffer_.size() > 1 &&
                     sei_has_recovery_point_zero(std::span<const uint8_t>(fu_buffer_).subspan(1))) {

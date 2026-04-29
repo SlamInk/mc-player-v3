@@ -1,6 +1,7 @@
 #include "media/depack_h265.h"
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cstring>
 
@@ -67,13 +68,136 @@ constexpr uint8_t kNalApPacket   = 48;     // RFC 7798 §4.4.2 Aggregation Packe
 constexpr uint8_t kNalFuPacket   = 49;     // RFC 7798 §4.4.3 Fragmentation Unit
 constexpr uint8_t kNalPaciPacket = 50;     // 不支持
 
+// ──────────────────────────────────────────────────────────
+// 最小 H.265 SPS 解析：仅抽 sps_max_num_reorder_pics 与 VUI 颜色 4 字段。
+// ──────────────────────────────────────────────────────────
+struct BitReader {
+    const uint8_t* p   = nullptr;
+    std::size_t    n   = 0;
+    std::size_t    pos = 0;
+    bool           bad = false;
+    uint32_t read_bits(int k) noexcept {
+        uint32_t v = 0;
+        for (int i = 0; i < k; ++i) {
+            if (pos >= n * 8) { bad = true; return 0; }
+            v = (v << 1) | static_cast<uint32_t>((p[pos >> 3] >> (7 - (pos & 7))) & 1u);
+            ++pos;
+        }
+        return v;
+    }
+    bool     read_bit1() noexcept { return read_bits(1) != 0; }
+    void     skip_bits(int k) noexcept { (void)read_bits(k); }
+    uint32_t read_ue() noexcept {
+        int zeros = 0;
+        while (!bad && read_bits(1) == 0) {
+            ++zeros;
+            if (zeros > 32) { bad = true; return 0; }
+        }
+        if (bad) return 0;
+        if (zeros == 0) return 0;
+        const uint32_t body = read_bits(zeros);
+        return (1u << zeros) - 1u + body;
+    }
+    int32_t read_se() noexcept {
+        const uint32_t k = read_ue();
+        return (k & 1u) ? static_cast<int32_t>((k + 1u) >> 1) : -static_cast<int32_t>(k >> 1);
+    }
+};
+
+std::vector<uint8_t> rbsp_unescape(std::span<const uint8_t> ebsp) noexcept {
+    std::vector<uint8_t> out;
+    out.reserve(ebsp.size());
+    int zeros = 0;
+    for (uint8_t b : ebsp) {
+        if (zeros >= 2 && b == 0x03) { zeros = 0; continue; }
+        out.push_back(b);
+        zeros = (b == 0) ? zeros + 1 : 0;
+    }
+    return out;
+}
+
+void skip_profile_tier_level(BitReader& br, int max_sub_layers_minus1) noexcept {
+    // profile_tier_level() — 主层 11 字节 + 子层标志位（参考 codec_dxva_video.cpp 已有 parse_ptl 实现，
+    // 此处做最小裁剪，跳过所有字段不读语义）。
+    br.skip_bits(2 + 1 + 5);                    // profile_space + tier_flag + profile_idc
+    br.skip_bits(32);                           // profile_compatibility_flag[32]
+    br.skip_bits(48);                           // progressive/interlaced/non_packed/frame_only/compatibility_indications
+    br.skip_bits(8);                            // general_level_idc
+    if (max_sub_layers_minus1 > 0) {
+        std::array<bool, 8> profile_present_flag{}, level_present_flag{};
+        for (int i = 0; i < max_sub_layers_minus1; ++i) {
+            profile_present_flag[i] = br.read_bit1();
+            level_present_flag[i]   = br.read_bit1();
+        }
+        // reserved_zero_2bits aligned to 8
+        for (int i = max_sub_layers_minus1; i < 8; ++i) br.skip_bits(2);
+        for (int i = 0; i < max_sub_layers_minus1; ++i) {
+            if (profile_present_flag[i]) br.skip_bits(2 + 1 + 5 + 32 + 48);
+            if (level_present_flag[i])   br.skip_bits(8);
+        }
+    }
+}
+
+void parse_h265_sps(std::span<const uint8_t> sps_nal, H265SpsInfo& out) noexcept {
+    out = H265SpsInfo{};
+    if (sps_nal.size() < 5) return;
+    auto rbsp = rbsp_unescape(sps_nal.subspan(2));     // 跳过 2B NAL header
+    if (rbsp.size() < 4) return;
+    BitReader br{rbsp.data(), rbsp.size(), 0, false};
+
+    br.skip_bits(4);                                   // sps_video_parameter_set_id
+    const uint32_t max_sub_layers_minus1 = br.read_bits(3);
+    br.skip_bits(1);                                   // sps_temporal_id_nesting_flag
+    skip_profile_tier_level(br, static_cast<int>(max_sub_layers_minus1));
+    if (br.bad) return;
+    (void)br.read_ue();                                // sps_seq_parameter_set_id
+    const uint32_t chroma_format_idc = br.read_ue();
+    if (chroma_format_idc == 3) br.skip_bits(1);
+    out.pic_width  = br.read_ue();
+    out.pic_height = br.read_ue();
+    if (br.read_bit1()) {                              // conformance_window_flag
+        (void)br.read_ue(); (void)br.read_ue();
+        (void)br.read_ue(); (void)br.read_ue();
+    }
+    (void)br.read_ue();                                // bit_depth_luma_minus8
+    (void)br.read_ue();                                // bit_depth_chroma_minus8
+    (void)br.read_ue();                                // log2_max_pic_order_cnt_lsb_minus4
+    const bool sub_layer_ordering_info_present = br.read_bit1();
+    const uint32_t start = sub_layer_ordering_info_present ? 0 : max_sub_layers_minus1;
+    uint32_t max_reorder_top = 0;
+    for (uint32_t i = start; i <= max_sub_layers_minus1; ++i) {
+        (void)br.read_ue();                            // sps_max_dec_pic_buffering_minus1
+        const uint32_t mr = br.read_ue();              // sps_max_num_reorder_pics
+        (void)br.read_ue();                            // sps_max_latency_increase_plus1
+        if (i == max_sub_layers_minus1) max_reorder_top = mr;
+    }
+    out.max_num_reorder_pics = max_reorder_top;
+    if (br.bad) return;
+    out.parsed = true;     // reorder 已可信；VUI 颜色 v1 不解（RPS 变长需完整逻辑）
+    (void)br.read_ue();                                // log2_min_luma_coding_block_size_minus3
+    (void)br.read_ue();                                // log2_diff_max_min_luma_coding_block_size
+    (void)br.read_ue();                                // log2_min_luma_transform_block_size_minus2
+    (void)br.read_ue();                                // log2_diff_max_min_luma_transform_block_size
+    (void)br.read_ue();                                // max_transform_hierarchy_depth_inter
+    (void)br.read_ue();                                // max_transform_hierarchy_depth_intra
+    // VUI 与 scaling_list / RPS 之后，v1 不解析。reorder 与启发式色彩兜底已足够。
+}
+
 }  // namespace
 
 DepackH265::DepackH265(EmitFn emit) noexcept : emit_{std::move(emit)} {}
 
 void DepackH265::set_sprop_vps(std::string_view base64) noexcept { vps_ = base64_decode(base64); }
-void DepackH265::set_sprop_sps(std::string_view base64) noexcept { sps_ = base64_decode(base64); }
+void DepackH265::set_sprop_sps(std::string_view base64) noexcept {
+    sps_ = base64_decode(base64);
+    parse_sps_locked();
+}
 void DepackH265::set_sprop_pps(std::string_view base64) noexcept { pps_ = base64_decode(base64); }
+
+void DepackH265::parse_sps_locked() noexcept {
+    if (sps_.empty()) { sps_info_ = H265SpsInfo{}; return; }
+    parse_h265_sps(std::span<const uint8_t>(sps_), sps_info_);
+}
 
 void DepackH265::on_rtp(int64_t pts_us, bool marker, std::span<const uint8_t> payload) noexcept {
     if (payload.size() < 2) return;
@@ -101,7 +225,7 @@ void DepackH265::on_rtp(int64_t pts_us, bool marker, std::span<const uint8_t> pa
             append_annexb(au_buffer_, nal);
             if (is_irap(nt))     saw_irap_in_au_     = true;
             if (nt == 32)        vps_ = std::vector<uint8_t>(nal.begin(), nal.end());
-            else if (nt == 33)   sps_ = std::vector<uint8_t>(nal.begin(), nal.end());
+            else if (nt == 33) { sps_ = std::vector<uint8_t>(nal.begin(), nal.end()); parse_sps_locked(); }
             else if (nt == 34)   pps_ = std::vector<uint8_t>(nal.begin(), nal.end());
             i += nal_size;
         }
@@ -132,7 +256,7 @@ void DepackH265::on_rtp(int64_t pts_us, bool marker, std::span<const uint8_t> pa
                 append_annexb(au_buffer_, nal);
                 if (is_irap(nt))   saw_irap_in_au_ = true;
                 if (nt == 32)      vps_ = std::vector<uint8_t>(nal.begin(), nal.end());
-                else if (nt == 33) sps_ = std::vector<uint8_t>(nal.begin(), nal.end());
+                else if (nt == 33) { sps_ = std::vector<uint8_t>(nal.begin(), nal.end()); parse_sps_locked(); }
                 else if (nt == 34) pps_ = std::vector<uint8_t>(nal.begin(), nal.end());
                 fu_in_progress_ = false;
                 fu_buffer_.clear();
@@ -146,7 +270,7 @@ void DepackH265::on_rtp(int64_t pts_us, bool marker, std::span<const uint8_t> pa
         append_annexb(au_buffer_, payload);
         if (is_irap(t)) saw_irap_in_au_ = true;
         if (t == 32)      vps_ = std::vector<uint8_t>(payload.begin(), payload.end());
-        else if (t == 33) sps_ = std::vector<uint8_t>(payload.begin(), payload.end());
+        else if (t == 33) { sps_ = std::vector<uint8_t>(payload.begin(), payload.end()); parse_sps_locked(); }
         else if (t == 34) pps_ = std::vector<uint8_t>(payload.begin(), payload.end());
     } else {
         MCP_LOGF(pal::LogLevel::warn,

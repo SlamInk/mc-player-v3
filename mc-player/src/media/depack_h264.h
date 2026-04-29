@@ -38,6 +38,25 @@ struct H264AccessUnit {
     bool                     params_present   = false;     // SPS/PPS 已缓存
 };
 
+/// SPS 解析信息（ADD §5.6.4 B-Frame Policy + §5.12 Color VUI）。
+/// max_num_reorder_frames 从 VUI bitstream_restriction 段读取——
+/// 0 = 流不会重排序，可放心开 LowLatencyMode；>0 必须取消 LowLatency 否则花屏。
+/// VUI 颜色 4 字段缺失时为 -1，由 controller 走 color_meta 三级兜底。
+struct H264SpsInfo {
+    bool     parsed                    = false;
+    uint8_t  profile_idc               = 0;
+    uint8_t  constraint_flags          = 0;
+    uint8_t  level_idc                 = 0;
+    uint32_t pic_width_in_mbs          = 0;
+    uint32_t pic_height_in_map_units   = 0;
+    uint32_t max_num_reorder_frames    = 0;
+    bool     bitstream_restriction     = false;
+    int      colour_primaries          = -1;
+    int      matrix_coefficients       = -1;
+    int      transfer_characteristics  = -1;
+    bool     video_full_range_flag     = false;
+};
+
 class DepackH264 {
 public:
     using EmitFn = std::function<void(H264AccessUnit&&)>;
@@ -57,12 +76,18 @@ public:
     /// Device Lost / 重连 → 重置 FU 重组状态、恢复标记、缓存 SPS/PPS。
     void reset() noexcept;
 
+    /// 当前已解析的 SPS info（由 sprop 或带内 SPS 触发解析）。
+    const H264SpsInfo& sps_info() const noexcept { return sps_info_; }
+
 private:
     void emit_au(int64_t pts_us, bool with_extradata) noexcept;
+
+    void parse_sps_locked() noexcept;     // 内部：sps_ 变更时调用，填充 sps_info_
 
     EmitFn               emit_;
     std::vector<uint8_t> sps_;
     std::vector<uint8_t> pps_;
+    H264SpsInfo          sps_info_;
     std::vector<uint8_t> au_buffer_;       // 当前正在拼装的 AU（Annex-B）
     std::vector<uint8_t> fu_buffer_;       // FU-A 重组中的单 NAL
     bool                 fu_in_progress_     = false;

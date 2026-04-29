@@ -33,6 +33,20 @@ struct H265AccessUnit {
     bool                 params_present   = false;
 };
 
+/// SPS 解析信息（ADD §5.6.4 / §5.12）。
+/// sps_max_num_reorder_pics 取最高 sub-layer 的值——0 即无 B 帧重排序。
+struct H265SpsInfo {
+    bool     parsed                    = false;
+    uint32_t pic_width                 = 0;
+    uint32_t pic_height                = 0;
+    uint32_t max_num_reorder_pics      = 0;
+    bool     vui_present               = false;
+    int      colour_primaries          = -1;
+    int      matrix_coefficients       = -1;
+    int      transfer_characteristics  = -1;
+    bool     video_full_range_flag     = false;
+};
+
 class DepackH265 {
 public:
     using EmitFn = std::function<void(H265AccessUnit&&)>;
@@ -47,11 +61,15 @@ public:
     void mark_reference_lost() noexcept;
     void reset() noexcept;
 
+    const H265SpsInfo& sps_info() const noexcept { return sps_info_; }
+
 private:
     void emit_au(int64_t pts_us, bool with_extradata) noexcept;
+    void parse_sps_locked() noexcept;
 
     EmitFn               emit_;
     std::vector<uint8_t> vps_, sps_, pps_;
+    H265SpsInfo          sps_info_;
     std::vector<uint8_t> au_buffer_;
     std::vector<uint8_t> fu_buffer_;
     bool                 fu_in_progress_     = false;

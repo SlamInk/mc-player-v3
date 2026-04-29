@@ -65,6 +65,19 @@ public:
     static std::optional<SdpSession> parse(std::string_view text) noexcept;
 };
 
+/// H.264 profile-level-id（RFC 6184 §8.1）3 字节 hex —— profile_idc / constraint_flags / level_idc。
+struct H264ProfileLevelId {
+    uint8_t profile_idc      = 0;
+    uint8_t constraint_flags = 0;     // constraint_set0..7
+    uint8_t level_idc        = 0;
+};
+/// 解析 6 hex 字符（"42e01e" 等）；失败返回 std::nullopt。
+std::optional<H264ProfileLevelId> parse_h264_profile_level_id(std::string_view hex) noexcept;
+
+/// 用 profile-level-id 推断该流是否绝不会出现 B 帧（Constrained Baseline / Baseline /
+/// Constrained High）。返回 true 即可放心开 LowLatencyMode；false 表示未知或可能含 B 帧。
+bool h264_profile_excludes_b_frames(const H264ProfileLevelId& plid) noexcept;
+
 }  // namespace mcp::transport
 
 #endif  // MC_PLAYER_TRANSPORT_SDP_PARSER_H_

@@ -208,4 +208,36 @@ std::optional<SdpSession> SdpParser::parse(std::string_view text) noexcept {
     return sess;
 }
 
+std::optional<H264ProfileLevelId> parse_h264_profile_level_id(std::string_view hex) noexcept {
+    if (hex.size() != 6) return std::nullopt;
+    auto h = [](char c) -> int {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        return -1;
+    };
+    int b[6];
+    for (int i = 0; i < 6; ++i) { b[i] = h(hex[i]); if (b[i] < 0) return std::nullopt; }
+    H264ProfileLevelId out;
+    out.profile_idc      = static_cast<uint8_t>((b[0] << 4) | b[1]);
+    out.constraint_flags = static_cast<uint8_t>((b[2] << 4) | b[3]);
+    out.level_idc        = static_cast<uint8_t>((b[4] << 4) | b[5]);
+    return out;
+}
+
+bool h264_profile_excludes_b_frames(const H264ProfileLevelId& plid) noexcept {
+    // ITU-T H.264 Annex A profile_idc：
+    //   66 = Baseline；constraint_set1=1 → Constrained Baseline（必无 B 帧）。
+    //   77 = Main；100 = High（可含 B 帧），constraint_set4=1 + constraint_set5=1 → Constrained High（无 B 帧）。
+    // 其它 profile（Extended 88 / High10 110 等）按规范可含 B，保守返 false。
+    const uint8_t cs = plid.constraint_flags;
+    const bool cs1 = (cs & 0x40) != 0;     // constraint_set1_flag
+    const bool cs4 = (cs & 0x08) != 0;     // constraint_set4_flag
+    const bool cs5 = (cs & 0x04) != 0;     // constraint_set5_flag
+    if (plid.profile_idc == 66) return true;                        // Baseline / Constrained Baseline 都无 B
+    if (plid.profile_idc == 100 && cs4 && cs5) return true;          // Constrained High
+    if (cs1) return true;                                            // 任何 profile + constraint_set1 → 排除 B 帧
+    return false;
+}
+
 }  // namespace mcp::transport
