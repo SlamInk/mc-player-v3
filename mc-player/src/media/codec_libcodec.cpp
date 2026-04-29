@@ -1,8 +1,16 @@
 #include "media/codec_libcodec.h"
 
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <mutex>
+#include <thread>
+#include <vector>
+
 #include "mc-libcodec/mc_libcodec.h"
 #include "pal/error.h"
 #include "pal/log.h"
+#include "pal/thread.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -29,6 +37,22 @@ struct CodecLibcodecVideo::Impl {
     ComPtr<ID3D11Texture2D>         upload_tex;
     uint32_t                        upload_w = 0;
     uint32_t                        upload_h = 0;
+
+    // T4-Soft worker（ADD §3.3）：原版 mclc_submit + mclc_pull 同步在 RX 线程跑，
+    // 现拆到独立 worker，submit 仅入队。
+    struct PendingAu {
+        std::vector<uint8_t> bytes;
+        int64_t              pts_us = 0;
+    };
+    static constexpr std::size_t kAuQueueMax = 16;
+
+    std::thread                     worker_thread;
+    std::atomic<bool>               worker_stop{false};
+    std::mutex                      au_mu;
+    std::condition_variable         au_cv;
+    std::deque<PendingAu>           au_queue;
+
+    void worker_loop() noexcept;
 
     bool ensure_upload_texture(uint32_t w, uint32_t h) noexcept {
         if (upload_tex && upload_w == w && upload_h == h) return true;
@@ -113,37 +137,82 @@ mc_status_t CodecLibcodecVideo::start() noexcept {
              "CodecLibcodecVideo: started codec=%d (libcodec software fallback; "
              "Phase 1 only — emits decode_error placeholders pending Phase 2-4)",
              static_cast<int>(impl_->cfg.codec));
+
+    // 启动 T4-Soft worker。
+    impl_->worker_stop.store(false, std::memory_order_release);
+    impl_->worker_thread = std::thread([impl = impl_.get()] { impl->worker_loop(); });
     return MC_OK;
 }
 
-void CodecLibcodecVideo::submit(std::span<const uint8_t> au, int64_t pts_us) noexcept {
+void CodecLibcodecVideo::submit(std::vector<uint8_t> au_bytes, int64_t pts_us) noexcept {
     if (!impl_->decoder) return;
-    mclc_submit(impl_->decoder, au.data(), au.size(), pts_us);
-
-    // 同步 drain：libcodec 是 single-threaded，在 submit 内即可 pull。
-    while (true) {
-        mclc_nv12_frame_t f{};
-        f.struct_size    = sizeof(f);
-        f.struct_version = MCLC_NV12_FRAME_VERSION;
-        const mclc_status_t s = mclc_pull(impl_->decoder, &f);
-        if (s == MCLC_ERR_NEED_MORE_INPUT) break;
-        if (s != MCLC_OK) break;
-        impl_->upload_and_emit(f);
+    Impl::PendingAu p;
+    p.bytes  = std::move(au_bytes);
+    p.pts_us = pts_us;
+    {
+        std::scoped_lock lk{impl_->au_mu};
+        while (impl_->au_queue.size() >= Impl::kAuQueueMax) {
+            impl_->au_queue.pop_front();
+        }
+        impl_->au_queue.push_back(std::move(p));
     }
+    impl_->au_cv.notify_one();
 }
 
 void CodecLibcodecVideo::flush() noexcept {
+    {
+        std::scoped_lock lk{impl_->au_mu};
+        impl_->au_queue.clear();
+    }
     if (impl_->decoder) mclc_flush(impl_->decoder);
 }
 
 void CodecLibcodecVideo::stop() noexcept {
     if (!impl_) return;
+    impl_->worker_stop.store(true, std::memory_order_release);
+    impl_->au_cv.notify_all();
+    if (impl_->worker_thread.joinable()) impl_->worker_thread.join();
+
     if (impl_->decoder) {
         mclc_destroy(impl_->decoder);
         impl_->decoder = nullptr;
     }
     impl_->upload_tex.Reset();
     impl_->ctx.Reset();
+}
+
+void CodecLibcodecVideo::Impl::worker_loop() noexcept {
+    pal::ThreadRegistration reg;
+    pal::ThreadOptions opt;
+    opt.name        = "mc-player T4 Libcodec-Decode";
+    opt.mmcss_task  = pal::MmcssTask::playback;
+    reg.apply(opt);
+
+    while (!worker_stop.load(std::memory_order_acquire)) {
+        PendingAu au;
+        {
+            std::unique_lock lk{au_mu};
+            au_cv.wait(lk, [&]{
+                return worker_stop.load(std::memory_order_acquire) || !au_queue.empty();
+            });
+            if (worker_stop.load(std::memory_order_acquire)) break;
+            au = std::move(au_queue.front());
+            au_queue.pop_front();
+        }
+
+        mclc_submit(decoder, au.bytes.data(), au.bytes.size(), au.pts_us);
+
+        // Drain：libcodec 是 single-threaded，submit 后立即 pull。
+        while (true) {
+            mclc_nv12_frame_t f{};
+            f.struct_size    = sizeof(f);
+            f.struct_version = MCLC_NV12_FRAME_VERSION;
+            const mclc_status_t s = mclc_pull(decoder, &f);
+            if (s == MCLC_ERR_NEED_MORE_INPUT) break;
+            if (s != MCLC_OK) break;
+            upload_and_emit(f);
+        }
+    }
 }
 
 }  // namespace mcp::media

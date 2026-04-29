@@ -8,13 +8,19 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <climits>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "pal/error.h"
 #include "pal/log.h"
+#include "pal/thread.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -492,6 +498,36 @@ struct CodecDxvaVideo::Impl {
     ComPtr<ID3D11Texture2D> out_pool;
     UINT                    out_pool_size = 4;
     UINT                    out_next       = 0;
+    bool                    out_pool_array_capable = true;
+
+    // 创建 + 烟测：对 NV12 用 R8/R8G8 plane SRV 试一次，避免 SetTexture 成功但 SRV 失败的驱动陷阱。
+    bool try_create_out_pool(const D3D11_TEXTURE2D_DESC& desc) noexcept {
+        ComPtr<ID3D11Texture2D> tex;
+        HRESULT hr = cfg.device->CreateTexture2D(&desc, nullptr, &tex);
+        if (FAILED(hr) || !tex) return false;
+        // 烟测：试创建 plane SRV，失败说明 driver 对该组合不支持 SR 路径。
+        D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = DXGI_FORMAT_R8_UNORM;
+        if (desc.ArraySize > 1) {
+            sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+            sd.Texture2DArray.MipLevels       = 1;
+            sd.Texture2DArray.FirstArraySlice = 0;
+            sd.Texture2DArray.ArraySize       = 1;
+        } else {
+            sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+            sd.Texture2D.MipLevels = 1;
+        }
+        ComPtr<ID3D11ShaderResourceView> probe_srv;
+        hr = cfg.device->CreateShaderResourceView(tex.Get(), &sd, &probe_srv);
+        if (FAILED(hr)) {
+            MCP_LOGF(pal::LogLevel::warn,
+                     "CodecDxvaVideo: out_pool SRV smoke-test failed bind=0x%X arr=%u hr=0x%08lX",
+                     desc.BindFlags, desc.ArraySize, hr);
+            return false;
+        }
+        out_pool = tex;
+        return true;
+    }
 
     // 当前 AU 累积
     std::vector<uint8_t>                 bitstream_buf;
@@ -505,6 +541,24 @@ struct CodecDxvaVideo::Impl {
     Pps*                                  cur_pps = nullptr;
 
     std::vector<uint8_t>                 scratch_rbsp;
+
+    // ─── T4-DXVA worker（ADD §3.3）─────────────────────────────────
+    // 原版 submit 同步在 RX (T2) 线程跑 NAL 解析 + DPB 管理 + DXVA EndFrame，
+    // 占用 TIME_CRITICAL + P-core 的 socket 线程几 ms，期间 socket 内核缓冲堆积。
+    // 现在拆到独立 worker：submit 仅入队，T4 worker 取出再 on_au。
+    struct PendingAu {
+        std::vector<uint8_t> bytes;
+        int64_t              pts_us = 0;
+    };
+    static constexpr std::size_t kAuQueueMax = 16;
+
+    std::thread                          worker_thread;
+    std::atomic<bool>                    worker_stop{false};
+    std::mutex                           au_mu;
+    std::condition_variable              au_cv;
+    std::deque<PendingAu>                au_queue;
+
+    void worker_loop() noexcept;
 
     // ── lifecycle ──
     HRESULT init_video_device() noexcept {
@@ -600,28 +654,46 @@ struct CodecDxvaVideo::Impl {
         }
         dpb.assign(dpb_size, DpbEntry{});
 
-        // 输出 pool — NV12 + BIND_SHADER_RESOURCE 单独使用通常不被驱动接受；
-        // dxgi_caps_probe 已验证 dual-bind 能力，所以加上 BIND_DECODER 让驱动按视频纹理对待。
+        // 输出 pool — 创建一定要支持 SRV，否则 render_d3d11 无法采样视频。
+        // AMD 独显（含 RX 7000 系列）driver 对 NV12 + BIND_DECODER + ArraySize>1
+        // 的 BIND_SHADER_RESOURCE 路径在创建 SRV 时报 E_INVALIDARG，导致渲染端
+        // 静默丢帧。所以用预飞行测试探测能否真的拿到 SRV，挑选第一个能过的方案：
+        //   ① dual-bind + ArraySize=N
+        //   ② SR-only + ArraySize=N（去 DECODER bit；不少 AMD/NV 驱动接受 NV12 SR 阵列）
+        //   ③ SR-only + ArraySize=1（最兼容兜底）
+        out_pool_array_capable = true;
         D3D11_TEXTURE2D_DESC ot = td;
         ot.ArraySize = out_pool_size;
         ot.BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
-        hr = cfg.device->CreateTexture2D(&ot, nullptr, &out_pool);
-        if (FAILED(hr)) {
-            // 退路：再去掉 DECODER bit，仅 SR + ArraySize=1。
+        bool ok = try_create_out_pool(ot);
+        if (!ok) {
             MCP_LOGF(pal::LogLevel::warn,
-                     "CodecDxvaVideo: out_pool dual-bind failed hr=0x%08lX, retry SR-only arr=1",
-                     hr);
+                     "CodecDxvaVideo: out_pool dual-bind+arr=%u failed; retry SR-only arr=%u",
+                     out_pool_size, out_pool_size);
+            ot = td;
+            ot.ArraySize = out_pool_size;
             ot.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-            ot.ArraySize = 1;
-            out_pool_size = 1;
-            hr = cfg.device->CreateTexture2D(&ot, nullptr, &out_pool);
-            if (FAILED(hr)) {
-                MCP_LOGF(pal::LogLevel::error,
-                         "CodecDxvaVideo: out_pool CreateTexture2D failed hr=0x%08lX %ux%u",
-                         hr, tex_w, tex_h);
-                return hr;
-            }
+            ok = try_create_out_pool(ot);
         }
+        if (!ok) {
+            MCP_LOGF(pal::LogLevel::warn,
+                     "CodecDxvaVideo: out_pool SR-only arr=%u failed; retry SR-only arr=1",
+                     out_pool_size);
+            out_pool_size = 1;
+            out_pool_array_capable = false;
+            ot = td;
+            ot.ArraySize = 1;
+            ot.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            ok = try_create_out_pool(ot);
+        }
+        if (!ok) {
+            MCP_LOGF(pal::LogLevel::error,
+                     "CodecDxvaVideo: out_pool 全部 fallback 失败 %ux%u", tex_w, tex_h);
+            return E_FAIL;
+        }
+        MCP_LOGF(pal::LogLevel::info,
+                 "CodecDxvaVideo: out_pool ok bind=0x%X arr=%u",
+                 ot.BindFlags, ot.ArraySize);
 
         decoder_inited = true;
         MCP_LOGF(pal::LogLevel::info,
@@ -791,6 +863,13 @@ struct CodecDxvaVideo::Impl {
             return false;
         }
         ++pic_count;
+        const bool trace_first = pic_count <= 3;
+        if (trace_first) {
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecDxvaVideo: flush#%u nal=%u poc=%d dpb=%u slices=%zu bs_bytes=%zu",
+                     pic_count, cur_nal_type, cur_poc, cur_dpb_idx,
+                     slice_ctrl.size(), bitstream_buf.size());
+        }
         DXVA_PicParams_HEVC pp{};
         fill_pic_params(pp, *cur_sps, *cur_pps, cur_nal_type, cur_poc, cur_dpb_idx);
 
@@ -802,6 +881,10 @@ struct CodecDxvaVideo::Impl {
                      "CodecDxvaVideo: DecoderBeginFrame hr=0x%08lX", hr);
             has_pic = false;
             return false;
+        }
+        if (trace_first) {
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecDxvaVideo: flush#%u DecoderBeginFrame ok", pic_count);
         }
 
         auto submit_buffer = [&](D3D11_VIDEO_DECODER_BUFFER_TYPE type,
@@ -849,17 +932,29 @@ struct CodecDxvaVideo::Impl {
             MCP_LOGF(pal::LogLevel::warn,
                      "CodecDxvaVideo: DecoderEndFrame hr=0x%08lX", hr);
         }
+        if (trace_first) {
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecDxvaVideo: flush#%u DecoderEndFrame hr=0x%08lX", pic_count, hr);
+        }
 
         // 标记 DPB 槽
         dpb[cur_dpb_idx].used = true;
         dpb[cur_dpb_idx].poc  = cur_poc;
         dpb[cur_dpb_idx].output_pending = true;
 
-        // 拷贝 DPB slice → output pool slice（对 BIND_DECODER → BIND_SHADER_RESOURCE 跨 BindFlag 拷贝）
-        const UINT out_slice = out_next;
-        out_next = (out_next + 1) % out_pool_size;
+        // 拷贝 DPB slice → output pool slice（对 BIND_DECODER → BIND_SHADER_RESOURCE 跨 BindFlag 拷贝）。
+        // ArraySize=1 的 fallback pool，dst slice 必须是 0；DPB slice 仍然按 cur_dpb_idx。
+        const UINT out_slice = out_pool_array_capable ? out_next : 0;
+        if (out_pool_array_capable) {
+            out_next = (out_next + 1) % out_pool_size;
+        }
         ctx->CopySubresourceRegion(out_pool.Get(), out_slice, 0, 0, 0,
                                     dpb_tex.Get(), cur_dpb_idx, nullptr);
+        if (trace_first) {
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecDxvaVideo: flush#%u CopySubresourceRegion done dpb=%u→pool=%u",
+                     pic_count, cur_dpb_idx, out_slice);
+        }
 
         // emit
         VideoFrame f;
@@ -884,6 +979,11 @@ struct CodecDxvaVideo::Impl {
         uint32_t mask = kValidityParams | kValidityColor | kValidityReorder | kValidityFence;
         if (anchor_armed) mask |= kValidityRefs | kValidityRecovery;
         f.validity_mask = mask;
+        if (emit_count == 0) {
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecDxvaVideo: first frame emit pts=%lld slice=%u poc=%d",
+                     static_cast<long long>(cur_pts_us), out_slice, cur_poc);
+        }
         if (cfg.emit) cfg.emit(std::move(f));
         ++emit_count;
 
@@ -1046,23 +1146,69 @@ mc_status_t CodecDxvaVideo::start() noexcept {
     }
     MCP_LOGF(pal::LogLevel::info,
              "CodecDxvaVideo: GPU supports HEVC Main, awaiting SPS to size decoder");
+
+    // 启动 T4-DXVA worker：submit 不再同步阻塞 RX 线程。
+    impl_->worker_stop.store(false, std::memory_order_release);
+    impl_->worker_thread = std::thread([impl = impl_.get()] { impl->worker_loop(); });
     return MC_OK;
 }
 
-void CodecDxvaVideo::submit(std::span<const uint8_t> au, int64_t pts_us) noexcept {
+void CodecDxvaVideo::submit(std::vector<uint8_t> au_bytes, int64_t pts_us) noexcept {
     if (!impl_->video_device) return;
-    impl_->on_au(au, pts_us);
+    Impl::PendingAu p;
+    p.bytes  = std::move(au_bytes);
+    p.pts_us = pts_us;
+    {
+        std::scoped_lock lk{impl_->au_mu};
+        // 满时丢最老（CLAUDE.md 硬约束 / ADD §6.1）
+        while (impl_->au_queue.size() >= Impl::kAuQueueMax) {
+            impl_->au_queue.pop_front();
+        }
+        impl_->au_queue.push_back(std::move(p));
+    }
+    impl_->au_cv.notify_one();
 }
 
 void CodecDxvaVideo::flush() noexcept {
+    {
+        std::scoped_lock lk{impl_->au_mu};
+        impl_->au_queue.clear();
+    }
     if (impl_->has_pic) impl_->flush_pending_pic();
     impl_->reset_dpb();
 }
 
 void CodecDxvaVideo::stop() noexcept {
     if (!impl_) return;
+    // 阶段 1：通知 worker 退出并等其结束；之后 release D3D 资源才安全。
+    impl_->worker_stop.store(true, std::memory_order_release);
+    impl_->au_cv.notify_all();
+    if (impl_->worker_thread.joinable()) impl_->worker_thread.join();
+
     flush();
     impl_->release_all();
+}
+
+void CodecDxvaVideo::Impl::worker_loop() noexcept {
+    pal::ThreadRegistration reg;
+    pal::ThreadOptions opt;
+    opt.name        = "mc-player T4 DXVA-Decode";
+    opt.mmcss_task  = pal::MmcssTask::playback;
+    reg.apply(opt);
+
+    while (!worker_stop.load(std::memory_order_acquire)) {
+        PendingAu au;
+        {
+            std::unique_lock lk{au_mu};
+            au_cv.wait(lk, [&]{
+                return worker_stop.load(std::memory_order_acquire) || !au_queue.empty();
+            });
+            if (worker_stop.load(std::memory_order_acquire)) break;
+            au = std::move(au_queue.front());
+            au_queue.pop_front();
+        }
+        on_au(std::span<const uint8_t>(au.bytes.data(), au.bytes.size()), au.pts_us);
+    }
 }
 
 }  // namespace mcp::media

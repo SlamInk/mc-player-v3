@@ -294,10 +294,12 @@ struct Controller::Impl {
         }
     }
 
-    void submit_au_to_decoder(std::span<const uint8_t> bytes, int64_t pts_us) noexcept {
-        if (codec_video)         codec_video->submit(bytes, pts_us);
-        else if (codec_dxva)     codec_dxva->submit(bytes, pts_us);
-        else if (codec_libcodec) codec_libcodec->submit(bytes, pts_us);
+    // ownership 移交链：depack → on_video_au_* → submit_au_to_decoder → codec.submit。
+    // 整条路径无中间 memcpy（vector buffer 直接移交给 codec 的 PendingAu）。
+    void submit_au_to_decoder(std::vector<uint8_t>&& bytes, int64_t pts_us) noexcept {
+        if (codec_video)         codec_video->submit(std::move(bytes), pts_us);
+        else if (codec_dxva)     codec_dxva->submit(std::move(bytes), pts_us);
+        else if (codec_libcodec) codec_libcodec->submit(std::move(bytes), pts_us);
     }
 
     void on_video_au_h264(media::H264AccessUnit&& au) noexcept {
@@ -306,10 +308,11 @@ struct Controller::Impl {
             idr_count.fetch_add(1, std::memory_order_relaxed);
             dump_armed = true;
         }
+        // dump 必须先于 move：std::move 之后 au.annexb_bytes 被掏空。
         if (dump_armed && dump_file && !au.annexb_bytes.empty()) {
             std::fwrite(au.annexb_bytes.data(), 1, au.annexb_bytes.size(), dump_file);
         }
-        submit_au_to_decoder(au.annexb_bytes, au.pts_us);
+        submit_au_to_decoder(std::move(au.annexb_bytes), au.pts_us);
     }
 
     void on_video_au_h265(media::H265AccessUnit&& au) noexcept {
@@ -321,7 +324,7 @@ struct Controller::Impl {
         if (dump_armed && dump_file && !au.annexb_bytes.empty()) {
             std::fwrite(au.annexb_bytes.data(), 1, au.annexb_bytes.size(), dump_file);
         }
-        submit_au_to_decoder(au.annexb_bytes, au.pts_us);
+        submit_au_to_decoder(std::move(au.annexb_bytes), au.pts_us);
     }
 
     void on_decoded_frame(media::VideoFrame&& f) noexcept {

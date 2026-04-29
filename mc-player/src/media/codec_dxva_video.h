@@ -25,6 +25,7 @@
 #include <functional>
 #include <memory>
 #include <span>
+#include <vector>
 
 #include "media/frame.h"
 #include "mc-player/mc_player_types.h"
@@ -47,9 +48,10 @@ public:
     CodecDxvaVideo(const CodecDxvaVideo&)            = delete;
     CodecDxvaVideo& operator=(const CodecDxvaVideo&) = delete;
 
-    /// 启动；探测 HEVC profile + decoder config + 建 DPB pool。
+    /// 启动；探测 HEVC profile + decoder config + 建 DPB pool；启动 T4-DXVA worker 线程。
     mc_status_t start() noexcept;
-    void        submit(std::span<const uint8_t> au, int64_t pts_us) noexcept;
+    /// 入异步队列；接 vector ownership 避免中间拷贝。
+    void        submit(std::vector<uint8_t> au_bytes, int64_t pts_us) noexcept;
     void        flush() noexcept;
     void        stop() noexcept;
 

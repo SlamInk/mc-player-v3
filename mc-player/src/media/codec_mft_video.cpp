@@ -16,6 +16,7 @@
 
 #include "pal/error.h"
 #include "pal/log.h"
+#include "pal/thread.h"
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfuuid.lib")
@@ -51,6 +52,10 @@ struct PendingAu {
     int64_t              pts_us = 0;
     bool                 keyframe = false;
 };
+
+// AU 队列上限 —— 30fps 下满代表 ~half second 积压（远超低延时阈值），保护性丢最老。
+// 4K60fps 下 0.27 s 积压触发丢弃；任何卡顿都不该超过这个量级。
+constexpr std::size_t kAuQueueMax = 16;
 
 }  // namespace
 
@@ -201,6 +206,7 @@ struct CodecMftVideo::Impl {
     }
 
     void event_loop() noexcept;
+    void sync_worker_loop() noexcept;
     HRESULT on_need_input() noexcept;
     HRESULT on_have_output() noexcept;
     HRESULT process_have_output(IMFSample* host_sample) noexcept;
@@ -210,6 +216,14 @@ struct CodecMftVideo::Impl {
 };
 
 void CodecMftVideo::Impl::event_loop() noexcept {
+    // T4 Video Decode (ADD §3.3)：MMCSS Playback (~优先级 23)。host 线程仅驱动事件循环；
+    // MFT 内部 worker queue 由驱动管理，不在此处注册。
+    pal::ThreadRegistration reg;
+    pal::ThreadOptions opt;
+    opt.name        = "mc-player T4 MFT-Decode";
+    opt.mmcss_task  = pal::MmcssTask::playback;
+    reg.apply(opt);
+
     while (!stop_requested.load(std::memory_order_acquire)) {
         ComPtr<IMFMediaEvent> ev;
         HRESULT hr = event_gen->GetEvent(0, &ev);
@@ -231,6 +245,35 @@ void CodecMftVideo::Impl::event_loop() noexcept {
             HRESULT err_hr = S_OK;
             ev->GetStatus(&err_hr);
             MCP_LOGF(pal::LogLevel::error, "CodecMftVideo: MEError hr=0x%08lX", err_hr);
+        }
+    }
+}
+
+void CodecMftVideo::Impl::sync_worker_loop() noexcept {
+    // sync MFT (Microsoft HEVC Video Extension 等 software MFT) 没有事件机制；
+    // 这里阻塞等 au_queue，每次 pop 一个 AU 同步跑 submit_sync (ProcessInput + drain)。
+    // 收益：把原本在 RX (T2 / TIME_CRITICAL) 上同步的软解搬到独立 MMCSS Playback 线程。
+    pal::ThreadRegistration reg;
+    pal::ThreadOptions opt;
+    opt.name        = "mc-player T4 MFT-Sync-Decode";
+    opt.mmcss_task  = pal::MmcssTask::playback;
+    reg.apply(opt);
+
+    while (!stop_requested.load(std::memory_order_acquire)) {
+        PendingAu au;
+        {
+            std::unique_lock lk{au_mu};
+            au_cv.wait(lk, [&]{
+                return stop_requested.load(std::memory_order_acquire) || !au_queue.empty();
+            });
+            if (stop_requested.load(std::memory_order_acquire)) break;
+            au = std::move(au_queue.front());
+            au_queue.pop_front();
+        }
+        HRESULT hr = submit_sync(au);
+        if (FAILED(hr)) {
+            MCP_LOGF(pal::LogLevel::warn,
+                     "CodecMftVideo: sync submit hr=0x%08lX", hr);
         }
     }
 }
@@ -345,9 +388,9 @@ HRESULT CodecMftVideo::Impl::on_have_output() noexcept {
     f.dxva_texture        = out_pool;
     f.dxva_array_slice    = dst_slice;
     f.is_keyframe         = (clean_point != 0);
-    f.color_primaries     = MC_COLOR_PRIMARIES_BT709;
-    f.color_range         = MC_COLOR_RANGE_LIMITED;
-    f.color_matrix        = MC_COLOR_MATRIX_BT709;
+    f.color_primaries     = cfg.color.primaries;
+    f.color_range         = cfg.color.range;
+    f.color_matrix        = cfg.color.matrix;
     // v1 简化：CopySubresourceRegion 已在 immediate context 上序列化，无 dual-bind 跨队列读写
     // → 把 fence bit 视作已 signal；此处仍由 FrameValidityGate 校验六类合一。
     f.validity_mask       = kValidityAll;
@@ -528,9 +571,9 @@ HRESULT CodecMftVideo::Impl::drain_sync_output() noexcept {
         f.dxva_texture        = upload_tex;
         f.dxva_array_slice    = 0;
         f.is_keyframe         = (clean_point_sync != 0);
-        f.color_primaries     = MC_COLOR_PRIMARIES_BT709;
-        f.color_range         = MC_COLOR_RANGE_LIMITED;
-        f.color_matrix        = MC_COLOR_MATRIX_BT709;
+        f.color_primaries     = cfg.color.primaries;
+        f.color_range         = cfg.color.range;
+        f.color_matrix        = cfg.color.matrix;
         f.validity_mask       = kValidityAll;
         if (cfg.emit) cfg.emit(std::move(f));
     }
@@ -688,6 +731,40 @@ mc_status_t CodecMftVideo::start(std::span<const uint8_t> /*extradata*/) noexcep
         impl_->update_output_dims();
     }
 
+    // ADD §5.6.3 / ADR-014：CODECAPI_AVLowLatencyMode —— 禁掉 reorder buffer，
+    // 客户端内部解码延时降到 5~10 ms 量级（不设时 MFT 默认开 reorder 多缓 1~3 帧）。
+    // 类型陷阱：H.264 用 VT_UI4=1（MS Learn 明示），其它 codec 文档未声明，按惯例
+    // VT_BOOL=TRUE，失败即降级 VT_UI4 再试一次；都失败仅记日志不阻断启动。
+    // B-Frame Policy（ADD §5.6.4）：caller 检出 reorder>0 必传 prefer_low_latency=false
+    // 否则与 LowLatency 模式冲突 → 必然花屏。
+    if (impl_->cfg.prefer_low_latency) {
+        ComPtr<ICodecAPI> codec_api;
+        if (SUCCEEDED(impl_->transform.As(&codec_api)) && codec_api) {
+            const bool is_h264 = impl_->cfg.codec == MC_VIDEO_CODEC_H264;
+            VARIANT v{};
+            HRESULT hl = E_FAIL;
+            if (is_h264) {
+                v.vt = VT_UI4;  v.ulVal = 1;
+                hl = codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &v);
+            } else {
+                v.vt = VT_BOOL; v.boolVal = VARIANT_TRUE;
+                hl = codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &v);
+                if (FAILED(hl)) {
+                    v = {};
+                    v.vt = VT_UI4; v.ulVal = 1;
+                    hl = codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &v);
+                }
+            }
+            MCP_LOGF(SUCCEEDED(hl) ? pal::LogLevel::info : pal::LogLevel::warn,
+                     "CodecMftVideo: AVLowLatencyMode set hr=0x%08lX (codec=%s type=%s)",
+                     hl, codec_name(impl_->cfg.codec), is_h264 ? "VT_UI4" : "VT_BOOL/UI4");
+        } else {
+            MCP_LOG_WARN("CodecMftVideo: ICodecAPI not exposed; LowLatencyMode skipped");
+        }
+    } else {
+        MCP_LOG_INFO("CodecMftVideo: LowLatencyMode disabled by caller (B-frame stream)");
+    }
+
     // 5. event generator（仅 async）；sync 路径无事件队列。
     if (!impl_->is_sync_mft) {
         hr = impl_->transform.As(&impl_->event_gen);
@@ -718,8 +795,12 @@ mc_status_t CodecMftVideo::start(std::span<const uint8_t> /*extradata*/) noexcep
     impl_->sync_streaming_started = true;
 
     impl_->started.store(true, std::memory_order_release);
+    // async MFT：driver 通过 IMFMediaEventGenerator 发 NeedInput/HaveOutput；event_loop 驱动。
+    // sync MFT：无事件机制，sync_worker_loop 阻塞等 au_queue + 直接 ProcessInput。
     if (!impl_->is_sync_mft) {
         impl_->event_thread = std::thread([this]{ impl_->event_loop(); });
+    } else {
+        impl_->event_thread = std::thread([this]{ impl_->sync_worker_loop(); });
     }
 
     MCP_LOGF(pal::LogLevel::info,
@@ -730,25 +811,24 @@ mc_status_t CodecMftVideo::start(std::span<const uint8_t> /*extradata*/) noexcep
     return MC_OK;
 }
 
-void CodecMftVideo::submit(std::span<const uint8_t> au, int64_t pts_us) noexcept {
+void CodecMftVideo::submit(std::vector<uint8_t> au_bytes, int64_t pts_us) noexcept {
     if (!impl_->started.load(std::memory_order_acquire)) return;
     PendingAu p;
-    p.bytes.assign(au.begin(), au.end());
+    p.bytes = std::move(au_bytes);  // ownership 移交，无 memcpy
     p.pts_us = pts_us;
-    if (impl_->is_sync_mft) {
-        // sync 路径：直接 ProcessInput + drain ProcessOutput，无事件循环。
-        HRESULT hr = impl_->submit_sync(p);
-        if (FAILED(hr)) {
-            MCP_LOGF(pal::LogLevel::warn,
-                     "CodecMftVideo: sync submit hr=0x%08lX", hr);
-        }
-        return;
-    }
     {
         std::scoped_lock lk{impl_->au_mu};
+        // 满时丢最老（CLAUDE.md 硬约束 / ADD §6.1）。低延时模式下深度积压无意义，
+        // 直接丢早 AU 让 codec 抓最近内容；下一个 IDR/recovery anchor 解 freeze。
+        while (impl_->au_queue.size() >= kAuQueueMax) {
+            impl_->au_queue.pop_front();
+        }
         impl_->au_queue.push_back(std::move(p));
     }
     impl_->au_cv.notify_one();
+    // async 路径：event_thread 在 NeedInput 事件触发时从 queue 取；
+    // sync 路径：sync_worker_loop 直接消费 queue 跑 submit_sync。
+    // 两者都不再阻塞 caller。
 }
 
 void CodecMftVideo::flush() noexcept {
@@ -763,17 +843,24 @@ void CodecMftVideo::stop() noexcept {
     impl_->stop_requested.store(true, std::memory_order_release);
     impl_->au_cv.notify_all();
 
-    if (impl_->transform) {
-        impl_->transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
-        if (impl_->is_sync_mft) {
-            // sync drain：把 MFT 内部还在的 frame 拉出来直到 NEED_MORE_INPUT
+    if (impl_->is_sync_mft) {
+        // sync 路径：先唤醒 worker 让它退出，再独占 transform 调 DRAIN + drain_sync_output。
+        // worker 与 stop 并发访问 transform 会撕裂 ProcessOutput 状态机。
+        if (impl_->event_thread.joinable()) impl_->event_thread.join();
+        if (impl_->transform) {
+            impl_->transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
             impl_->transform->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
             impl_->drain_sync_output();
-        } else {
+        }
+    } else {
+        // async 路径：driver 收到 END_OF_STREAM + DRAIN 后会发 METransformDrainComplete
+        // 事件，event_loop 内部继续抽完 NeedInput/HaveOutput 直到 driver 关闭队列。
+        if (impl_->transform) {
+            impl_->transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
             impl_->transform->ProcessMessage(MFT_MESSAGE_COMMAND_DRAIN, 0);
         }
+        if (impl_->event_thread.joinable()) impl_->event_thread.join();
     }
-    if (impl_->event_thread.joinable()) impl_->event_thread.join();
 
     if (impl_->transform) {
         impl_->transform->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
