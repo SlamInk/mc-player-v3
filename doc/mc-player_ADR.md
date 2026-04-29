@@ -4,7 +4,7 @@
 
 ---
 
-## ADR-001 Media Foundation Transform 作 OS 标准抽象兼容档（正文 §5.6.4；原决策由 ADR-015 缩窄）
+## ADR-001 Media Foundation Transform 作 OS 标准抽象兼容档（正文 §5.6.2.3；原决策由 ADR-015 缩窄）
 
 - **决策**：H.264 / H.265 / AAC 走 Windows MFT 作为**OS 标准抽象兼容档**——在 ADR-015 四级降级链中处于第 3 档（vendor SDK / DXVA-direct 之后），不再是默认主路径。仅 hardware async MFT (`hw_url=1 && async=1`) 接受为本档；sync software MFT 由 ADR-015 直接降到第 4 档软解。AAC 音频路径不受 ADR-015 影响，仍走 AAC MFT。
 - **依据**：
@@ -12,7 +12,7 @@
   - **缩窄理由（追加，2026-04-29）**：Microsoft Learn 明示 hardware MFT 是 DXVA-DDI 的协议封装，硬件路径与 DXVA-direct 等价；MFT 多出的 host 侧开销在 SPS `max_num_reorder_frames>0` 流上强制累积 ≥3 帧延时（实测 +100ms vs VLC），且 driver 内部 DPB 管理是黑盒不可调，与"极限低延时"目标不一致。详见 ADR-015。
   - **保留 MFT 而非 Supersede 的理由**：driver 暴露 hardware MFT 但 DXVA-DDI 不暴露的边缘场景仍需要 MFT；AAC 路径无 DXVA 对位实现。
 
-## ADR-002 硬件 MFT 走 async 事件驱动模型（正文 §5.6.4）
+## ADR-002 硬件 MFT 走 async 事件驱动模型（正文 §5.6.2.3）
 
 - **决策**：被 ADR-015 选中走 MFT 第 3 档时，激活硬件 MFT 必启用 async unlock，用事件生成器驱动 NeedInput / HaveOutput 循环。
 - **依据**：Microsoft 文档明确 "hardware MFT always process data asynchronously" —— 协议要求而非性能选择；sync 调用模式会 stall。
@@ -103,7 +103,7 @@
   - ADR-002 不变；明确"sync software MFT 不在约束范围"。
   - **Supersedes ADR-004**：HEVC Extension 缺失场景统一走本 ADR 的四级链。
 
-## ADR-016 vendor SDK 内置下载面板：运行期 detect + 按需下载 + 本地缓存（正文 §5.6.2）
+## ADR-016 vendor SDK 内置下载面板：运行期 detect + 按需下载 + 本地缓存（正文 §5.6.6）
 
 - **决策**：mc-player 不预 bundle vendor SDK redistributable（NVDEC / oneVPL / AMF）；在应用内提供"硬解组件"面板，按运行期检测到的 GPU vendor 引导用户下载对应 SDK 到本地缓存目录，后续启动按文件存在性 probe，不存在即降到 ADR-015 档 2。
 - **依据**：
