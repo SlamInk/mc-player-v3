@@ -24,6 +24,8 @@
 4. **变更范围**：commit 改动文件仅限本阶段计划列出的目标文件；未涉及的模块禁止触碰（避免 review 噪音 + 回归责任不清）。
 5. **commit message 格式**：`refactor(phase-N): <summary>` 或 `feat(phase-N): <summary>`，body 列出该阶段验收 metric 的实测值（before / after）。
 
+> **基础设施 phase 验收豁免**：Phase 0（性能量度地基）是引入 metric 字段本身的阶段，**正确性闸 / 延时闸 / 资源闸三条仅看埋点完整性而非业务 metric 达标值** —— 此时业务路径可能仍有未修的 +100ms sync MFT 误用等已知问题，本阶段验收只要求 metric 字段全部上报、ETW Provider 注册可见、stats JSON dump 工具可输出。具体业务 metric 达标由 Phase 1 起的"延时闸 / 正确性闸"按本表常规执行。该豁免仅适用于"引入度量基础设施"的 phase，不适用于其他业务 phase。
+
 ### 0.2 stop conditions（任一触发即暂停 + 重新评估）
 
 - 任一 metric 退化 > 5%（即上一阶段实测的 baseline）→ 回滚或修复后重测
@@ -39,7 +41,7 @@
 
 ### 0.4 测试基线
 
-- **回归基线流**：本仓库 `mc-player-dump.h265` + 一路 720p H.264 RTSP（参考 `hardware-decode-dependencies.md` §5）+ 一路 4K H.265 RTSP（手头有则用，无则跳过 4K 验收）。
+- **回归基线流**：本仓库 `mc-player-dump.h265` + 一路 720p H.264 RTSP（参考 `hardware-decode-dependencies.md` §5）+ 一路 **4K H.265 RTSP（必测，Phase 4 / 5 / 6 / 7 强制 4K 验收）**。仓库应在 CI 工件区或测试目录提供 4K H.265 测试流（推荐使用 ITU-T HM 参考流或自录 4K 样本），缺失时阶段不予 commit。
 - **VLC 对照**：每阶段实测时同一台机器同一路 RTSP 流并行播 mc-player 与 VLC，比时钟差。VLC 是事实基线（应用层管 DPB + D3D11VA），mc-player 偏差应稳定收敛到 ±2ms 以内（档 1 / 档 2 命中时）。
 - **平台覆盖**：开发机（Win11 IoT LTSC + Intel UHD 730）必测；CI 上 Win11 / Win10 22H2 / Win11 IoT LTSC 三档。
 
@@ -570,70 +572,154 @@ before/after（NVIDIA 测试机首次启动）：
 ## Phase 9 — Capability Probe Suite + Preset 架构基座（ADR-017 ~ ADR-019）
 
 > Phase 0 ~ 8 让"每个子系统单独最优"；Phase 9 让"子系统协同最优"。无 Phase 9 之前每个子系统按 worst-case 配置，端到端延时被最差档拖；有 Phase 9 后按 active_preset 联合调档，实测端到端 p95 可再降 30~50%。
+>
+> ⚠️ **scope 拆分（修订自初版）**:本 Phase 9 拆为 6 个子 phase——主线 9.0 + 5 个子目标 9.1-9.5,各自独立 commit。原"5 子目标加分项"模式被废弃,因为子目标缺失会让 SDI_REPLACEMENT preset 退化为 REALTIME_LAN 实质效果（ADD §8.4 关键洞察:SDI_REPLACEMENT ≤25ms 端到端目标依赖子目标 1-4 全命中）。新模式让"preset 命中 == 实质效果达标",避免用 metric 名字遮蔽真实落地。
 
-### 9.0 目标
+### 9.0 主线:Capability Probe + Selector + Apply
 
-- 启动期完成三维 capability probe（hardware ∩ network ∩ encoder）；输出 `CapabilitySnapshot`（ADD §7.5.1 时序）。
-- Preset Selector 落地 5 档：SDI_REPLACEMENT / REALTIME_LAN / STREAMING_WIFI / WAN_FALLBACK / SAFE_MODE（ADD §7.5.4 匹配规则）。
+#### 9.0.0 目标
+
+- 启动期完成四维 capability probe（hardware ∩ network ∩ encoder ∩ render）；输出 `CapabilitySnapshot`（ADD §7.5.1 时序;render 维度详见 capability_probe §3.5）。
+- Preset Selector 落地 5 档：SDI_REPLACEMENT / REALTIME_LAN / STREAMING_WIFI / WAN_FALLBACK / SAFE_MODE（capability_probe §6.2 匹配规则）。
 - 一次性 apply preset 到 6 个子系统（decoder / jitter / render / present / RTCP / gate），首帧前确定 active_preset。
-- 5 个短期探索性子目标——可在本 phase 内并行实施（任一未达不阻塞主线，但完成则解锁 SDI_REPLACEMENT preset 的全部潜力）：
-  1. **DCOMP NV12 直显**（ADD §5.10）：composition swapchain `DXGI_FORMAT_NV12` + MPO 多面合成，绕过 shader RGB 转换；
-  2. **RFC 5506 Reduced-Size RTCP**：与 AVPF Immediate `trr-int=0` 协同减少反馈链路开销；
-  3. **ZeroJitter 模式**（jitter target 0~1ms）：LAN-switched 链路替代 Kalman aggressive；
-  4. **Race-to-display Present**：Reflex 风格——一帧解码就绪即 Present，依赖 ALLOW_TEARING + VRR；
-  5. **CUDA Graphs 探索（NVDEC 路径）**：把"alloc + parse + decode + map"打包成单次提交（仅 NVDEC 档评估）。
+- **SDI_REPLACEMENT preset 主线降级行为**:Phase 9.0 内 SDI_REPLACEMENT 命中条件中"子目标 1-4 命中"以默认 false 返回（hardware/render probe 检出 supports_dcomp_nv12_direct=false / present 调度无 race_to_display 路径 / rtcp 无 reduced-size 协商 / jitter 无 ZeroJitter mode）;实际命中 SDI_REPLACEMENT 需 Phase 9.1-9.4 各自完成。Phase 9.0 实测稳态命中 REALTIME_LAN 为期望。
 
-> ⚠️ 5 个子目标都属于"加分项"——主线 Phase 9 验收只看 capability probe + preset selector + 一次性 apply。子目标命中即写实测增益，未命中不阻塞。
-
-### 9.1 改动范围
+#### 9.0.1 改动范围
 
 | 文件 | 动作 |
 |---|---|
 | `mc-player/src/probe/hardware_probe.{h,cpp}`（重构）| 把现有零散 probe（DXGI 枚举 / CheckVideoDecoderProfile / vendor SDK 探测）合并到统一接口，输出 `HardwareSnapshot` |
 | `mc-player/src/probe/network_probe.{h,cpp}`（新增）| RTSP keepalive RTT 或 RTCP RR/SR 反推；首 GOP 内 iat 抖动 + loss 统计；link_kind 推断（ADD §7.5.2 阈值表） |
 | `mc-player/src/probe/encoder_probe.{h,cpp}`（新增）| SDP profile-level-id 解析 + SPS VUI bitstream_restriction_flag / max_num_reorder_frames 读取 + 首 GOP DTS/PTS 实测兜底（ADD §7.5.3 三档可信度） |
+| `mc-player/src/probe/render_probe.{h,cpp}`（新增）| 显示器刷新率 / VRR / DCOMP / MPO planes 数 / hardware composition support 探测,输出 `RenderSnapshot`(capability_probe §3.5) |
 | `mc-player/src/probe/capability_snapshot.{h,cpp}`（新增）| 聚合 4 维 snapshot（hw/net/enc/render），暴露给 selector |
-| `mc-player/src/preset/preset_selector.{h,cpp}`（新增）| ADD §7.5.4 匹配算法落地，输出 `active_preset_id` |
-| `mc-player/src/preset/preset_definitions.h`（新增）| 5 档 preset 的具体参数表（jitter mode / decoder hint / render profile / present scheduling / rtcp mode），与 ADD §7.5.4 表格 1:1 |
+| `mc-player/src/preset/preset_selector.{h,cpp}`（新增）| capability_probe §6.2 匹配算法落地，输出 `active_preset_id` |
+| `mc-player/src/preset/preset_definitions.h`（新增）| 5 档 preset 的具体参数表（jitter mode / decoder hint / render profile / present scheduling / rtcp mode），与 capability_probe §6.1 表格 1:1 |
 | `mc-player/src/preset/preset_apply.cpp`（新增）| 一次性 apply preset 到 6 个子系统的协同入口 |
 | `mc-player/src/controller/controller.cpp` | 启动序列改为：`signaling 握手 ‖ probe suite` → `probe 完成` → `preset apply` → `首帧` |
-| `mc-player/src/render/dcomp_swapchain.cpp`（仅子目标 1）| swapchain DESC 的 Format 在 SDI_REPLACEMENT preset 下设 `DXGI_FORMAT_NV12`；探测 MPO planes 数 |
-| `mc-player/src/transport/rtcp_*.cpp`（仅子目标 2）| Reduced-Size RTCP 报文构造 + 接收方协商位 |
-| `mc-player/src/media/jitter_buffer.cpp`（仅子目标 3）| 增 ZeroJitter mode 分支；与 Kalman 共用接口 |
-| `mc-player/src/render/present_scheduler.cpp`（仅子目标 4）| race_to_display 模式 + ALLOW_TEARING flag 协同 |
 | `subprojects/mc-libcodec/...` | **不动**（preset 不影响 libcodec 内部，仅在 selector 决定不走档 4 时绕过它） |
 
-### 9.2 实施步骤
+#### 9.0.2 实施步骤
 
-1. **probe 框架先行**：以 `capability_snapshot.h` 为契约头，先把现有 hardware probe 重构进新接口（行为零变化），再补 network / encoder probe；这样三个 probe 可并行实现而不阻塞 selector。
-2. **selector 与 preset 表落地**：完成 ADD §7.5.4 匹配算法 + ADD §3.5 / §7.5.4 子系统参数表；初版 selector 输入 hardcoded snapshot 单测。
+1. **probe 框架先行**：以 `capability_snapshot.h` 为契约头，先把现有 hardware probe 重构进新接口（行为零变化），再补 network / encoder / render probe；这样四个 probe 可并行实现而不阻塞 selector。
+2. **selector 与 preset 表落地**：完成 capability_probe §6.2 匹配算法 + §6.1 子系统参数表；初版 selector 输入 hardcoded snapshot 单测。
 3. **6 个子系统 apply 接口**：每个子系统暴露 `apply_preset(const Preset&)` 接口，幂等（同一 preset 多次 apply 等价单次）。
 4. **启动序列改造**：BOOTSTRAP 默认 preset = REALTIME_LAN（保守版）；probe 完成后第一次 reload 切到正式 preset。
-5. **5 个子目标按需推进**：每个子目标独立 PR-internal；完成 + 实测增益归档进 phase 9 commit body。
 
-### 9.3 验收 metric
-
-主线（必达）：
+#### 9.0.3 验收 metric
 
 | metric | 阈值 |
 |---|---|
-| `mc.preset.active_id` | 在 LAN + NVDEC 测试机：稳定 = `SDI_REPLACEMENT` 或 `REALTIME_LAN`（取决于显示器档） |
+| `mc.preset.active_id` | 在 LAN + NVDEC + 240Hz VRR 测试机：稳定 = `REALTIME_LAN`（不到 SDI_REPLACEMENT,因 9.1-9.4 未做） |
 | `mc.preset.bootstrap_to_active_ms` | < 1500ms（首帧后第一次 reload 完成时间） |
 | `mc.probe.hardware_complete_ms` | < 200ms |
 | `mc.probe.network_complete_ms` | < 1000ms（首 GOP 到齐） |
 | `mc.probe.encoder_complete_ms` | < 1000ms（首 GOP 到齐） |
+| `mc.probe.render_complete_ms` | < 50ms（本地 DXGI / DCOMP 探测） |
 | `mc.gate.drop_*_count` warm_steady | 0（preset 切换不能引发花屏；ADR-014 不让步） |
 | `mc.preset.apply_atomic_violation_count` | 0（apply 全程帧间缝隙完成，不丢帧） |
+| `mc.e2e.client_internal_p95` | LAN + NVDEC + 144Hz VRR REALTIME_LAN 命中 → ≤20ms |
 
-子目标（命中即记，不阻塞）：
+---
 
-| metric | 阈值（命中即说明子目标成功） |
+### Phase 9.1 — 子目标 1:DCOMP NV12 直显（ADD §5.10 / 子目标 1）
+
+#### 9.1.0 目标
+
+composition swapchain `DXGI_FORMAT_NV12` + MPO 多面合成,绕过 shader RGB 转换。命中后让 SDI_REPLACEMENT preset 在 render 维度的硬性条件 `render.supports_dcomp_nv12_direct == true` 满足。
+
+#### 9.1.1 改动范围
+
+| 文件 | 动作 |
 |---|---|
-| `mc.render.dcomp_nv12_direct_active` | NVDEC + 240Hz VRR 路径下 = 1（DCOMP NV12 直显） |
-| `mc.rtcp.reduced_size_active` | 与 AVPF Immediate 协商成功后 = 1 |
-| `mc.jitter.mode` | LAN-switched 链路下 = `ZeroJitter` |
+| `mc-player/src/render/dcomp_swapchain.cpp` | swapchain DESC 的 Format 在 SDI_REPLACEMENT preset 下设 `DXGI_FORMAT_NV12`；探测 MPO planes 数 |
+| `mc-player/src/probe/render_probe.cpp` | 在 9.0 基础上补 supports_dcomp_nv12_direct 试探(尝试创建 NV12 composition swapchain) |
+
+#### 9.1.2 验收 metric
+
+| metric | 阈值 |
+|---|---|
+| `mc.render.dcomp_nv12_direct_active` | NVDEC + 240Hz VRR 路径下 = 1 |
+| `mc.preset.active_id` | 配合 9.2-9.4 完成后才能命中 SDI_REPLACEMENT;单 9.1 完成不影响命中 |
+
+---
+
+### Phase 9.2 — 子目标 2:RFC 5506 Reduced-Size RTCP
+
+#### 9.2.0 目标
+
+RFC 5506 Reduced-Size RTCP 与 AVPF Immediate `trr-int=0` 协同减少反馈链路开销;协商位与对端确认。
+
+#### 9.2.1 改动范围
+
+| 文件 | 动作 |
+|---|---|
+| `mc-player/src/transport/rtcp_*.cpp` | Reduced-Size RTCP 报文构造 + 接收方协商位 + SDP `a=rtcp-rsize` 协商 |
+
+#### 9.2.2 验收 metric
+
+| `mc.rtcp.reduced_size_active` | 与对端协商成功后 = 1 |
+
+---
+
+### Phase 9.3 — 子目标 3:ZeroJitter 模式（jitter target 0~1ms）
+
+#### 9.3.0 目标
+
+LAN-switched 链路替代 Kalman aggressive。命中后让 SDI_REPLACEMENT preset 的 jitter buffer 子系统配置可达 `target_delay = 0~1ms`。
+
+#### 9.3.1 改动范围
+
+| 文件 | 动作 |
+|---|---|
+| `mc-player/src/media/jitter_buffer.cpp` | 增 ZeroJitter mode 分支；与 Kalman 共用接口;切换不丢帧（双缓冲交替读） |
+
+#### 9.3.2 验收 metric
+
+| `mc.jitter.mode` | LAN-switched 链路 + SDI_REPLACEMENT preset 下 = `ZeroJitter` |
+| `mc.jitter.target_delay_ms` | LAN-switched 链路下 ≤ 1ms |
+
+---
+
+### Phase 9.4 — 子目标 4:Race-to-display Present
+
+#### 9.4.0 目标
+
+Reflex 风格——一帧解码就绪即 Present,依赖 ALLOW_TEARING + VRR。命中后让 SDI_REPLACEMENT preset 的 present 子系统配置可达"零等待"。
+
+#### 9.4.1 改动范围
+
+| 文件 | 动作 |
+|---|---|
+| `mc-player/src/render/present_scheduler.cpp` | race_to_display 模式 + ALLOW_TEARING flag 协同;SDI_REPLACEMENT 下激活 |
+
+#### 9.4.2 验收 metric
+
 | `mc.present.race_to_display_active` | SDI_REPLACEMENT preset 下 = 1 |
-| `mc.decoder.cuda_graph_active`（NVDEC 专属） | NVDEC 路径下 = 1（如未实装则不上报字段） |
+
+---
+
+### Phase 9.5 — 子目标 5:CUDA Graphs 探索（NVDEC 路径专属）
+
+#### 9.5.0 目标
+
+把"alloc + parse + decode + map"打包成单次 CUDA Graph 提交（仅 NVDEC 档评估）。本子目标是探索性,命中收益小(预期 -1~2ms),失败不影响 SDI_REPLACEMENT 命中。
+
+#### 9.5.1 改动范围
+
+| 文件 | 动作 |
+|---|---|
+| `mc-player/src/media/codec_nvdec.cpp` | 增 CUDA Graphs 提交路径;失败 fallback 到原 streaming 提交 |
+
+#### 9.5.2 验收 metric
+
+| `mc.decoder.cuda_graph_active`（NVDEC 专属） | NVDEC 路径下 = 1（实装失败 / 不命中则字段为 0 或不上报） |
+
+---
+
+### Phase 9.x SDI_REPLACEMENT 命中前提
+
+完成 9.0 + 9.1 + 9.2 + 9.3 + 9.4(子目标 5 可选) 后,在 NVDEC + 240Hz VRR + LAN-switched + zerolatency 编码 + DCOMP_INDEPENDENT_FLIP 测试机上,`mc.preset.active_id` 应稳定命中 `SDI_REPLACEMENT`,`mc.e2e.client_internal_p95` ≤ 8ms(ADD §8.4 SDI_REPLACEMENT 行,前提:子目标 1-4 全命中)。
 
 端到端验收：
 

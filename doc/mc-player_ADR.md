@@ -6,7 +6,7 @@
 
 ## ADR-001 Media Foundation Transform 作 OS 标准抽象兼容档（正文 §5.6.2.3；原决策由 ADR-015 缩窄）
 
-- **决策**：H.264 / H.265 / AAC 走 Windows MFT 作为**OS 标准抽象兼容档**——在 ADR-015 四级降级链中处于第 3 档（vendor SDK / DXVA-direct 之后），不再是默认主路径。仅 hardware async MFT (`hw_url=1 && async=1`) 接受为本档；sync software MFT 由 ADR-015 直接降到第 4 档软解。AAC 音频路径不受 ADR-015 影响，仍走 AAC MFT。
+- **决策**：H.264 / H.265 / AAC 走 Windows MFT 作为**OS 标准抽象兼容档**——在 ADR-015 四级降级链中处于第 3 档（vendor SDK / DXVA-direct 之后），不再是默认主路径。仅 hardware async MFT (`hw_url=1 && async=1`) 接受为本档；sync software MFT 的处理由 ADR-015 唯一定义（不在本 ADR 重复）。AAC 音频路径不受 ADR-015 影响，仍走 AAC MFT。
 - **依据**：
   - **原决策依据保留**：MFT 走 DXVA 与底层硬解管线一致；OS 内置零依赖、零 license 风险；Microsoft 官方持续维护。
   - **缩窄理由（追加，2026-04-29）**：Microsoft Learn 明示 hardware MFT 是 DXVA-DDI 的协议封装，硬件路径与 DXVA-direct 等价；MFT 多出的 host 侧开销在 SPS `max_num_reorder_frames>0` 流上强制累积 ≥3 帧延时（实测 +100ms vs VLC），且 driver 内部 DPB 管理是黑盒不可调，与"极限低延时"目标不一致。详见 ADR-015。
@@ -16,7 +16,7 @@
 
 - **决策**：被 ADR-015 选中走 MFT 第 3 档时，激活硬件 MFT 必启用 async unlock，用事件生成器驱动 NeedInput / HaveOutput 循环。
 - **依据**：Microsoft Learn 'Hardware MFTs' 文档原文 "Hardware MFTs must use the new asynchronous processing model" —— 协议要求而非性能选择；sync 调用模式不被支持。
-- **范围澄清（追加）**：本 ADR 仅约束 hardware MFT (`hw_url=1`) 路径。sync software MFT (`hw_url=0 && async=0`，如 OS 内置 `Microsoft H264 Video Decoder MFT`) 不在约束范围——它由 ADR-015 直接降到第 4 档软解，不再被当作"硬件 MFT 的同枚举兜底"。
+- **范围澄清（追加）**：本 ADR 仅约束 hardware MFT (`hw_url=1`) 路径。sync software MFT (`hw_url=0 && async=0`，如 OS 内置 `Microsoft H264 Video Decoder MFT`) 不在本 ADR 约束范围——其处理方式由 ADR-015 唯一定义（不在本 ADR 重复）。
 
 ## ADR-003 dual-bind 通过 BindFlags 显式启用（正文 §4.3）
 
@@ -62,7 +62,7 @@
 ## ADR-011 H.264 / H.265 SEP 专利责任声明（正文 §10.4）
 
 - **决策**：OS MFT 路径无责任；mc-libcodec 软解 distribute 时 distributor 自负；参考 Cisco OpenH264 源码-二进制责任分割模型。
-- **依据**：Via LA AVC / HEVC pool 与 Access Advance 现行条款；Apache 2.0 §3 含明确专利 grant。
+- **依据**：Via LA AVC / HEVC pool 与 Access Advance 现行条款；Apache 2.0 §3 含明确专利 grant（仅覆盖贡献者授予使用者贡献本身的专利，**不替代 H.264 / H.265 SEP 池授权**——商业分发 mc-libcodec 二进制需自行向 Via LA / Access Advance 申请 per-device 或 per-stream 许可，参考 Cisco OpenH264 BINARY_LICENSE 模型）。
 
 ## ADR-012 智能 render profile 选择默认 AUTO（正文 §5.10.1）
 
@@ -147,6 +147,7 @@
 ## ADR-020 Preset Live Reload + Self-Upgrade Loop（运行期适配协议；正文 §7.5.4 / §7.5.5）
 
 - **决策**：运行期持续 telemetry 反馈，当**假设破坏**触发即立即热切到下一档 Preset；当**长期延时低于设计阈值**且无 tainted 事件，主动尝试**自驱升档**到更激进 Preset。失败立即降级 + 加入本会话 blacklist 不再尝试。
+- **决策范围（hw.tier 维度限制）**：本 ADR 的 Preset 热切**不跨 ADR-015 解码档**——decoder 档位仍按 ADD §5.6.1 "降级一次性原则"在 `mc_open` 时一次确定，运行期不主动升档（如档 2 → 档 1）。原因：① 性能量度规范 §6 已有 `mc.decoder.cross_tier_demote_count`（降级）但故意不设 `cross_tier_promote_count`（升级），该缺失即设计声明；② 跨档升级要求重做完整的 decoder probe + reconfigure，与 ADR-013 双 buffered transition 类似但更复杂，超出本 ADR 范围；③ ADR-016 内置下载面板补 vendor SDK 后，仍需用户重启 / 重 `mc_open` 才能命中档 1。**SDI_REPLACEMENT preset 命中前提因此追加：启动期硬件 probe 已选中档 1 vendor SDK**——若启动时档 1 未就位、运行期再下载好 SDK，本会话保持档 2 + REALTIME_LAN preset，不切到 SDI_REPLACEMENT。
 - **依据**：
   - **网络环境运行期变化**：Wi-Fi 信号强度 / WAN 拥塞 / 用户跨网络（家网→热点→蜂窝）。Preset 一次性绑定无法应对。
   - **设计裕度可被自动消化**：性能量度规范每个 metric 的 warm_steady 阈值是保守值；实际 LAN 场景延时常远低于阈值，主动升档可拿到额外 5~10ms 收益。
@@ -155,8 +156,17 @@
 - **关系**：
   - 与 ADR-017：本 ADR 定义运行期热切协议；ADR-017 定义启动期一次性 apply。
   - 与 ADR-014（Frame Validity Gate）：切换路径所有 in-flight 帧标 invalid，等下一 refresh anchor 解 freeze——这是 Gate 污染态生命周期已规定的标准路径。
+  - 与 ADR-015（四级降级链）：本 ADR 的 Preset 热切**不跨 decoder 档**；档间升级仅在用户重 `mc_open` 时发生（见决策范围段）。
   - 与性能量度规范 §11.3：Preset 切换次数 / blacklist 命中作为新增 metric 上报（具体字段在性能规范实施期补完）。
 
 ---
 
-> 当一条决策因实证或新约束被推翻，新增 ADR 引用旧 ADR 编号并标 Superseded，不修改历史条目。
+## 修订规范
+
+每条 ADR 的"决策"与"依据"正文是**该 ADR 写就时的历史快照**，原则上不再回头修改。当一条决策因实证或新约束被推翻或缩窄时：
+
+1. **首选**：新增 ADR 引用旧 ADR 编号，旧 ADR 标 `Superseded by ADR-XXX` 或 `Narrowed by ADR-XXX`，旧 ADR 决策 / 依据正文不动。
+2. **折中允许**：在旧 ADR 末尾追加 `**修订记录（YYYY-MM-DD）**` 段补充 narrowed 后的范围说明（如 ADR-001 / ADR-002 / ADR-004 已实践此模式），但**不修改原决策与原依据正文，标题中可加"原决策由 ADR-XXX 缩窄"标注**。
+3. **禁止**：直接重写原决策段或原依据段；改写历史等于让 ADR 失去作为"决策时间线"的价值。
+
+ADR 之间的内容引用应优先单向（新 ADR 引用旧 ADR）；多条 ADR 重复同一规则时，确定唯一权威 ADR，其余以"参见 ADR-XXX"代替全文重述（见 ADR-001 / ADR-002 引用 ADR-015 sync software MFT 排除规则的方式）。

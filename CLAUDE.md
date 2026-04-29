@@ -9,11 +9,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 目录拓扑
 
 ```
-doc/                                架构与运维文档
-  ├── mc-player_架构设计文档_v3.0.md   架构设计文档（ADD）— 原理 / 架构 / 可行性
-  ├── mc-player_ADR.md                 架构决策记录（ADR-001 ~ ADR-014），与 ADD 交叉引用
-  └── hardware-decode-dependencies.md  硬件解码依赖与故障排查（IoT LTSC 等场景）
-mc-player-ui-ux/                    React UI/UX 设计稿，浏览器渲染
+doc/                                          架构与运维文档（ADD / ADR / design-detail）
+  ├── mc-player_架构设计文档_v3.0.md           ADD — 原理 / 架构 / 可行性
+  ├── mc-player_ADR.md                         ADR-001 ~ ADR-020 决策记录，与 ADD 交叉引用
+  ├── mc-player_capability_probe_设计.md       design-detail — Capability Probe Suite + Preset 的 struct/算法/状态机
+  ├── mc-player_性能量度规范.md                 metric 字段 / 阈值 / 排障(实施性规范)
+  └── hardware-decode-dependencies.md          硬件解码依赖与故障排查（IoT LTSC 等场景）
+plan/                                          实施性 roadmap
+  └── mc-player_重构方案.md                     Phase 0 ~ Phase 10 阶段交付计划
+mc-player-ui-ux/                              React UI/UX 设计稿,浏览器渲染
 ```
 
 未来按 ADD §3.1 与 ADR-010 落地的目录：
@@ -37,15 +41,26 @@ python -m http.server 8000
 
 ## 文档协作规范
 
-修改 ADD 或 ADR 时遵循以下结构性约束：
+修改文档时遵循以下结构性约束（按文档类型）：
 
-1. **ADD 是"原理 + 可行性"层，不是实施手册**。具体 API 头文件、参数清单、目录结构、迭代排期、测量工具命令明确不在 ADD 范围（见 ADD 文首声明）。新增章节前先确认归属：
-   - 决策依据 → ADR
-   - 原理 / 数据流 / 模块拓扑 / 风险对策 → ADD
-   - 命令 / API / 排期 → 仅本文件、README 或后续工程文档
-2. **ADR 一条决策 = 一个编号 + 决策 + 依据**，不展开正文。被推翻的 ADR 标 `Superseded` 但**不修改历史条目**（ADR 文件末尾说明），新增 ADR 引用旧编号。
-3. **ADD 与 ADR 双向交叉引用**：ADD 关键章节末尾标注对应 ADR 编号，ADR 在标题括号内反向标注 ADD 章节号。新增决策需同步两处。
-4. **附录 B（ADR 索引）必须与 ADR 文件保持一一对应**。
+### 文档分类
+
+| 类型 | 范围 | 允许内容 | 不允许内容 |
+|---|---|---|---|
+| **ADD**（doc/mc-player_架构设计文档_v3.0.md） | "原理 + 可行性"层 | 数据流图 / 模块拓扑 / 协议 / 算法形式化 / 风险对策 | 具体 API 头文件 / cmake target / 排期 / shell 命令 |
+| **ADR**（doc/mc-player_ADR.md） | 决策记录 | 一条决策 = 一个编号 + 决策 + 依据 | 不展开正文实现细节 |
+| **design-detail**（doc/mc-player_capability_probe_设计.md / doc/mc-player_性能量度规范.md） | ADD 与 plan 之间的实施细化层 | 数据结构定义 / 伪代码算法 / 状态机 / metric 字段名 + 单位 + 阈值 | cmake target 命名 / 具体 C/C++ 头文件签名 / 阶段排期 / shell 命令 |
+| **plan**（plan/mc-player_重构方案.md） | 实施 roadmap | 阶段排期 / commit 模板 / 验收 metric / 改动文件清单 | 决策依据（在 ADR）/ 原理论证（在 ADD） |
+| **运维文档**（doc/hardware-decode-dependencies.md） | 故障排查 + 平台特例 | PowerShell / WMIC 诊断命令 / 修复路径 | 决策（在 ADR）/ 原理（在 ADD） |
+| **本文件 CLAUDE.md** | 项目级硬约束 + 给 AI 的协作指引 | 不可妥协约束清单 / 路由速查 / 风险点 | 完整原理或决策依据（指向 ADD/ADR） |
+
+### 协作原则
+
+1. **新增章节前先确认归属**：决策依据 → ADR；原理 / 数据流 / 模块拓扑 / 风险对策 → ADD；struct + 伪代码 + metric 字段 → design-detail；命令 / 排期 / 改动文件清单 → plan；shell 命令 + 故障排查 → 运维文档。
+2. **ADR 修订规范**：见 `doc/mc-player_ADR.md` 文末"修订规范"章节——首选新开 ADR 引用旧编号；折中允许在旧 ADR 末尾追加"修订记录"段，但不修改原决策与原依据正文；禁止重写历史。
+3. **ADD ↔ ADR 双向交叉引用**：ADD 关键章节末尾标注对应 ADR 编号，ADR 在标题括号内反向标注 ADD 章节号。新增决策需同步两处。
+4. **ADD 附录 B（ADR 索引）必须与 ADR 文件保持一一对应**。
+5. **跨文档去重**：同一规则在多文档重述时确定唯一权威源（如 ADR-015 四档链权威 + ADD §5.6.1 表权威），其他位置改用"参见 ADR-XXX / ADD §X.X"引用而非重述。
 
 ## 设计原则中**不可妥协**的硬约束
 

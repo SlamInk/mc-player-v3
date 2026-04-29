@@ -129,12 +129,29 @@ struct HardwareSnapshot {
     bool                supports_dual_bind_nv12;
     bool                supports_d3d11_fence;
 
-    // 子目标 1 / 5 探针
-    bool                supports_dcomp_nv12_direct;   // composition swapchain DXGI_FORMAT_NV12 + MPO 多 plane
-    uint32_t            mpo_max_planes;               // OS 报告的 MPO planes 数（DCOMP_INDEPENDENT_FLIP 前提）
-    bool                supports_cuda_graphs;          // 仅 NVDEC tier 时有意义
+    // 注:render 相关字段(supports_dcomp_nv12_direct / mpo_max_planes 等)已拆出到独立 RenderSnapshot(§3.5)
+
+    // vendor-specific 能力（按 gpu_vendor 字段消费对应 union 分支;其余分支字段未定义）
+    union {
+        struct {
+            bool        supports_cuda_graphs;       // CUDA Graphs API 可用(NVDEC pipeline 优化)
+            // 未来扩展: bool supports_nvenc_av1; bool supports_dlss_decoder; ...
+        } nvidia;
+        struct {
+            // 未来扩展: bool supports_avx_video_extensions; bool supports_xess_decoder; ...
+            uint32_t    reserved;
+        } intel;
+        struct {
+            // 未来扩展: bool supports_amf_features_v2; ...
+            uint32_t    reserved;
+        } amd;
+    } vendor_specific;
 };
 ```
+
+> **render 字段拆出**:DCOMP NV12 直显支持 / MPO planes 数 / 显示器刷新率 / VRR 等 render 相关字段已从 HardwareSnapshot 拆出到独立的 RenderSnapshot 结构(见 §3.5),避免 hardware vs render 维度归属混乱。
+
+> **vendor-specific 字段归位原则**:任何只在某一家 GPU vendor 路径下有意义的能力字段都归入 `vendor_specific.<vendor>` 子结构,不污染通用 HardwareSnapshot 字段。selector 在消费时先检查 `gpu_vendor`,再读对应 union 分支。这避免了"Intel 永远 false"的字段堆叠。
 
 **采集步骤**：
 
@@ -142,10 +159,52 @@ struct HardwareSnapshot {
 2. `D3D11CreateDevice(adapter, ...)` → `ID3D11VideoDevice::CheckVideoDecoderProfile` 四组合（H264/H265/H265-10bit/AV1）；
 3. vendor SDK 命中检测：按 ADR-016 的 `%LOCALAPPDATA%\mc-player\sdk\<vendor>\<version>\` cache 探测 + System32 fallback；
 4. `CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS5)` 取 fence 支持；
-5. DCOMP MPO planes 数：`IDXGIOutput6::GetCurrentOutputDuplicationDescription` 或 PresentMon 实测兜底；
-6. CUDA Graphs：仅 NVDEC tier 时调 `cuGraphCreate` 试探（失败即 false，不 panic）。
+5. CUDA Graphs：仅 NVDEC tier 时调 `cuGraphCreate` 试探（失败即 false，不 panic）;结果写入 `vendor_specific.nvidia.supports_cuda_graphs`。
 
 **fail-open 原则**（ADD §2 #11）：任何探测失败 → 对应字段置 false，**不抛异常**。后续 selector 会按"能力差"路径选 preset。
+
+---
+
+## 3.5 RenderSnapshot（ADR-008 / ADR-012;独立第 4 维 probe）
+
+**采集源**：本地 DXGI / DCOMP / DWM 探测 + 显示器 EDID 读取;可在 ~50ms 内完成(纯本地查询)。
+
+```
+struct RenderSnapshot {
+    // 显示器物理参数
+    uint32_t            primary_monitor_refresh_rate_hz;   // 60 / 120 / 144 / 240 / ...
+    bool                vrr_enabled;                       // 显示器 VRR (G-Sync / FreeSync) 启用状态
+    bool                hdr_enabled;                       // 显示器 HDR 输出启用状态(预留 milestone)
+    color_gamut_t       primary_color_gamut;               // {sRGB, P3, BT2020} - EDID 读取
+    uint32_t            primary_panel_response_ms;         // 面板响应时间(EDID 或硬编码估值)
+
+    // 渲染 profile 能力(ADR-012 智能 render profile 选择)
+    render_profile_t    profile;                           // {COMPAT, BALANCED, EXTREME, ULTIMATE_DCOMP}
+                                                           // 由智能选择算法根据下面三 bit 决定
+    bool                supports_allow_tearing;            // DXGI_FEATURE_PRESENT_ALLOW_TEARING 可用
+    bool                supports_hardware_composition;     // CheckHardwareCompositionSupport 通过
+    bool                supports_dcomp;                    // IDCompositionDevice 创建成功
+
+    // ADR-008 + 子目标 1:DCOMP NV12 直显与 MPO 多面合成
+    bool                supports_dcomp_nv12_direct;        // composition swapchain DXGI_FORMAT_NV12 可用
+    uint32_t            mpo_max_planes;                    // OS 报告的 MPO planes 数(DCOMP_INDEPENDENT_FLIP 前提)
+    bool                supports_independent_flip;         // PresentMon 实测当前 OS + driver 能进 IndependentFlip
+};
+```
+
+**采集步骤**:
+
+1. `IDXGIOutput6::GetDesc1` → 拿 primary monitor refresh_rate / color_gamut;
+2. `IDXGIFactory5::CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING)` → `supports_allow_tearing`;
+3. `IDXGIOutput6::CheckHardwareCompositionSupport` → `supports_hardware_composition`;
+4. `DCompositionCreateDevice2` 试探 → `supports_dcomp`;
+5. `IDXGIOutput6::GetCurrentOutputDuplicationDescription` 或 PresentMon 实测 → `mpo_max_planes`;
+6. composition swapchain 试创 `DXGI_FORMAT_NV12` 格式 → `supports_dcomp_nv12_direct`(子目标 1 探针);
+7. ADR-012 智能选择算法按上述三 bit 决定 `profile`(COMPAT / BALANCED / EXTREME / ULTIMATE_DCOMP)。
+
+> **维度归属**:render 是 capability probe 的**独立第 4 维**(与 hardware / network / encoder 平级),不是 hardware 子集。理由:① render 字段消费方主要是 §5.10 视频渲染 + ADR-012 智能 profile 选择,与 §5.6 解码档位(hardware tier)正交;② 未来扩展 HDR10 / scRGB / OLED tone mapping 等都属于 render 维度,与 hardware 维度独立演进;③ ADR-008 DCOMP / ADR-012 render profile 与 ADR-007 GPU 选择 / ADR-015 解码档位是不同决策维度,应在 snapshot 层面就独立。
+
+> **与 ADD §3.5 顶层架构图协同**:ADD §3.5 / §7.5.1 的"三维 probe"图示需要相应扩展为"四维 probe(hardware ∩ network ∩ encoder ∩ render)";当前 ADD 图示仍以三维呈现是历史快照,以本节 RenderSnapshot 为权威(ADD 图示在下次大版本修订时同步)。
 
 ---
 
@@ -257,6 +316,8 @@ struct EncoderSnapshot {
 
 > 字段 `source` 用于 telemetry 调试——如果生产环境大量场景跑到 `FIRST_GOP_MEASURED`，可能需要要求编码端开 VUI bitstream_restriction_flag。
 
+> ⚠️ **selector §6.2 对 `is_zerolatency_hint` 的采纳策略：严格保守(解读 1)**。SDI_REPLACEMENT preset 把 `enc.is_zerolatency_hint == true` 与 `enc.reorder_depth == 0` 并列作为硬 AND 条件——已知会损失"实际 0 reorder 但未声明 zerolatency"的部分流（如某些非 x264/x265 编码器）。**这是有意权衡**：SDI_REPLACEMENT 是延时极致档，"双重确认"宁可保守也不放过潜在 reorder 风险；该设计将不命中 SDI 的边界流降级到 REALTIME_LAN，不视为 selector bug。如未来发现损失流量过大，可在 §6.2 改为"hint 仅作 tie-breaker / 信心系数"——此变更需要由设计者明确决策并同步修订 §5 / §6.2 / ADR-019。
+
 ---
 
 ## 6. PresetSelector（ADR-017，ADD §7.5.4）
@@ -265,13 +326,12 @@ struct EncoderSnapshot {
 
 | 字段 | SDI_REPLACEMENT | REALTIME_LAN | STREAMING_WIFI | WAN_FALLBACK | SAFE_MODE |
 |---|---|---|---|---|---|
-| `decoder_low_latency_hint` | full（NVDEC ulMaxDisplayDelay=0 + EOP / oneVPL AsyncDepth=1 + COMPLETE_FRAME / AMF REORDER_MODE=LOW_LATENCY） | full | partial（允许 1 reorder） | off | off |
+| `decoder_low_latency_hint` | full（各 vendor 配置参数权威源:ADD §5.6.2.1 + §5.6.3） | full | partial（允许 1 reorder,B-Frame Policy 见 ADD §5.6.4） | off | off |
 | `jitter_mode` | ZeroJitter（target 0~1ms） | Kalman aggressive（target 5ms） | Kalman normal（target 15ms） | Kalman safe（target 80ms） | Kalman safe |
 | `render_profile` | DCOMP_INDEPENDENT_FLIP + NV12 直显 + ALLOW_TEARING | 同左 | DCOMP_BEST_EFFORT 或 SWAPCHAIN_FLIP | SWAPCHAIN_FLIP | SWAPCHAIN_FLIP |
 | `present_scheduling` | race_to_display | race_to_display | vsync-aligned | vsync-aligned | vsync-aligned |
 | `rtcp_mode` | RFC 5506 Reduced-Size + AVPF Immediate trr-int=0 | 同左 | AVPF Immediate | AVPF Regular | AVPF Regular |
-| `gate_strictness` | 4 核心 bit（refs/params/recovery/reorder）strict；color/fence 见 §6.3 注 | 6 bit 全 strict | 同左 | 同左 | 同左 |
-| `frame_validity_six_bits` | refs / params / recovery / reorder strict；color/fence 在 NV12 直显路径不参与决策 | 6 bit 全 strict | 6 bit 全 strict | 6 bit 全 strict | 6 bit 全 strict |
+| `frame_validity_gate` | 详见 §6.3(权威)+ ADR-014 / ADD §5.13;6 bit 严格度按 preset 派生 | 同左 | 同左 | 同左 | 同左 |
 
 ### 6.2 匹配算法（ADD §7.5.4 重申）
 
@@ -283,7 +343,7 @@ def match(snapshot: CapabilitySnapshot) -> PresetId:
 
     # SDI_REPLACEMENT — 仅在硬件 + 网络 + 编码器 + 显示器全部最优时
     if (hw.tier in {VENDOR_SDK_NVDEC, VENDOR_SDK_ONEVPL, VENDOR_SDK_AMF}
-        and hw.supports_dcomp_nv12_direct
+        and render.supports_dcomp_nv12_direct
         and net.link_kind == LAN_SWITCHED
         and net.rtt_p95_ns < 1_000_000
         and net.loss_rate_short < 0.0001
@@ -412,17 +472,39 @@ def match(snapshot: CapabilitySnapshot) -> PresetId:
   - 过去 60s 滑窗 NetworkSnapshot / EncoderSnapshot / RenderSnapshot 持续满足下一档 preset 触发条件
   - 过去 60s tainted_event_count == 0
     （tainted_event = Frame Validity Gate 拒帧 + present_underrun + tearing_detected 任一）
+  - 升档目标 preset 的 hw.tier 要求与当前会话的 decoder tier 一致
+    （即不跨 ADR-015 档位 —— 详见 §8.5 不跨档原则）
 
 升档后 30s 内若再被降级触发：
   oscillation_count++
 
-oscillation_count >= 2 时：
+oscillation_count >= 2 时:
   锁定当前档 5 min 禁升（lockout_until = now + 5min）；
   每次降级仍可正常执行；
   超过 lockout_until 后 oscillation_count 清零。
 ```
 
 > **设计理由**：升档误判的代价是"用户视觉抖动 + 振荡循环"，远超"延时偏高"的代价。所以升档严苛、降档宽松。
+
+### 8.3.1 不跨 decoder 档原则（ADR-020 / ADR-015）
+
+Preset 升档**不会跨越 ADR-015 解码档位**：
+
+| 启动期 hw.tier | 运行期可升档到 | 运行期不可升档到 |
+|---|---|---|
+| VENDOR_SDK_NVDEC | SDI_REPLACEMENT / REALTIME_LAN(原档) | — |
+| VENDOR_SDK_ONEVPL | SDI_REPLACEMENT / REALTIME_LAN(原档) | — |
+| VENDOR_SDK_AMF | SDI_REPLACEMENT / REALTIME_LAN(原档) | — |
+| DXVA_DIRECT | REALTIME_LAN(原档) / STREAMING_WIFI(原档) | SDI_REPLACEMENT（要求 hw.tier ∈ vendor SDK 集合） |
+| MFT_HARDWARE | STREAMING_WIFI(原档) | SDI_REPLACEMENT / REALTIME_LAN |
+| LIBCODEC | WAN_FALLBACK / SAFE_MODE | 全部更激进档 |
+
+**例**：用户首次启动时档 1 vendor SDK 缺失（ADR-016 面板提示但未下载），档位选档 2，preset 落 REALTIME_LAN。运行期用户接受面板下载并装好 SDK。**本会话保持档 2 + REALTIME_LAN，不切到档 1 + SDI_REPLACEMENT**——需要用户主动重 `mc_open` 触发新一轮 hardware probe，下次会话才能命中档 1。
+
+**理由**：
+- 跨档升级要求重做 decoder probe + reconfigure，与 ADR-013 跨屏 adapter switch 类似但更复杂（ADR-013 是 device 维度，跨档是 codec 后端维度）；
+- 性能量度规范 §6 设计上**不暴露** `mc.decoder.cross_tier_promote_count`（仅有 `_demote_count`），该缺失即"不跨档升级"的可观测声明；
+- 由 ADR-013 / ADR-007 / ADR-015 / ADR-020 协调跨档升级在未来 milestone 引入，本 ADR 范围内不涉及。
 
 ### 8.4 reload 原子性闸
 
@@ -474,7 +556,7 @@ mc.decoder.cuda_graph_active                 gauge bool (NVDEC only)
 
 | 用例 | 输入 snapshot | 预期 active_preset_id |
 |---|---|---|
-| best-case | NVDEC + LAN_SWITCHED RTT 0.3ms + 0 reorder + 240Hz VRR + DCOMP_INDEPENDENT_FLIP | SDI_REPLACEMENT |
+| best-case | NVDEC + LAN_SWITCHED RTT 0.3ms + 0 reorder + 240Hz VRR + DCOMP_INDEPENDENT_FLIP + render.supports_dcomp_nv12_direct=true | SDI_REPLACEMENT |
 | LAN-1080p | UHD 730 oneVPL + LAN_SWITCHED RTT 0.5ms + 0 reorder + 144Hz VRR | REALTIME_LAN |
 | LAN-with-B | NVDEC + LAN_SWITCHED + reorder=1 + 240Hz VRR | REALTIME_LAN（不命中 SDI 因有 B）|
 | Wi-Fi | NVDEC + LAN_WIFI RTT 4ms + 0 reorder + 144Hz | REALTIME_LAN（命中 LAN_WIFI 上限） |
