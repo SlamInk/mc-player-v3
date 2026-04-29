@@ -54,11 +54,12 @@ python -m http.server 8000
 - **正确性优先于延时**（ADD §2 #12 / ADR-014）：花屏与陈旧区域比延时多 1 帧更不可接受。所有解码 / 渲染异常路径默认 freeze last-good，不输出半态帧。
 - **Frame Validity Gate**（ADD §5.13）：codec 与 render 之间唯一闸门。六类 validity bit（refs / params / recovery / color / reorder / fence）任一缺失即丢帧；不允许在 codec 层或 render 层各自做散落兜底。
 - **Present Epoch + Watchdog**（ADD §5.10.5）：T5（render thread）是 `IDCompositionDevice::Commit` **唯一**调用方；视频 Present 与 DCOMP commit 同 epoch 配对；超时未推进强制 redraw last-good。
-- **硬件 MFT 永远 async**（ADR-002 / ADD §5.6.1）：Microsoft 协议要求，非性能选择。激活硬件 MFT 必须显式 unlock async + 用事件生成器驱动 NeedInput / HaveOutput / DrainComplete 事件循环。sync 调用模式不被支持。
+- **硬件解码四级降级链**（ADR-015 / ADD §5.6）：硬件 path 最短优先。`vendor SDK 直驱 (NVDEC/oneVPL/AMF) → DXVA-direct (D3D11VideoDevice) → MFT hardware async → mc-libcodec 软解`。前一档失败立即降级；sync software MFT 不算硬解（直接归到档 4）。Vendor SDK redistributable 不预 bundle，由 ADR-016 内置下载面板按需获取。
+- **硬件 MFT 永远 async**（ADR-002 / ADD §5.6.2.3）：Microsoft 协议要求，非性能选择。**仅约束档 3 hardware MFT 路径**（`hw_url=1 && async=1`）；激活时必须显式 unlock async + 用事件生成器驱动 NeedInput / HaveOutput / DrainComplete 事件循环。sync software MFT 不在约束范围。
 - **dual-bind 的 fence 同步**（ADR-003 / ADD §4.3）：`BIND_DECODER | BIND_SHADER_RESOURCE` 必须显式请求；array slice 在 DPB evict 前必须用 `ID3D11Fence` 等 SRV 读完，否则花屏。
 - **B-Frame Policy**（ADD §5.6.4）：检测到 reorder > 0 必须取消 `CODECAPI_AVLowLatencyMode`，否则与 low-latency 模式冲突 → **必然花屏**。检测优先 SDP `profile-level-id`，兜底扫 SPS VUI `max_num_reorder_frames` / `sps_max_num_reorder_pics`。
 - **GDR ≠ IDR**（ADD §5.5.3）：仅发 GDR 不发 IDR 的低延时编码器场景，必须等 `recovery_point` SEI `recovery_frame_cnt == 0` 才解 freeze；中间 P/B 帧仍带 invalid 下沉。把两者等价是花屏常见根因。
-- **平台原生优先**（ADD §2 #10）：codec → MFT，HTTP → WinHTTP，TLS → Schannel，时钟 → QPC，COM/D3D11/DCOMP 直调。引第三方需要 ADR 明示理由（当前仅 libdatachannel / libopus / mc-libcodec / TLS backend）。
+- **平台原生 + 性能例外**（ADD §2 #10）：HTTP → WinHTTP，TLS → Schannel，时钟 → QPC，COM/D3D11/DCOMP 直调；视频解码 OS 内置档走 DXVA-DDI / MFT。引第三方需要 ADR 明示理由（当前已开口：libdatachannel ADR-005 / libopus ADR-009 / mc-libcodec ADR-006 / TLS backend / vendor SDK ADR-015 + ADR-016）。例外不是默认值——必须给出具体性能 / 能力依据。
 - **能力探测 fail-open**（ADD §2 #11）：所有硬件加速路径 open 前先探测，探测失败立即降级；不允许 fail-late 抛运行时异常。
 - **mc-libcodec 不依赖第三方解码库代码**（ADD §5.7.7 / ADR-006）：可参考 OpenH264 / libde265 算法描述；x264 仅作 spec 参考，不读源码（GPL 污染规避）。正确性基准对齐 ITU-T JM/HM reference 100% bit-exact。
 - **mc-libcodec ABI 演进契约**（ADD §5.7.2）：公开 API 头首字段 `struct_size + version`，未来追加字段不破坏旧调用方。
@@ -87,20 +88,20 @@ WHEP 模式下 T2 由 libdatachannel 内部 socket 线程承担、T7 不存在 R
 | RTSP interleaved TCP | 同上 | TCP `$ ch len` 帧化 | 无 |
 | WHEP（draft-ietf-wish-whep-03） | WinHTTP 异步 POST/PATCH/DELETE | libdatachannel SRTP | DTLS-SRTP（RFC 5764） |
 
-| Codec | 主路径 | 兜底 |
-|---|---|---|
-| H.264 / H.265 | Windows MFT（DXVA + 共享 D3D11） | mc-libcodec 软解（NV12 RAM → dynamic texture 上传） |
-| AAC | Microsoft AAC MFT；显式协商 `MFAudioFormat_Float` 32-bit | — |
-| Opus | bundled libopus（无 OS MFT） | — |
-| G.711 a/μ-law | 256-entry LUT 自实现 | — |
-| AV1 / H.266 | OS MFT（AV1 需 Microsoft Store 装 Extension） | mc-libcodec 后续追加 |
+| Codec | 解码后端（ADR-015 四级降级链按档探测）|
+|---|---|
+| H.264 / H.265 | 档1: vendor SDK (NVDEC/oneVPL/AMF) → 档2: DXVA-direct (D3D11VideoDevice) → 档3: MFT hardware async (OS 兼容档) → 档4: mc-libcodec 软解 (NV12 RAM 上传 dynamic texture) |
+| AAC | Microsoft AAC MFT；显式协商 `MFAudioFormat_Float` 32-bit（音频不在 ADR-015 范围）|
+| Opus | bundled libopus（无 OS MFT，ADR-009）|
+| G.711 a/μ-law | 256-entry LUT 自实现 |
+| AV1 / H.266 | 同 H.264/H.265 四档链；H.266 待 vendor / OS 支持 |
 
 ## 关键风险点（已写进设计、实施时易踩）
 
 - **`CODECAPI_AVLowLatencyMode` 类型陷阱**（ADD §5.6.3）：Microsoft H.264 decoder 用 `VT_UI4`（MS Learn 明示），其它 codec 按惯例用 `VT_BOOL` 但**未在 MS 文档明示**，`SetValue` 前应实测验证。
 - **DXGI factory `IsCurrent()` 语义**（ADD §7.2.2）：device removed 后旧 factory stale，强烈建议重建，不要复用。
 - **ResizeBuffers 必须先 ClearState**（ADD §5.10.3）：未清场 + 未释放 back buffer 引用的 SRV/RTV/UAV 会返回 `DXGI_ERROR_INVALID_CALL`，常表现为窗口 resize / 跨屏拖拽后陈旧内容残留或黑屏。
-- **HEVC Extension 默认缺失**（ADR-004 / ADD §7.4）：Win10/11 retail 默认无 HEVC Extension，必须实现 mc-libcodec H.265 软解兜底，UX 上无感。
+- **HEVC Extension 默认缺失**（ADD §7.4，ADR-004 已 Superseded by ADR-015）：Win10/11 retail / IoT LTSC 默认无 HEVC Video Extension。**新策略不再特殊对待**——直接按 ADR-015 四级链兜底（vendor SDK → DXVA-direct H.265 Main/Main10 → libcodec），不依赖 OS Extension。
 - **H.265 NAL header 是 2 字节**（ADD §5.5.2）：FU 重组与 H.264 不同，需保留 LayerId/TID 并按 FU header 内的 type 字段重组。
 - **拒绝 `packetization-mode=2`**（ADD §5.5.1）：SDP answer 阶段拒，避免 DON 重排复杂度；STAP-A + FU-A 覆盖现网。
 - **AVPF Immediate Feedback mode + `trr-int 0` 是两个独立机制**（ADD §5.4），需同时满足才能近实时反馈。
