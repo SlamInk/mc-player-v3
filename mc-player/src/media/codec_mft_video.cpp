@@ -11,12 +11,13 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
-#include <deque>
 #include <mutex>
 #include <thread>
 
+#include "pal/cache_line.h"
 #include "pal/error.h"
 #include "pal/log.h"
+#include "pal/spsc_queue.h"
 #include "pal/thread.h"
 
 #pragma comment(lib, "mfplat.lib")
@@ -55,11 +56,14 @@ struct PendingAu {
     bool                 keyframe       = false;
 };
 
-// AU 队列上限 —— 低延时模式下 host 端 AU 缓存只是「让 MFT 立刻拉到下一个」的接力槽。
-// MFT 自身有内部 input buffering（async event 驱动），host 多缓 ≠ 多吞吐，反而把网络拥塞
-// 转成解码侧滞后。3 = 一个 anchor + 1-2 P，对应 ~100 ms@30fps 上限。满即丢最老让 codec
-// 抓最近内容；下一个 IDR/recovery anchor 解 freeze（与 FrameValidityGate 行为对齐）。
-constexpr std::size_t kAuQueueMax = 3;
+// AU 队列容量（pal::SpscQueue 要求 power-of-two）。低延时模式下 host 端 AU 缓存只是
+// 「让 codec 立刻拉到下一个」的接力槽。MFT 自身有内部 input buffering（async event
+// 驱动），host 多缓 ≠ 多吞吐，反而把网络拥塞转成解码侧滞后。
+// 4 = 一个 anchor + 2-3 P，对应 ~130 ms@30fps 上限（≈ P0-3 的 3 +1，satisfy 2^n）。
+// SPSC 不变量约束 producer 不能动 tail，"丢最老"由 consumer 在 try_pop 前调
+// try_drop_oldest 到只剩 1 个实现（"最新优先"等价于 producer 端"丢最老"）。
+// producer 满时直接丢自己（drop newest，极少触发，4 远大于 MFT 内部 buffering 需求）。
+constexpr std::size_t kAuQueueCap = 4;
 
 // 自定义 IMFSample attribute — 透传 arrival_qpc_ns。MFT 文档未明示
 // input→output 自定义 attribute 透传，实测 driver 行为不一；失败时回退
@@ -88,9 +92,13 @@ struct CodecMftVideo::Impl {
     std::atomic<bool>               stop_requested{false};
     std::atomic<bool>               started{false};
 
-    std::mutex                      au_mu;
-    std::condition_variable         au_cv;
-    std::deque<PendingAu>           au_queue;
+    // SPSC ring + cache-line padding（CLAUDE.md / ADD §6.1 硬约束）。
+    // au_queue 是真正的 lock-free SPSC（producer = controller 线程，consumer = T4
+    // event/sync worker），mutex+cv 仅用于 wake/sleep 同步。三个字段独占 cache line
+    // 防 false-sharing。kAuQueueCap = 4。
+    alignas(pal::kCacheLineSize) std::mutex                 au_mu;
+    alignas(pal::kCacheLineSize) std::condition_variable    au_cv;
+    alignas(pal::kCacheLineSize) pal::SpscQueue<PendingAu>  au_queue{kAuQueueCap};
     bool                            need_input_pending = false;
 
     // PTS-keyed arrival 戳兜底 ring（仅 T4 单线程访问，无锁）。MFT 不保证
@@ -302,15 +310,21 @@ void CodecMftVideo::Impl::sync_worker_loop() noexcept {
 
     while (!stop_requested.load(std::memory_order_acquire)) {
         PendingAu au;
+        bool got = false;
         {
             std::unique_lock lk{au_mu};
             au_cv.wait(lk, [&]{
-                return stop_requested.load(std::memory_order_acquire) || !au_queue.empty();
+                return stop_requested.load(std::memory_order_acquire) ||
+                        au_queue.approx_size() > 0;
             });
             if (stop_requested.load(std::memory_order_acquire)) break;
-            au = std::move(au_queue.front());
-            au_queue.pop_front();
+            // SPSC 不变量：consumer 端的 try_drop_oldest / try_pop 必须串行；与
+            // flush()（也是 consumer 角色）持同一把 mu 互斥。producer try_push 仍 lock-free。
+            // "最新优先"：drop 到只剩 1 再 pop（兑现 CLAUDE.md "满时丢最老" 语义）。
+            while (au_queue.approx_size() > 1) (void)au_queue.try_drop_oldest();
+            got = au_queue.try_pop(au);
         }
+        if (!got) continue;     // race / spurious wake，回 wait
         HRESULT hr = submit_sync(au);
         if (FAILED(hr)) {
             MCP_LOGF(pal::LogLevel::warn,
@@ -321,15 +335,20 @@ void CodecMftVideo::Impl::sync_worker_loop() noexcept {
 
 HRESULT CodecMftVideo::Impl::on_need_input() noexcept {
     PendingAu au;
+    bool got = false;
     {
         std::unique_lock lk{au_mu};
         au_cv.wait(lk, [&]{
-            return stop_requested.load(std::memory_order_acquire) || !au_queue.empty();
+            return stop_requested.load(std::memory_order_acquire) ||
+                    au_queue.approx_size() > 0;
         });
         if (stop_requested.load(std::memory_order_acquire)) return S_OK;
-        au = std::move(au_queue.front());
-        au_queue.pop_front();
+        // SPSC consumer 操作必须持 mu（与 flush() 互斥）；producer try_push 仍 lock-free。
+        // "最新优先"：drop 到只剩 1 再 pop（兑现 CLAUDE.md "满时丢最老" 语义）。
+        while (au_queue.approx_size() > 1) (void)au_queue.try_drop_oldest();
+        got = au_queue.try_pop(au);
     }
+    if (!got) return S_OK;     // race / spurious wake，回事件循环再等
 
     ComPtr<IMFMediaBuffer> buf;
     HRESULT hr = ::MFCreateMemoryBuffer(static_cast<DWORD>(au.bytes.size()), &buf);
@@ -946,26 +965,36 @@ void CodecMftVideo::submit(std::vector<uint8_t> au_bytes, int64_t pts_us,
     p.bytes          = std::move(au_bytes);  // ownership 移交，无 memcpy
     p.pts_us         = pts_us;
     p.arrival_qpc_ns = arrival_qpc_ns;
+
+    // SPSC try_push lock-free。满时 producer 不能动 tail（违反 SPSC 不变量），
+    // 直接丢自己（drop-newest）；consumer 端在 try_pop 前会做 drop_to_last 维持
+    // "最新优先"语义，所以即便偶尔丢新 AU，下个 AU 仍能被 consumer 拿到（旧的被
+    // consumer 自己 drop）。容量 4 远大于 MFT 内部 buffering 需求，触发极少。
+    if (!impl_->au_queue.try_push(std::move(p))) {
+        static std::atomic<uint64_t> dropped{0};
+        const auto n = dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || (n & (n - 1)) == 0) {  // 1, 2, 4, 8, 16, ...
+            MCP_LOGF(pal::LogLevel::warn,
+                     "CodecMftVideo: au_queue full (cap=%zu), drop newest AU (#%llu)",
+                     kAuQueueCap, static_cast<unsigned long long>(n));
+        }
+        return;
+    }
+    // 标准 cv 模式：modify state 后短暂持锁作 happens-before barrier，再 notify。
+    // 保证 consumer 要么在 wait predicate 检查时已看到 push，要么被 notify 唤醒。
     {
         std::scoped_lock lk{impl_->au_mu};
-        // 满时丢最老（CLAUDE.md 硬约束 / ADD §6.1）。低延时模式下深度积压无意义，
-        // 直接丢早 AU 让 codec 抓最近内容；下一个 IDR/recovery anchor 解 freeze。
-        while (impl_->au_queue.size() >= kAuQueueMax) {
-            impl_->au_queue.pop_front();
-        }
-        impl_->au_queue.push_back(std::move(p));
     }
     impl_->au_cv.notify_one();
-    // async 路径：event_thread 在 NeedInput 事件触发时从 queue 取；
-    // sync 路径：sync_worker_loop 直接消费 queue 跑 submit_sync。
-    // 两者都不再阻塞 caller。
 }
 
 void CodecMftVideo::flush() noexcept {
     if (!impl_->transform) return;
     impl_->transform->ProcessMessage(MFT_MESSAGE_COMMAND_FLUSH, 0);
+    // SPSC 不变量：try_drop_oldest 是 consumer 操作，与 worker 端的 try_pop 串行。
+    // 持 au_mu 排他即可（worker 也在该锁内做 SPSC pop）。
     std::scoped_lock lk{impl_->au_mu};
-    impl_->au_queue.clear();
+    while (impl_->au_queue.try_drop_oldest()) { /* drain */ }
 }
 
 void CodecMftVideo::stop() noexcept {

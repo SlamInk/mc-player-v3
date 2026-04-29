@@ -2,14 +2,15 @@
 
 #include <atomic>
 #include <condition_variable>
-#include <deque>
 #include <mutex>
 #include <thread>
 #include <vector>
 
 #include "mc-libcodec/mc_libcodec.h"
+#include "pal/cache_line.h"
 #include "pal/error.h"
 #include "pal/log.h"
+#include "pal/spsc_queue.h"
 #include "pal/thread.h"
 
 using Microsoft::WRL::ComPtr;
@@ -45,15 +46,15 @@ struct CodecLibcodecVideo::Impl {
         int64_t              pts_us         = 0;
         int64_t              arrival_qpc_ns = 0;
     };
-    // 低延时模式下 host 端 AU 缓存 = 接力槽，3 = anchor + 1-2 P（~100 ms@30fps）；
-    // 满即丢最老（与 codec_mft_video.cpp kAuQueueMax 对齐）。
-    static constexpr std::size_t kAuQueueMax = 3;
+    // SPSC ring（power-of-2，CLAUDE.md / ADD §6.1 硬约束）。容量 4，consumer
+    // try_drop_oldest 维持"最新优先"。与 codec_mft_video.cpp kAuQueueCap 对齐。
+    static constexpr std::size_t kAuQueueCap = 4;
 
     std::thread                     worker_thread;
     std::atomic<bool>               worker_stop{false};
-    std::mutex                      au_mu;
-    std::condition_variable         au_cv;
-    std::deque<PendingAu>           au_queue;
+    alignas(pal::kCacheLineSize) std::mutex                au_mu;
+    alignas(pal::kCacheLineSize) std::condition_variable   au_cv;
+    alignas(pal::kCacheLineSize) pal::SpscQueue<PendingAu> au_queue{kAuQueueCap};
 
     void worker_loop() noexcept;
 
@@ -155,12 +156,19 @@ void CodecLibcodecVideo::submit(std::vector<uint8_t> au_bytes, int64_t pts_us,
     p.bytes          = std::move(au_bytes);
     p.pts_us         = pts_us;
     p.arrival_qpc_ns = arrival_qpc_ns;
-    {
-        std::scoped_lock lk{impl_->au_mu};
-        while (impl_->au_queue.size() >= Impl::kAuQueueMax) {
-            impl_->au_queue.pop_front();
+
+    if (!impl_->au_queue.try_push(std::move(p))) {
+        static std::atomic<uint64_t> dropped{0};
+        const auto n = dropped.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || (n & (n - 1)) == 0) {
+            MCP_LOGF(pal::LogLevel::warn,
+                     "CodecLibcodecVideo: au_queue full (cap=%zu), drop newest AU (#%llu)",
+                     Impl::kAuQueueCap, static_cast<unsigned long long>(n));
         }
-        impl_->au_queue.push_back(std::move(p));
+        return;
+    }
+    {
+        std::scoped_lock lk{impl_->au_mu};   // happens-before barrier
     }
     impl_->au_cv.notify_one();
 }
@@ -168,7 +176,7 @@ void CodecLibcodecVideo::submit(std::vector<uint8_t> au_bytes, int64_t pts_us,
 void CodecLibcodecVideo::flush() noexcept {
     {
         std::scoped_lock lk{impl_->au_mu};
-        impl_->au_queue.clear();
+        while (impl_->au_queue.try_drop_oldest()) { /* drain */ }
     }
     if (impl_->decoder) mclc_flush(impl_->decoder);
 }
@@ -196,15 +204,20 @@ void CodecLibcodecVideo::Impl::worker_loop() noexcept {
 
     while (!worker_stop.load(std::memory_order_acquire)) {
         PendingAu au;
+        bool got = false;
         {
             std::unique_lock lk{au_mu};
             au_cv.wait(lk, [&]{
-                return worker_stop.load(std::memory_order_acquire) || !au_queue.empty();
+                return worker_stop.load(std::memory_order_acquire) ||
+                        au_queue.approx_size() > 0;
             });
             if (worker_stop.load(std::memory_order_acquire)) break;
-            au = std::move(au_queue.front());
-            au_queue.pop_front();
+            // SPSC consumer 操作必须持 mu（与 flush() 互斥）；producer try_push 仍 lock-free。
+            // "最新优先"：drop 到只剩 1 再 pop（兑现 CLAUDE.md "满时丢最老" 语义）。
+            while (au_queue.approx_size() > 1) (void)au_queue.try_drop_oldest();
+            got = au_queue.try_pop(au);
         }
+        if (!got) continue;
 
         mclc_submit(decoder, au.bytes.data(), au.bytes.size(), au.pts_us);
 
