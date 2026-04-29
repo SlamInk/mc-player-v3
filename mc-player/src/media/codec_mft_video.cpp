@@ -254,6 +254,70 @@ struct CodecMftVideo::Impl {
         return S_OK;
     }
 
+    // P1-6: MFT input IMFMediaBuffer pool —— 每次 NeedInput / submit_sync 不再
+    // ::MFCreateMemoryBuffer 新分配 + 销毁，从双桶 pool 取空闲 buffer 复用。
+    // 桶设计：小 ≤ 64KB（P/B AU），大 ≤ 2MB（IDR/IRAP），> 2MB 直接新建不缓存。
+    // idle 探测：buf->AddRef() → buf->Release() 返回值 == 1 即 pool 单持引用 → 可复用。
+    // COM Release 在并发下保守可靠：MFT 持 N>0 ref 时返回 N+1>1，绝不误判 busy 为
+    // idle（误判反向无害——保守判 busy 触发新建，多 1 次 alloc 而已）。
+    // 单线程访问：async 仅 event_loop / sync 仅 sync_worker_loop（is_sync_mft 互斥），
+    // pool 无锁可靠；stop() 在 transform.Reset() 之后清空 pool（MFT 已释放飞行 sample）。
+    // 字段名避开 `small` —— Win32 <rpcndr.h> 有 `#define small char` 污染。
+    struct InputBufferPool {
+        static constexpr DWORD       kSmallCap = 64u * 1024u;
+        static constexpr DWORD       kBigCap   = 2u  * 1024u * 1024u;
+        static constexpr std::size_t kSmallMax = 4;
+        static constexpr std::size_t kBigMax   = 4;
+        std::vector<ComPtr<IMFMediaBuffer>> bucket_small;
+        std::vector<ComPtr<IMFMediaBuffer>> bucket_big;
+        uint64_t hit_small = 0, miss_small = 0;
+        uint64_t hit_big   = 0, miss_big   = 0;
+        uint64_t alloc_oversize = 0;
+
+        static bool is_idle(IMFMediaBuffer* b) noexcept {
+            b->AddRef();
+            return b->Release() == 1;
+        }
+
+        HRESULT acquire(DWORD req, ComPtr<IMFMediaBuffer>* out) noexcept {
+            if (req <= kSmallCap)
+                return acquire_bucket(bucket_small, kSmallCap, kSmallMax,
+                                       hit_small, miss_small, out);
+            if (req <= kBigCap)
+                return acquire_bucket(bucket_big,   kBigCap,   kBigMax,
+                                       hit_big,   miss_big,   out);
+            ++alloc_oversize;
+            return ::MFCreateMemoryBuffer(req, out->ReleaseAndGetAddressOf());
+        }
+
+        HRESULT acquire_bucket(std::vector<ComPtr<IMFMediaBuffer>>& bucket,
+                                DWORD cap, std::size_t max,
+                                uint64_t& hit, uint64_t& miss,
+                                ComPtr<IMFMediaBuffer>* out) noexcept {
+            for (auto& b : bucket) {
+                if (is_idle(b.Get())) {
+                    b->SetCurrentLength(0);
+                    *out = b;
+                    ++hit;
+                    return S_OK;
+                }
+            }
+            ComPtr<IMFMediaBuffer> nb;
+            HRESULT hr = ::MFCreateMemoryBuffer(cap, &nb);
+            if (FAILED(hr)) return hr;
+            if (bucket.size() < max) bucket.push_back(nb);
+            *out = nb;
+            ++miss;
+            return S_OK;
+        }
+
+        void clear() noexcept {
+            bucket_small.clear();
+            bucket_big.clear();
+        }
+    };
+    InputBufferPool input_buf_pool;
+
     void event_loop() noexcept;
     void sync_worker_loop() noexcept;
     HRESULT on_need_input() noexcept;
@@ -351,7 +415,7 @@ HRESULT CodecMftVideo::Impl::on_need_input() noexcept {
     if (!got) return S_OK;     // race / spurious wake，回事件循环再等
 
     ComPtr<IMFMediaBuffer> buf;
-    HRESULT hr = ::MFCreateMemoryBuffer(static_cast<DWORD>(au.bytes.size()), &buf);
+    HRESULT hr = input_buf_pool.acquire(static_cast<DWORD>(au.bytes.size()), &buf);
     if (FAILED(hr)) return hr;
 
     BYTE* dst = nullptr;
@@ -522,7 +586,7 @@ HRESULT CodecMftVideo::Impl::on_have_output() noexcept {
 // sync 路径 — Microsoft HEVC Video Extension 等 software MFT。
 HRESULT CodecMftVideo::Impl::submit_sync(const PendingAu& au) noexcept {
     ComPtr<IMFMediaBuffer> buf;
-    HRESULT hr = ::MFCreateMemoryBuffer(static_cast<DWORD>(au.bytes.size()), &buf);
+    HRESULT hr = input_buf_pool.acquire(static_cast<DWORD>(au.bytes.size()), &buf);
     if (FAILED(hr)) return hr;
     BYTE* dst = nullptr;
     DWORD max_len = 0;
@@ -1031,6 +1095,26 @@ void CodecMftVideo::stop() noexcept {
     impl_->out_pool.Reset();
     impl_->upload_tex.Reset();
     impl_->ctx.Reset();
+
+    // P1-6: MFT 已 Reset → 所有飞行 sample 释放 → buffer ref 归 pool 自有 → 安全清空。
+    {
+        const auto& p = impl_->input_buf_pool;
+        const uint64_t total_s = p.hit_small + p.miss_small;
+        const uint64_t total_b = p.hit_big   + p.miss_big;
+        MCP_LOGF(pal::LogLevel::info,
+                 "CodecMftVideo: input_buf_pool small hit/miss=%llu/%llu (%.1f%%) "
+                 "big hit/miss=%llu/%llu (%.1f%%) oversize=%llu",
+                 static_cast<unsigned long long>(p.hit_small),
+                 static_cast<unsigned long long>(p.miss_small),
+                 total_s ? 100.0 * static_cast<double>(p.hit_small) /
+                          static_cast<double>(total_s) : 0.0,
+                 static_cast<unsigned long long>(p.hit_big),
+                 static_cast<unsigned long long>(p.miss_big),
+                 total_b ? 100.0 * static_cast<double>(p.hit_big) /
+                          static_cast<double>(total_b) : 0.0,
+                 static_cast<unsigned long long>(p.alloc_oversize));
+    }
+    impl_->input_buf_pool.clear();
 }
 
 }  // namespace mcp::media
