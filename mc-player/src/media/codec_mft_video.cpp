@@ -942,38 +942,70 @@ mc_status_t CodecMftVideo::start(std::span<const uint8_t> /*extradata*/) noexcep
         impl_->update_output_dims();
     }
 
-    // ADD §5.6.3 / ADR-014：CODECAPI_AVLowLatencyMode —— 禁掉 reorder buffer，
-    // 客户端内部解码延时降到 5~10 ms 量级（不设时 MFT 默认开 reorder 多缓 1~3 帧）。
-    // 类型陷阱：H.264 用 VT_UI4=1（MS Learn 明示），其它 codec 文档未声明，按惯例
-    // VT_BOOL=TRUE，失败即降级 VT_UI4 再试一次；都失败仅记日志不阻断启动。
-    // B-Frame Policy（ADD §5.6.4）：caller 检出 reorder>0 必传 prefer_low_latency=false
-    // 否则与 LowLatency 模式冲突 → 必然花屏。
-    if (impl_->cfg.prefer_low_latency) {
+    // ADD §5.6.3 / ADR-014：CODECAPI 低延时配置 —— 一次拿 ICodecAPI 后做完所有 hint。
+    //
+    // (1) AVLowLatencyMode：禁 reorder buffer（默认开缓 1~3 帧 = 33~100ms）。
+    //     类型陷阱：H.264 VT_UI4=1（MS Learn 明示），其它 VT_BOOL→VT_UI4 fallback。
+    //     B-Frame Policy（ADD §5.6.4）：caller 检出 reorder>0 传 prefer_low_latency=false
+    //     避开 LowLatency-vs-B 冲突花屏。运行期 PTS 反序检测兜底（Step 1c）。
+    // (2) DropPicWithMissingRef = TRUE：ref 缺失立即丢，丢包场景额外 33~66ms 收益。
+    // (3) NumWorkerThreads = 1：1080p@30fps driver 多 worker 反引入 sync overhead。
+    // (4) AVDecVideoSWPowerLevel = 100：SW 路径 performance 优先（HW 路径忽略，无害）。
+    //
+    // 任一项失败仅记日志不阻断启动。
+    {
         ComPtr<ICodecAPI> codec_api;
         if (SUCCEEDED(impl_->transform.As(&codec_api)) && codec_api) {
-            const bool is_h264 = impl_->cfg.codec == MC_VIDEO_CODEC_H264;
-            VARIANT v{};
-            HRESULT hl = E_FAIL;
-            if (is_h264) {
-                v.vt = VT_UI4;  v.ulVal = 1;
-                hl = codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &v);
-            } else {
-                v.vt = VT_BOOL; v.boolVal = VARIANT_TRUE;
-                hl = codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &v);
-                if (FAILED(hl)) {
-                    v = {};
-                    v.vt = VT_UI4; v.ulVal = 1;
+            // (1) AVLowLatencyMode
+            if (impl_->cfg.prefer_low_latency) {
+                const bool is_h264 = impl_->cfg.codec == MC_VIDEO_CODEC_H264;
+                VARIANT v{};
+                HRESULT hl = E_FAIL;
+                if (is_h264) {
+                    v.vt = VT_UI4;  v.ulVal = 1;
                     hl = codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &v);
+                } else {
+                    v.vt = VT_BOOL; v.boolVal = VARIANT_TRUE;
+                    hl = codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &v);
+                    if (FAILED(hl)) {
+                        v = {};
+                        v.vt = VT_UI4; v.ulVal = 1;
+                        hl = codec_api->SetValue(&CODECAPI_AVLowLatencyMode, &v);
+                    }
                 }
+                MCP_LOGF(SUCCEEDED(hl) ? pal::LogLevel::info : pal::LogLevel::warn,
+                         "CodecMftVideo: AVLowLatencyMode set hr=0x%08lX (codec=%s type=%s)",
+                         hl, codec_name(impl_->cfg.codec), is_h264 ? "VT_UI4" : "VT_BOOL/UI4");
+            } else {
+                MCP_LOG_INFO("CodecMftVideo: LowLatencyMode disabled by caller (B-frame stream)");
             }
-            MCP_LOGF(SUCCEEDED(hl) ? pal::LogLevel::info : pal::LogLevel::warn,
-                     "CodecMftVideo: AVLowLatencyMode set hr=0x%08lX (codec=%s type=%s)",
-                     hl, codec_name(impl_->cfg.codec), is_h264 ? "VT_UI4" : "VT_BOOL/UI4");
+
+            // (2) DropPicWithMissingRef = TRUE
+            {
+                VARIANT vd{}; vd.vt = VT_BOOL; vd.boolVal = VARIANT_TRUE;
+                HRESULT hd = codec_api->SetValue(&CODECAPI_AVDecVideoDropPicWithMissingRef, &vd);
+                MCP_LOGF(SUCCEEDED(hd) ? pal::LogLevel::info : pal::LogLevel::warn,
+                         "CodecMftVideo: DropPicWithMissingRef=TRUE hr=0x%08lX", hd);
+            }
+
+            // (3) NumWorkerThreads = 1
+            {
+                VARIANT vw{}; vw.vt = VT_UI4; vw.ulVal = 1;
+                HRESULT hw = codec_api->SetValue(&CODECAPI_AVDecNumWorkerThreads, &vw);
+                MCP_LOGF(SUCCEEDED(hw) ? pal::LogLevel::info : pal::LogLevel::warn,
+                         "CodecMftVideo: NumWorkerThreads=1 hr=0x%08lX", hw);
+            }
+
+            // (4) AVDecVideoSWPowerLevel = 100（max performance）
+            {
+                VARIANT vp{}; vp.vt = VT_UI4; vp.ulVal = 100;
+                HRESULT hp = codec_api->SetValue(&CODECAPI_AVDecVideoSWPowerLevel, &vp);
+                MCP_LOGF(SUCCEEDED(hp) ? pal::LogLevel::info : pal::LogLevel::warn,
+                         "CodecMftVideo: SWPowerLevel=100 hr=0x%08lX", hp);
+            }
         } else {
-            MCP_LOG_WARN("CodecMftVideo: ICodecAPI not exposed; LowLatencyMode skipped");
+            MCP_LOG_WARN("CodecMftVideo: ICodecAPI not exposed; low-latency hints skipped");
         }
-    } else {
-        MCP_LOG_INFO("CodecMftVideo: LowLatencyMode disabled by caller (B-frame stream)");
     }
 
     // 5. event generator（仅 async）；sync 路径无事件队列。

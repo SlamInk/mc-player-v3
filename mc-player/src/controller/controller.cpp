@@ -274,7 +274,25 @@ struct Controller::Impl {
             return MC_ERR_INTERNAL;
         }
         enable_multithread_protection();
+        apply_low_latency_dxgi();
         return MC_OK;
+    }
+
+    // Step 2: device-level DXGI present queue 深度。与 swap chain 级
+    // IDXGISwapChain2::SetMaximumFrameLatency(1)（render_swap_chain.cpp:90）独立 ——
+    // DXGI runtime 默认 device 级 max-latency=3，未限会让 driver 内部 present queue 多
+    // 积 1-2 帧。两层都设 1 才能让端到端 present 延时降到 ≈1 frame period。失败仅记
+    // 日志不阻断启动。
+    void apply_low_latency_dxgi() noexcept {
+        if (!d3d_device) return;
+        ComPtr<IDXGIDevice1> dxgi_dev;
+        if (FAILED(d3d_device.As(&dxgi_dev)) || !dxgi_dev) {
+            MCP_LOG_WARN("Controller: IDXGIDevice1 query failed; device-level frame latency skipped");
+            return;
+        }
+        HRESULT hr = dxgi_dev->SetMaximumFrameLatency(1);
+        MCP_LOGF(SUCCEEDED(hr) ? pal::LogLevel::info : pal::LogLevel::warn,
+                 "Controller: device-level SetMaximumFrameLatency(1) hr=0x%08lX", hr);
     }
 
     // CLAUDE.md 硬约束："MFT 与 renderer 共享同一 ID3D11Device 并启用多线程保护"。
@@ -340,42 +358,32 @@ struct Controller::Impl {
     // ADD §5.6.4 B-Frame Policy + §5.12 Color VUI 三级兜底：
     // 在 start_decode_pipeline 创建 codec 之前必须已计算 decoded_no_b_frames + resolved_color。
     //
-    // B-frame 判定优先级（任一确认无 B 帧即可放心开 LowLatencyMode）：
-    //   1. SDP profile-level-id（H.264 only） — Constrained Baseline / Baseline /
-    //      Constrained High 必无 B 帧。零成本，握手期就拿到。
-    //   2. SPS VUI — H.264 max_num_reorder_frames / H.265 sps_max_num_reorder_pics。
-    //      depack 在 sprop-parameter-sets 设置时即解析。
-    //   3. 任一信号未声明排除 B 帧 → 保守置 false（关 LowLatency，多缓 reorder）。
+    // B-frame 判定（VLC 风格："乐观默认 + 运行期检测降级"）：
+    //   默认 decoded_no_b_frames = true（开 LowLatencyMode）。仅在 SPS 明示
+    //   reorder > 0（H.264 bitstream_restriction=1 + max_num_reorder_frames>0
+    //   或 H.265 sps_max_num_reorder_pics>0）时关。
+    //
+    //   SDP profile-level-id 不再用作判据 —— 现网 zero-latency 编码器即便报 Main/High
+    //   profile 也常 -bf 0 实际无 B 帧，profile_idc 不能权威判定。SPS bitstream_restriction
+    //   缺席（VUI 可选字段，MediaMTX/GStreamer 不发）也保持乐观；运行期 codec 在 emit 端
+    //   做 PTS 反序检测，连续 N 次反序触发 controller 降级回调（关 LowLatency 重启 codec）。
     //
     // Color 三级兜底（color_meta::resolve_color）：VUI 自洽 → 启发式 → 用户覆盖。
-    // 高度未知时高度默认 1080（启发式落 BT.709，符合现网 IPC 主流）。
-    void decide_codec_policy(const transport::SdpMedia* video) noexcept {
-        decoded_no_b_frames = false;
+    // 高度未知时默认 1080（启发式落 BT.709，符合现网 IPC 主流）。
+    void decide_codec_policy(const transport::SdpMedia* /*video*/) noexcept {
+        decoded_no_b_frames = true;     // 乐观默认：开 LowLatencyMode
         media::VuiInputs vui;
         uint32_t height_hint = 1080;
 
         if (video_codec == MC_VIDEO_CODEC_H264) {
-            // 1) SDP profile-level-id
-            if (video) {
-                for (const auto& fmtp : video->fmtp) {
-                    auto it = fmtp.params.find("profile-level-id");
-                    if (it == fmtp.params.end()) continue;
-                    if (auto plid = transport::parse_h264_profile_level_id(it->second); plid) {
-                        if (transport::h264_profile_excludes_b_frames(*plid)) {
-                            decoded_no_b_frames = true;
-                            MCP_LOGF(pal::LogLevel::info,
-                                     "Controller: SDP profile-level-id=%s → no B-frames",
-                                     it->second.c_str());
-                        }
-                    }
-                }
-            }
-            // 2) SPS VUI（depack 已经解析）
             if (depack_h264) {
                 const auto& info = depack_h264->sps_info();
                 if (info.parsed) {
-                    if (info.bitstream_restriction && info.max_num_reorder_frames == 0) {
-                        decoded_no_b_frames = true;
+                    if (info.bitstream_restriction && info.max_num_reorder_frames > 0) {
+                        decoded_no_b_frames = false;
+                        MCP_LOGF(pal::LogLevel::info,
+                                 "Controller: H.264 SPS bitstream_restriction reorder=%u → has B-frames, disable LowLatency",
+                                 info.max_num_reorder_frames);
                     }
                     if (info.colour_primaries >= 0) {
                         vui.colour_primaries = info.colour_primaries;
@@ -399,7 +407,12 @@ struct Controller::Impl {
             if (depack_h265) {
                 const auto& info = depack_h265->sps_info();
                 if (info.parsed) {
-                    if (info.max_num_reorder_pics == 0) decoded_no_b_frames = true;
+                    if (info.max_num_reorder_pics > 0) {
+                        decoded_no_b_frames = false;
+                        MCP_LOGF(pal::LogLevel::info,
+                                 "Controller: H.265 SPS reorder=%u → has B-frames, disable LowLatency",
+                                 info.max_num_reorder_pics);
+                    }
                     if (info.pic_height > 0) height_hint = info.pic_height;
                     MCP_LOGF(pal::LogLevel::info,
                              "Controller: H.265 SPS reorder=%u h=%u",
@@ -412,7 +425,8 @@ struct Controller::Impl {
         media::ColorOverride no_override{};
         resolved_color = media::resolve_color(vui, height_hint, no_override);
         MCP_LOGF(pal::LogLevel::info,
-                 "Controller: codec policy: low_latency=%d color(pri=%d range=%d mat=%d) h_hint=%u",
+                 "Controller: codec policy: low_latency=%d (default optimistic; runtime PTS-inversion fallback) "
+                 "color(pri=%d range=%d mat=%d) h_hint=%u",
                  decoded_no_b_frames ? 1 : 0,
                  static_cast<int>(resolved_color.primaries),
                  static_cast<int>(resolved_color.range),
