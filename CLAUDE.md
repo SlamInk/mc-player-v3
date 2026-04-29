@@ -9,9 +9,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## 目录拓扑
 
 ```
-mc-player_架构设计文档_v3.0.md   架构设计文档（ADD）— 原理 / 架构 / 可行性
-mc-player_ADR.md                 架构决策记录（ADR-001 ~ ADR-014），与 ADD 交叉引用
-mc-player-ui-ux/                 React UI/UX 设计稿，浏览器渲染
+doc/                                架构与运维文档
+  ├── mc-player_架构设计文档_v3.0.md   架构设计文档（ADD）— 原理 / 架构 / 可行性
+  ├── mc-player_ADR.md                 架构决策记录（ADR-001 ~ ADR-014），与 ADD 交叉引用
+  └── hardware-decode-dependencies.md  硬件解码依赖与故障排查（IoT LTSC 等场景）
+mc-player-ui-ux/                    React UI/UX 设计稿，浏览器渲染
 ```
 
 未来按 ADD §3.1 与 ADR-010 落地的目录：
