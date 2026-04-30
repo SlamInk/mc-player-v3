@@ -512,60 +512,147 @@ before/after（AMD Radeon 660M，720p H.264）：
 
 ---
 
-## Phase 8 — ADR-016 Vendor SDK 内置下载面板
+## Phase 8 — ADR-016 + ADR-021 Hardware Decode Component Manager（HDCM）
 
-> 让用户首次启动检测到 GPU vendor 后无感引导下载，避免"装客户端但拿不到档 1"的体验。
+> 让 mc-player 在用户层"零命令"完成所有硬解组件的安装：vendor SDK / Microsoft Store 媒体扩展 / Windows Optional Feature / GPU driver 引导。原 vendor SDK 单点下载面板（ADR-016）扩为统一管理 4 类组件、3 种 in-app 安装模式（ADR-021）。
+>
+> ⚠️ scope 拆分：本 Phase 8 拆为 **8-A / 8-B / 8-C / 8-D / 8-E** 五个子 phase，各自独立 commit。原 ADR-016 单点面板对应 8-A；8-B / 8-C / 8-D 是 ADR-021 新增类别的实装；8-E 是日志框架 + controller 集成的横切收尾。
 
 ### 8.0 目标
 
-- detect_gpu_vendor() → {NVIDIA, Intel, AMD, Unknown}；缺 SDK 时弹"Hardware decode boost available"面板（默认跳过，用户选择"下载并启用"才继续）。
-- 后台下载 vendor 官网直链 redistributable → SHA-256 + Authenticode 数字签名校验 → 缓存到 `%LOCALAPPDATA%\mc-player\sdk\<vendor>\<version>\`。
-- 下次启动 probe 此目录命中即启用档 1，无需重装应用。
-- 离线 / 下载失败 → 静默降到档 2（不阻断启动）。
+- 启动期 batch detect 7 类组件状态（A_NVDEC / A_oneVPL / A_AMF / B_HEVC_Ext / B_AV1_Ext / C_MediaPlayback / D_<vendor>），按 `already_installed` / `installable` / `unavailable_on_this_sku` 三态分发到面板（详 hdcm 设计 §5.1）。
+- 用户主动展开"硬解组件"面板可一键安装：
+  - **类别 A**：WinHTTP 异步下载 + SHA-256 + Authenticode；缓存到 `%LOCALAPPDATA%\mc-player\sdk\<vendor>\<version>\`（沿 ADR-016）。
+  - **类别 B**：Store API `StoreContext::RequestDownloadAndInstallStorePackagesAsync`（C++/WinRT interop）；用户视角 = app 内进度条。
+  - **类别 C**：`ShellExecuteEx(verb="runas")` + helper.exe + `DismApi::DismEnableFeature` 启用 MediaPlayback feature；完成提示重启。
+  - **类别 D**：检测 driver 版本 < 阈值即一键 `ShellExecuteEx` 跳浏览器到 vendor 官网；driver setup.exe **不在 mc-player 进程内运行**。
+- 离线 / 用户取消 / UAC 拒绝 / 校验失败 → 静默回退（不阻断启动），按 ADR-015 四级降级链兜底。
+- 默认 log level `silent`；诊断走"调高 log level → 复现 → 用户导出 log"，无主动 collector。
 
 ### 8.1 改动范围
 
 | 文件 | 动作 |
 |---|---|
-| `mc-player/src/sdk_panel/detector.{h,cpp}`（新增）| GPU vendor 检测 + SDK 已存在 probe |
-| `mc-player/src/sdk_panel/downloader.{h,cpp}`（新增）| WinHTTP 异步下载 + SHA-256 + WinTrust Authenticode 校验 |
-| `mc-player/src/sdk_panel/installer.{h,cpp}`（新增）| 解压 / 复制到 `%LOCALAPPDATA%\mc-player\sdk\<vendor>\<version>\` |
-| `mc-player/src/sdk_panel/ui_panel.{h,cpp}`（新增）| 简易模态面板（与 ui_overlay 风格一致）|
-| `mc-player/include/mc-player/mc_player.h` | `mc_sdk_install_progress_callback_t` 暴露下载进度给应用 |
-| `mc-player/src/controller/controller.cpp` | 启动期检测 SDK 缺失 → 触发面板（用户可跳过）|
+| `mc-player/src/hdcm/manifest_table.{h,cpp}`（新增）| HDCM_MANIFEST_TABLE 静态表（7 类组件 manifest，详 hdcm 设计 §2）|
+| `mc-player/src/hdcm/detector.{h,cpp}`（新增；原 sdk_panel/detector 重构合入）| 类别 A/B/C/D 各自 probe_fn；启动期 batch detect 输出 `HdcmComponentState[]` |
+| `mc-player/src/hdcm/installer_a_vendor_sdk.{h,cpp}`（新增；原 sdk_panel/downloader + installer 合入）| 类别 A：WinHTTP 异步下载 + SHA-256 + WinTrust Authenticode + 解压到缓存 |
+| `mc-player/src/hdcm/installer_b_store.{h,cpp}`（新增）| 类别 B：UWP `Windows.Services.Store` C++/WinRT interop 调 `RequestDownloadAndInstallStorePackagesAsync` |
+| `mc-player/src/hdcm/installer_c_feature.{h,cpp}`（新增）| 类别 C：主 app 侧 `ShellExecuteEx(verb="runas")` + 命名管道 IPC client（与 helper.exe 通信）|
+| `mc-player/src/hdcm/installer_d_driver.{h,cpp}`（新增）| 类别 D：`Win32_VideoController.DriverVersion` 检测 + `ShellExecuteEx` 跳浏览器 |
+| `mc-player/src/hdcm/ui_panel.{h,cpp}`（新增；原 sdk_panel/ui_panel 重构）| "硬解组件"面板（与 ui_overlay 风格一致）；按类别折叠展开；每组件显示状态 + 一键按钮 |
+| `mc-player/tools/mc_hdcm_helper/`（新工程）| helper.exe；manifest `requireAdministrator`；DismApi 调用 + 命名管道 IPC server；与主 app 同 vendor 签名；**无网络能力** |
+| `mc-player/include/mc-player/mc_player.h` | `mc_hdcm_progress_callback_t` 暴露安装进度（含 category / id / state / progress%）|
+| `mc-player/src/controller/controller.cpp` | 启动期触发 HDCM batch detect（异步，不阻塞 mc_open）；面板入口默认折叠 |
+| `mc-player/src/pal/log.{h,cpp}` | log level enum 新增 `silent`（默认）/ `error` / `warn` / `info` / `debug` / `trace`；运行期可调级 |
 
-### 8.2 实施步骤
+### 8.2 实施步骤（按子 phase 拆分）
 
-1. detector：`IDXGIAdapter1::GetDesc1` 拿 VendorId；按 ADR-016 + ADD §5.6.6 分发到对应 SDK 的预期文件存在性 probe（含 `%LOCALAPPDATA%` cache + System32）。
-2. downloader：WinHTTP 异步 GET 到临时文件；下载完成后 SHA-256 比对（值在编译期 hardcoded，每次升级 mc-player 一并升级）。
-3. installer：先做 Authenticode 签名校验（WinTrust），通过才解压 / 复制；失败立即清理临时。
-4. UI：模态面板用 mc-player 现有 ui_overlay 风格（不引第三方 UI 库）；按钮"下载并启用 / 跳过 / 下次再问"。
-5. 离线场景：`HTTPS GET` 失败 / 超时 → 直接关面板降到档 2 + 上报 `mc.decoder.sdk_cache_hit{vendor}=0`。
+**8-A. 类别 A vendor SDK（沿 ADR-016 实装）**
+1. detector：`IDXGIAdapter1::GetDesc1` 拿 VendorId；按 manifest 表分发到 A_NVDEC / A_oneVPL / A_AMF 各自 probe_fn（含 `%LOCALAPPDATA%` cache + System32 双查）。
+2. installer_a_vendor_sdk：WinHTTP 异步 GET 到临时文件；SHA-256 比对（manifest 表 hardcoded）；通过 → WinTrust Authenticode 签名校验；通过 → 解压 / 复制到 `%LOCALAPPDATA%\mc-player\sdk\<vendor>\<version>\`。
+3. ui_panel A 类入口：与 ui_overlay 风格一致；按钮"下载并启用 / 取消"。
+4. 验收：NVIDIA 测试机 detect → 用户点击下载 → 安装成功 → 下次启动 `mc.hdcm.component{type=A,id=A_NVDEC}.state=already_installed` + `mc.decoder.kind=VENDOR_SDK_NVDEC`。
+
+**8-B. 类别 B Store API（HEVC / AV1 Video Extension）**
+1. detector B：`Windows::Management::Deployment::PackageManager::FindPackagesForUser` 查找 `Microsoft.HEVCVideoExtension_*` / `Microsoft.AV1VideoExtension_*` PackageFamilyName；未装则 `Windows::Services::Store::StoreContext::GetDefault()` 检测 Store 客户端可用性。
+2. installer_b_store：C++/WinRT 项目配置 + `Windows.Services.Store` namespace；`StoreContext::RequestDownloadAndInstallStorePackagesAsync({product_id})` async wrap；进度通过 `IAsyncOperationWithProgress::Progress` callback 上报。
+3. SKU 限制：IoT LTSC / 无 Store SKU 自动归 `unavailable_on_this_sku`，面板隐藏入口。
+4. 验收：Win11 retail + Store 在线机器：detect → 用户点击 HEVC Ext 下载 → Store API 安装完成 → `Microsoft.HEVCVideoExtension` package 已注册 → 重启 mc-player → 档 3 H.265 codec 覆盖增加。
+
+**8-C. 类别 C MediaPlayback feature + helper.exe**
+1. helper.exe 工程：新建 `mc-player/tools/mc_hdcm_helper/`，manifest `<requestedExecutionLevel level="requireAdministrator" uiAccess="false" />`；与主 app 同 SignTool 证书。
+2. helper main：parent process 校验（`OpenProcess` + `GetModuleFileNameExW` + `WinVerifyTrust` cert chain → 同主 app 证书 thumbprint 才继续）；通过则监听命名管道 `\\.\pipe\mc-player\hdcm-helper-<pid>`；接收 EnableFeature 请求；调 `DismOpenSession` + `DismEnableFeature(L"MediaPlayback", ...)` + `DismGetFeatureInfo` → 返回 hr + restart_required + error_message；发送响应后退出。
+3. installer_c_feature：主 app 侧 `ShellExecuteEx(verb="runas", lpFile="mc_hdcm_helper.exe", lpParameters=pipe_name)` → UAC 弹窗；用户同意后通过命名管道发 EnableFeature 请求 → 等响应 → 解析 restart_required → 弹"立即重启 / 稍后重启"对话框。
+4. 离线场景：用户拒绝 UAC → `result=uac_denied` → 面板提示重试。
+5. 验收：IoT LTSC 主机 detect MediaPlayback=Disabled → 用户点击启用 → UAC 通过 → DISM 启用成功 → restart_required=Required → 用户立即重启 → 下次启动 `Get-WindowsOptionalFeature MediaPlayback=Enabled` + `MFTEnumEx` 返回 ≥1 hardware MFT → ADR-015 档 3 可用。
+
+**8-D. 类别 D GPU driver 引导**
+1. installer_d_driver：`IWbemServices::ExecQuery(WQL)` 查 `Win32_VideoController.DriverVersion` → 解析四段版本 → vs manifest 表编译期内嵌阈值；落后即 `mc.hdcm.driver_below_threshold{vendor}=1`。
+2. ui_panel D 类入口：仅 `driver_below_threshold=1` 时可见；按钮"前往 vendor 官网下载新驱动"。
+3. 点击 → `ShellExecuteEx({lpVerb=L"open", lpFile=vendor_url})` → 默认浏览器打开 → 用户在浏览器 + vendor 自家 installer 完成。
+4. 不监控 driver 安装结果（外部进程；mc-player 无能力跟踪）；下次启动重新 detect。
+5. 验收：driver 版本人为降到阈值之下 → 启动后 D 类入口可见 → 点击跳浏览器 → 用户更新 driver + 重启 → 下次启动 detect `driver_below_threshold=0` + `mc.probe.tier_skip_reason{tier=2}=profile_unsupported` 消失。
+
+**8-E. 日志框架 + controller 集成**
+1. pal/log：log level enum {silent, error, warn, info, debug, trace}；默认 silent；运行期可调级（设置面板）；不引第三方日志库。
+2. controller：mc_open 启动期异步触发 HDCM batch detect，**不阻塞** `mc_open` 首帧路径（性能规范 §3）。
+3. ui_overlay 集成"硬解组件"面板入口（默认折叠，仅 INSTALLABLE 组件存在时面板入口可见）。
+4. 整体 E2E 测试：单机覆盖 7 类组件全状态切换；面板 UX 评审。
 
 ### 8.3 验收 metric
 
 | metric | 阈值 |
 |---|---|
-| `mc.decoder.sdk_cache_hit{vendor=NVIDIA}` 在 NVIDIA 测试机首次启动后 | 0 → （用户选择下载并完成）→ 1 |
-| 下次启动 `mc.decoder.kind` | 自动到 `VENDOR_SDK_NVDEC` |
-| 离线场景 | 启动不阻断；档位降到 `DXVA_DIRECT`；`mc.probe.tier_skip_reason{tier=1}` = `sdk_missing` |
-| SHA-256 校验失败 | 拒绝安装；面板提示用户重试 |
-| Authenticode 签名校验失败 | 同上，安全闸不放行 |
+| `mc.hdcm.component{type=A, id=A_NVDEC}.state`（NVIDIA 测试机首启后） | `installable` → 用户点击下载 → `installing` → `already_installed` |
+| `mc.hdcm.install_attempt_count{type=A, result=success}` | NVDEC 下载 + 校验 + 解压成功 ≥ 1 |
+| `mc.hdcm.component{type=B, id=B_HEVC_Ext}.state` | Win11 retail + Store: 用户点击安装 → `already_installed`；IoT LTSC: 自动 `unavailable_on_this_sku` |
+| `mc.hdcm.component{type=C, id=C_MediaPlayback}.state` | IoT LTSC + Disabled: `installable` → UAC + DISM → `restart_pending` → 用户重启 → `already_installed` |
+| `mc.hdcm.driver_below_threshold{vendor=Intel}` | 老 driver 测试机: 1；用户更新后: 0 |
+| `mc.decoder.kind`（IoT LTSC + 用户启用 C + 重启） | 从 `LIBCODEC` 升到 `MFT_HARDWARE` 或 `DXVA_DIRECT` |
+| 离线 / UAC 拒绝 / 校验失败 | 启动不阻断；档位降到 ADR-015 兜底档；面板提示重试 |
+| `mc.firstframe.open_to_first_emit_ns` | HDCM batch detect 异步执行，不影响首帧延时阈值（性能规范 §3） |
 
 ### 8.4 commit 模板
 
+按 8-A ~ 8-E 拆 5 次 commit：
+
 ```
-feat(phase-8): ADR-016 vendor SDK 内置下载面板
+feat(phase-8-A): ADR-016 vendor SDK 子模块（HDCM 类别 A 实装）
 
-- sdk_panel/detector: GPU vendor 检测 + SDK 已存在 probe（含 %LOCALAPPDATA% cache）
-- sdk_panel/downloader: WinHTTP 异步下载 + SHA-256 + WinTrust Authenticode 校验
-- sdk_panel/installer: 解压到 %LOCALAPPDATA%\mc-player\sdk\<vendor>\<version>\
-- sdk_panel/ui_panel: 模态面板（与 ui_overlay 同风格）
-- 离线 / 下载失败 / 校验失败 → 静默降到档 2，启动不阻断
+- hdcm/manifest_table: A_NVDEC / A_oneVPL / A_AMF 三组件 manifest（vendor_id / 下载源 / SHA-256 / 缓存路径）
+- hdcm/detector: IDXGIAdapter1::GetDesc1 + cache 双查 probe
+- hdcm/installer_a_vendor_sdk: WinHTTP 异步下载 + SHA-256 + WinTrust Authenticode + 解压
+- hdcm/ui_panel A 类入口
+- 离线 / 校验失败 → 静默回退到 ADR-015 档 2
 
-before/after（NVIDIA 测试机首次启动）：
-- mc.decoder.sdk_cache_hit{vendor=NVIDIA}: 0 → 1（用户同意下载后）
-- mc.decoder.kind 下次启动:                DXVA_DIRECT → VENDOR_SDK_NVDEC
+before/after（NVIDIA 测试机首启）：
+- mc.hdcm.component{type=A,id=A_NVDEC}.state: installable → already_installed
+- mc.decoder.kind 下次启动:                     DXVA_DIRECT → VENDOR_SDK_NVDEC
+```
+
+```
+feat(phase-8-B): ADR-021 类别 B Microsoft Store 媒体扩展安装
+
+- hdcm/installer_b_store: UWP Windows.Services.Store C++/WinRT interop
+- HEVC / AV1 Video Extension 通过 RequestDownloadAndInstallStorePackagesAsync 安装
+- IoT LTSC / 无 Store SKU: 自动归 unavailable_on_this_sku，面板隐藏入口
+
+before/after（Win11 retail + 无 HEVC Ext）：
+- mc.hdcm.component{type=B,id=B_HEVC_Ext}.state: installable → already_installed
+- 重启 mc-player 后 H.265 流: 档 3 codec 覆盖增加
+```
+
+```
+feat(phase-8-C): ADR-021 类别 C Windows Optional Feature 启用（helper.exe + DismApi）
+
+- tools/mc_hdcm_helper/ 工程: requireAdministrator manifest + 命名管道 IPC server + DismApi 调用 + 同 vendor 签名 + 无网络能力
+- hdcm/installer_c_feature: ShellExecuteEx(verb="runas") + 命名管道 client + restart_required 处理
+- 启用成功后弹"立即重启 / 稍后重启"对话框
+
+before/after（IoT LTSC + MediaPlayback Disabled）:
+- mc.hdcm.component{type=C,id=C_MediaPlayback}.state: installable → restart_pending → already_installed（用户重启后）
+- mc.decoder.kind: LIBCODEC → MFT_HARDWARE（重启后档 3 可用）
+```
+
+```
+feat(phase-8-D): ADR-021 类别 D GPU driver 阈值检测 + 跳浏览器引导
+
+- hdcm/installer_d_driver: Win32_VideoController.DriverVersion 检测 vs 编译期阈值表
+- 落后则 ShellExecuteEx 一键跳 vendor 官网驱动页
+- driver setup.exe 不在 mc-player 进程内运行（工程边界）
+
+before/after（老 Intel driver 测试机）：
+- mc.hdcm.driver_below_threshold{vendor=Intel}: 1
+- 用户跳浏览器更新 driver + 重启后:                0
+- mc.probe.tier_skip_reason{tier=2}=profile_unsupported: 消失
+```
+
+```
+feat(phase-8-E): pal/log silent 默认 + HDCM 集成到 controller
+
+- pal/log: log level enum {silent, error, warn, info, debug, trace}; 默认 silent
+- controller: mc_open 异步触发 HDCM batch detect，不阻塞首帧路径
+- ui_overlay 集成"硬解组件"面板入口（默认折叠，installable 组件存在时入口可见）
 ```
 
 ---
