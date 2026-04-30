@@ -300,6 +300,18 @@ ADR-015 四级降级链的可观测面。运维主要靠这组 metric 判断"为
 | `mc.decoder.reorder_cost_ms` | gauge | B-Frame Policy 激活时的 reorder 延时代价 |
 | `mc.decoder.dual_bind_active` | gauge 0/1 | dual-bind 命中（§4.3）；0 表示 fallback 到 CopySubresource |
 
+### 6.1 Hardware Decode Component Manager（HDCM；ADR-021）
+
+`mc.decoder.sdk_cache_hit{vendor}` 是档 1 专用 backward-compatible alias；本组 metric 是 HDCM 引入的更通用视图（覆盖类别 A/B/C/D 共 7 类组件）。详 `mc-player_hdcm_设计.md` §6。
+
+| 字段 | 类型 | 取值 / 含义 |
+|---|---|---|
+| `mc.hdcm.component{type, id}.state` | gauge label | `type` ∈ {A,B,C,D}；`id` ∈ {A_NVDEC, A_oneVPL, A_AMF, B_HEVC_Ext, B_AV1_Ext, C_MediaPlayback, D_NVIDIA, D_Intel, D_AMD}；`state` ∈ {already_installed, installable, unavailable_on_this_sku, installing, install_failed, restart_pending}（hdcm 设计 §3.2）|
+| `mc.hdcm.install_attempt_count{type, id, result}` | counter | `result` ∈ {started, success, user_cancelled, net_error, checksum_mismatch, authenticode_invalid, uac_denied, store_unavailable, dism_payload_missing, helper_crashed, external_redirect} |
+| `mc.hdcm.last_install_duration_ms{type, id}` | gauge | 单次安装从 `INSTALLING` → `SUCCESS` / `FAILED` 耗时；类别 D 跳浏览器记 `external_redirect`，不计耗时 |
+| `mc.hdcm.restart_pending{feature}` | gauge 0/1 | 类别 C DISM 启用成功但 `restart_required > 0`，等用户重启电脑（`feature=MediaPlayback` 等）|
+| `mc.hdcm.driver_below_threshold{vendor}` | gauge 0/1 | 类别 D 检测当前 driver 版本 < 编译期阈值（`vendor` ∈ {NVIDIA, Intel, AMD}）|
+
 ---
 
 ## 7. 渲染管线（`mc.render.*`）
@@ -465,6 +477,10 @@ ADD §5.13 末段已规定"每个 bit 累计 drop 计数 + 最近一次 drop 帧
 | `mc.probe.tier_skip_reason{tier=2}` | `profile_unsupported` → driver 老旧 |
 | `mc.probe.tier_skip_reason{tier=3}` | `sync_software_only` → 正确，按 ADR-015 设计走档 4 / 上溯档 1/2 |
 | `mc.decoder.sdk_cache_hit{vendor=...}` | 0 → ADR-016 面板未触发 / 用户跳过 |
+| `mc.hdcm.component{type=A, id=A_<vendor>}.state` | `installable` 长期 → 用户未点击安装；`install_failed` → 看 `mc.hdcm.install_attempt_count{result=...}` 细分（net_error / checksum_mismatch / authenticode_invalid 等）|
+| `mc.hdcm.component{type=B, id=B_HEVC_Ext}.state` | `unavailable_on_this_sku` → 该 SKU 无 Microsoft Store（如 IoT LTSC）；按 `hardware-decode-dependencies.md` §4.4 走 Media Feature Pack MSU 离线方案兜底 |
+| `mc.hdcm.component{type=C, id=C_MediaPlayback}.state` | `restart_pending` 长期 → 用户已 enable feature 但未重启；`unavailable_on_this_sku` → base image 不含 payload，同样 §4.4 |
+| `mc.hdcm.driver_below_threshold{vendor}=1` + `mc.probe.tier_skip_reason{tier=2}=profile_unsupported` | driver 老旧导致档 2 profile 不暴露 → app 内已弹"GPU driver 落后"提示（类别 D），等用户跳浏览器更新 |
 
 ### 10.6 音画不同步
 
@@ -506,6 +522,8 @@ ADD §5.13 末段已规定"每个 bit 累计 drop 计数 + 最近一次 drop 帧
 - `mc.render.profile_actual` 是否到 `Hardware_Composed_Independent_Flip`：DCOMP 升级为 best-effort（ADD §5.10.2 / ADR-008），不 fail，仅监控
 - `mc.decoder.dual_bind_active`：driver 不支持时 fallback 到 CopySub 是允许的（ADD §4.3 / ADR-003），仅监控
 - `mc.decoder.sdk_cache_hit`：用户首次启动可能跳过下载（ADR-016），不 fail
+- `mc.hdcm.component{*}.state`：用户可选择不安装任何 HDCM 组件（ADR-021），不 fail；运维可定义"X 天 INSTALLABLE 状态长期未安装"提醒
+- `mc.hdcm.restart_pending{feature}`：类别 C 安装成功但用户未重启时长期为 1，不 fail；提示而非阻断
 
 ### 11.3 告警阈值（运维监控）
 
