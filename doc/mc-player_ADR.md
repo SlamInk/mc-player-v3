@@ -112,6 +112,7 @@
   - 与 ADR-005 (libdatachannel) / ADR-009 (libopus) 直接 bundle 的对比：那两个是 baseline 能力（无之则 WHEP / Opus 不可用），bundle 合理；vendor SDK 是**可选性能增强**（无之则降到档 2 仍能放）——按需下载更对应其角色。
   - 下载源限定 vendor 官网直链 + 校验 SHA-256；不引第三方 redistributable 仓库。
 - **关系**：执行 ADR-015 档 1 的工程化前置；与 §2 #10 "平台原生优先"的关系参考 ADR-005/009 的 "为关键能力可引第三方" 例外口子，本 ADR 进一步细化"可选增强档"的引入方式。
+- **扩展记录（2026-04-30）**：本 ADR 范围（vendor SDK redistributable）作为 ADR-021 HDCM 类别 A 保持不变；类别 B（Microsoft Store 扩展）/ C（Windows Optional Feature）/ D（GPU driver 引导）由 ADR-021 新增覆盖。原决策与原依据正文不动；ADD §5.6.6 状态机由"单档 vendor SDK 下载面板"改写为"四类组件 HDCM 状态机"统一管理。
 
 ## ADR-017 Capability-Driven Adaptive Preset 架构（顶层决策机制；正文 §3.5 / §7.5.4 / §8.4）
 
@@ -158,6 +159,36 @@
   - 与 ADR-014（Frame Validity Gate）：切换路径所有 in-flight 帧标 invalid，等下一 refresh anchor 解 freeze——这是 Gate 污染态生命周期已规定的标准路径。
   - 与 ADR-015（四级降级链）：本 ADR 的 Preset 热切**不跨 decoder 档**；档间升级仅在用户重 `mc_open` 时发生（见决策范围段）。
   - 与性能量度规范 §11.3：Preset 切换次数 / blacklist 命中作为新增 metric 上报（具体字段在性能规范实施期补完）。
+
+## ADR-021 Hardware Decode Component Manager（HDCM）：扩展 ADR-016 范围至 OS 媒体扩展 / Optional Feature / GPU driver（正文 §5.6.6）
+
+- **决策**：ADR-016 "vendor SDK 内置下载面板"扩展为统一的 **Hardware Decode Component Manager（HDCM）**，按"用户层零命令"原则覆盖四类硬解组件、三种 in-app 安装模式：
+
+  | 类别 | 组件 | 触发档位 | in-app 安装模式 |
+  |---|---|---|---|
+  | A | Vendor SDK redistributable（NVDEC / oneVPL / AMF） | 档 1 | 沿 ADR-016：WinHTTP 异步下载 + SHA-256 + Authenticode + 缓存到 `%LOCALAPPDATA%\mc-player\sdk\<vendor>\<version>\` |
+  | B | Microsoft Store 媒体扩展（HEVC / AV1 Video Extension） | 档 3 codec 覆盖 | UWP `Windows.Services.Store::StoreContext::RequestDownloadAndInstallStorePackagesAsync`；用户视角 = app 内进度条；Store 不可用 SKU（典型：IoT LTSC）自动隐藏入口 |
+  | C | Windows Optional Feature（MediaPlayback feature） | 档 3 整档可用 | helper.exe（`requireAdministrator` manifest）+ `DismApi::DismEnableFeature(L"MediaPlayback", ...)`；UAC 弹窗 → helper 执行 → 完成提示重启（DISM `DismRestartRequired_Possible` / `_Required` 状态）|
+  | D | GPU driver | 档 2 + 档 3 driver-side 能力 | 检测 `Win32_VideoController.DriverVersion` vs 编译期内嵌阈值；落后即 `ShellExecuteEx` 一键跳浏览器到 vendor 官网驱动页（**setup.exe 不在 app 进程内运行**）|
+
+  HDCM 默认 log level `silent`，诊断走"调高 log level → 复现 → 用户导出 log"，无主动 collector。
+
+- **依据**：
+  - **用户层零命令**：原 ADR-016 已实现类别 A in-app 全自动；让用户跑 `Enable-WindowsOptionalFeature` PowerShell 或外跳 Microsoft Store 客户端会割裂一致 UX。helper.exe + UAC 是 Windows 平台对系统级修改的标准 elevation 模式（COM elevation moniker / UAC manifest），不引第三方依赖。
+  - **类别 B 法律合规**：HEVC Video Extension 是付费 MSIX/Appx 包，license 不允许第三方 redistribute；Store API 走官方分发通道是 in-app install 唯一合规路径。AV1 Extension 免费，同走 Store API。
+  - **类别 D 工程边界**：GPU driver setup.exe 是大型侵入式安装（切显卡 / 黑屏 / 通常要求重启），与 mc-player 进程生命周期严重耦合时风险过高。"app 内检测 + 跳 vendor 官网"符合"硬件安装责任归 vendor 自家工具"的工程惯例。
+  - **silent default 日志**：主动诊断 collector 在企业部署场景容易触发安全合规审计；按需调级 + 用户导出 log 是更轻的运维路径。
+  - **保留 ADR-016 不 supersede**：ADR-016 vendor SDK 路径是 HDCM 类别 A 的全部实装；本 ADR 扩展类别 B/C/D，ADR-016 决策与依据正文不动，末尾追加扩展记录指向本 ADR。
+
+- **关系**：
+  - **扩展 ADR-016**：本 ADR 包含 ADR-016 全部内容（类别 A），新增类别 B/C/D。
+  - 与 ADR-015：HDCM 是四级降级链的工程化前置——类别 A 提升档 1 命中率；类别 B 间接提升档 3 codec 覆盖（HEVC / AV1）；类别 C 让档 3 MFT subsystem 在 IoT LTSC 等裁剪 SKU 上可用；类别 D 影响档 2 / 档 3 driver-side 能力。**HDCM 不影响档间优先级**——硬件 path 最短优先按 ADR-015 不变，HDCM 只补全各档的 OS 前置。
+  - 与 ADR-007 / ADR-013：HDCM 类别 A vendor 匹配 / 类别 D driver 检测均基于 active adapter（ADR-007 智能 GPU 选择结果）；多卡共存（如 NVIDIA dGPU + Intel iGPU）按 active 一侧分发组件；跨屏 transition（ADR-013）切 adapter 时不重新弹安装面板——HDCM 状态在 mc_open 生命周期内 immutable，下次重 `mc_open` 才重新 detect。
+  - 与 ADR-020：HDCM 类别 A 在运行期下载好 vendor SDK 后，本会话保持当前档位（不跨档升档），与 ADR-020 "Preset 热切不跨 decoder 档" 决策范围一致；档 1 命中需用户重 `mc_open` / 重启 app。
+  - 与 §2 #10 "平台原生优先"：类别 B 调用 UWP `Windows.Services.Store`（C++/WinRT interop）/ 类别 C 调用 `DismApi.dll` 均是 OS 原生 API，不引第三方依赖。类别 A 沿用 ADR-016 既定例外口子。
+  - 与性能量度规范：metric 字段集中在 §6 末"`mc.hdcm.*`"块，排障扩展到 §10.5。
+  - 与 plan Phase 8：原 vendor SDK 单点下载面板扩为 HDCM 四类组件，改动文件清单按本 ADR 切分。
+  - 与 `doc/mc-player_hdcm_设计.md`（design-detail）：组件 manifest / 状态机伪代码 / helper.exe IPC 协议 / driver 阈值表 等实施细节统一在该 design-detail 文档。
 
 ---
 
