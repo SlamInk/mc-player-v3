@@ -92,6 +92,8 @@ set(MCP_MEDIA_SOURCES
     src/hdcm/installer_b_store.cpp
     src/hdcm/installer_c_feature.h
     src/hdcm/installer_c_feature.cpp
+    src/hdcm/installer_d_driver.h
+    src/hdcm/installer_d_driver.cpp
     src/media/codec_amf.h
     src/media/codec_amf.cpp
     src/media/codec_nvdec.h
