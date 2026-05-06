@@ -606,6 +606,32 @@ struct CodecDxvaVideo::Impl {
         return ctx.As(&video_ctx);
     }
 
+    // 把 D3D11 debug layer 在 InfoQueue 里 pending 的所有消息打到 mc-player.log。
+    // Debug build 自带 D3D11_CREATE_DEVICE_DEBUG,driver/runtime 对 DXVA 提交的检查
+    // (slice ctrl / picparams / DPB view) 都会作为消息排队。silent fail 路径上只能从
+    // 这里拿到 driver 的真实拒绝理由。
+    void drain_d3d11_messages(const char* tag) noexcept {
+        ComPtr<ID3D11InfoQueue> iq;
+        if (FAILED(cfg.device.As(&iq)) || !iq) return;
+        const UINT64 n = iq->GetNumStoredMessages();
+        if (n == 0) return;
+        for (UINT64 i = 0; i < n && i < 30; ++i) {
+            SIZE_T sz = 0;
+            iq->GetMessage(i, nullptr, &sz);
+            if (sz == 0) continue;
+            std::vector<uint8_t> buf(sz);
+            auto* m = reinterpret_cast<D3D11_MESSAGE*>(buf.data());
+            if (FAILED(iq->GetMessage(i, m, &sz))) continue;
+            MCP_LOGF(pal::LogLevel::warn,
+                     "D3D11Info[%s]: cat=%d sev=%d id=%d %.*s",
+                     tag, static_cast<int>(m->Category), static_cast<int>(m->Severity),
+                     static_cast<int>(m->ID),
+                     static_cast<int>(m->DescriptionByteLength),
+                     m->pDescription);
+        }
+        iq->ClearStoredMessages();
+    }
+
     HRESULT pick_decoder_config(UINT w, UINT h) noexcept {
         D3D11_VIDEO_DECODER_DESC desc{};
         desc.Guid         = profile;
@@ -615,18 +641,40 @@ struct CodecDxvaVideo::Impl {
         UINT n = 0;
         HRESULT hr = video_device->GetVideoDecoderConfigCount(&desc, &n);
         if (FAILED(hr) || n == 0) return E_FAIL;
+        // 优先 raw=1 (DXVA H.264 spec 短格式 + Annex-B start codes)。
+        // raw=2 在 Intel/AMD/NV 不同 driver 上语义不一致(AVCC 长度前缀 vs 裸 NAL),
+        // 跨厂商可移植性差,作 fallback 即可。
+        int  picked_idx     = -1;
+        UINT picked_raw     = 0;
+        D3D11_VIDEO_DECODER_CONFIG best{};
         for (UINT i = 0; i < n; ++i) {
             D3D11_VIDEO_DECODER_CONFIG c{};
-            if (SUCCEEDED(video_device->GetVideoDecoderConfig(&desc, i, &c))) {
-                if (c.ConfigBitstreamRaw == 1) {     // Annex-B with start codes
-                    cfg_used = c;
-                    cfg_bitstream_raw = 1;
-                    return S_OK;
-                }
+            if (FAILED(video_device->GetVideoDecoderConfig(&desc, i, &c))) continue;
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecDxvaVideo: cfg[%u/%u] raw=%u 4Coef=%u DecSpec=0x%X "
+                     "minRT=%u SpatRsd8=%u ResidDiff=%u",
+                     i, n, c.ConfigBitstreamRaw, c.Config4GroupedCoefs,
+                     c.ConfigDecoderSpecific, c.ConfigMinRenderTargetBuffCount,
+                     c.ConfigSpatialResid8, c.ConfigResidDiffAccelerator);
+            if (c.ConfigBitstreamRaw == 1 && picked_raw != 1) {
+                best = c; picked_idx = static_cast<int>(i); picked_raw = 1;
+            } else if (c.ConfigBitstreamRaw == 2 && picked_raw == 0) {
+                best = c; picked_idx = static_cast<int>(i); picked_raw = 2;
             }
         }
-        // 降级：取首个支持的 config（可能要求 stripped 格式）。
-        return video_device->GetVideoDecoderConfig(&desc, 0, &cfg_used);
+        if (picked_idx >= 0) {
+            cfg_used          = best;
+            cfg_bitstream_raw = picked_raw;
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecDxvaVideo: picked cfg[%d] raw=%u (start_code_prefix=%s)",
+                     picked_idx, picked_raw,
+                     picked_raw == 1 ? "include" : "strip");
+            return S_OK;
+        }
+        // 降级:取首个 config(可能 long slice control / driver-specific format)。
+        hr = video_device->GetVideoDecoderConfig(&desc, 0, &cfg_used);
+        if (SUCCEEDED(hr)) cfg_bitstream_raw = cfg_used.ConfigBitstreamRaw;
+        return hr;
     }
 
     HRESULT init_decoder(const Sps& s) noexcept {
@@ -739,6 +787,24 @@ struct CodecDxvaVideo::Impl {
                  "CodecDxvaVideo: decoder ready %ux%u dpb=%u (Annex-B raw=%u)",
                  dec_w, dec_h, dpb_size, cfg_bitstream_raw);
         return S_OK;
+    }
+
+    // H.264 专用分配:从 slot 1 开始(slot 0 永留 unused)。
+    // 假设原因:DXVA_PicEntry_H264.bPicEntry=0x00 (Index7Bits=0, AssociatedFlag=0) 在某些
+    // driver 上可能被误读为"unused slot"(0xFF 是标准 unused 标记,但 0x00 的 Index=0+Flag=0
+    // 也是一个有效但语义模糊的边界 case)。让 CurrPic 始终从 DPB[1+]开始,bPicEntry≥0x01,
+    // 与 0xFF unused 完全区分。slot 0 不参与 ref/curr,只作为"reserved sentinel"。
+    UINT alloc_dpb_slot_h264() noexcept {
+        for (UINT i = 1; i < dpb_size; ++i) if (!dpb[i].used) return i;
+        UINT    victim  = UINT_MAX;
+        int32_t min_poc = INT32_MAX;
+        for (UINT i = 1; i < dpb_size; ++i) {
+            if (i == last_ref_dpb_idx) continue;
+            if (dpb[i].poc < min_poc) { min_poc = dpb[i].poc; victim = i; }
+        }
+        if (victim == UINT_MAX) victim = 1;
+        dpb[victim] = DpbEntry{};
+        return victim;
     }
 
     UINT alloc_dpb_slot() noexcept {
@@ -1161,6 +1227,41 @@ struct CodecDxvaVideo::Impl {
 
     HRESULT init_decoder_h264(const h264::Sps& s) noexcept {
         if (decoder_inited) return S_OK;
+        // 枚举 driver 暴露的所有 H.264 GUID;按 MCP_DXVA_H264_GUID env var (索引 0/1/2/3) 选;
+        // 默认 0 = driver 列表首个 supported (ffmpeg D3D11VA 同样策略)。
+        UINT pick_idx = 0;
+        {
+            char buf[8]; size_t n = 0;
+            if (getenv_s(&n, buf, sizeof(buf), "MCP_DXVA_H264_GUID") == 0 && n > 0) {
+                pick_idx = static_cast<UINT>(buf[0] - '0');
+            }
+        }
+        {
+            const UINT n = video_device->GetVideoDecoderProfileCount();
+            std::vector<GUID> h264_guids;
+            for (UINT i = 0; i < n; ++i) {
+                GUID g{};
+                if (FAILED(video_device->GetVideoDecoderProfile(i, &g))) continue;
+                if ((g.Data1 & 0xFFFFFF00u) != 0x1B81BE00u) continue;
+                BOOL supported = FALSE;
+                video_device->CheckVideoDecoderFormat(&g, DXGI_FORMAT_NV12, &supported);
+                MCP_LOGF(pal::LogLevel::info,
+                         "  H.264 GUID[%zu] (idx=%u) = {%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X} "
+                         "NV12_supported=%d",
+                         h264_guids.size(), i, g.Data1, g.Data2, g.Data3,
+                         g.Data4[0], g.Data4[1], g.Data4[2], g.Data4[3],
+                         g.Data4[4], g.Data4[5], g.Data4[6], g.Data4[7],
+                         supported);
+                if (supported) h264_guids.push_back(g);
+            }
+            if (!h264_guids.empty()) {
+                if (pick_idx >= h264_guids.size()) pick_idx = 0;
+                profile = h264_guids[pick_idx];
+                MCP_LOGF(pal::LogLevel::info,
+                         "CodecDxvaVideo: H.264 picked GUID[%u]={%08X-...} (env MCP_DXVA_H264_GUID=%u)",
+                         pick_idx, profile.Data1, pick_idx);
+            }
+        }
         HRESULT hr = pick_decoder_config(s.pic_width_in_samples_l,
                                           s.pic_height_in_samples_l);
         if (FAILED(hr)) {
@@ -1181,7 +1282,7 @@ struct CodecDxvaVideo::Impl {
         }
         dec_w = s.pic_width_in_samples_l;
         dec_h = s.pic_height_in_samples_l;
-        // DPB 大小：num_ref_frames + 1 (current) + 余量；下界 4，上界 20，匹配 driver 需求。
+        // DPB 大小:num_ref_frames + 1 (current) + 余量;下界 4,上界 20。
         dpb_size = std::max<UINT>(static_cast<UINT>(s.num_ref_frames) + 2u, 4u);
         if (cfg_used.ConfigMinRenderTargetBuffCount > dpb_size) {
             dpb_size = cfg_used.ConfigMinRenderTargetBuffCount;
@@ -1244,8 +1345,14 @@ struct CodecDxvaVideo::Impl {
 
         decoder_inited = true;
         MCP_LOGF(pal::LogLevel::info,
-                 "CodecDxvaVideo: H.264 decoder ready %ux%u dpb=%u (Annex-B raw=%u, profile=%u)",
-                 dec_w, dec_h, dpb_size, cfg_bitstream_raw, cur_h264_sps ? cur_h264_sps->profile_idc : 0);
+                 "CodecDxvaVideo: H.264 decoder ready %ux%u dpb=%u (Annex-B raw=%u) "
+                 "cfg{minRT=%u 4Coef=%u DecoderSpec=0x%X NoSliceCount=%u SpatRsdInter=%u}",
+                 dec_w, dec_h, dpb_size, cfg_bitstream_raw,
+                 cfg_used.ConfigMinRenderTargetBuffCount,
+                 cfg_used.Config4GroupedCoefs,
+                 cfg_used.ConfigDecoderSpecific,
+                 cfg_used.ConfigSpatialResid8,
+                 cfg_used.ConfigResidDiffAccelerator);
         return S_OK;
     }
 
@@ -1258,10 +1365,31 @@ struct CodecDxvaVideo::Impl {
         const bool trace_first = pic_count <= 3;
         if (trace_first) {
             MCP_LOGF(pal::LogLevel::info,
-                     "CodecDxvaVideo: H.264 flush#%u nal=%u poc=%d dpb=%u slices=%zu bs_bytes=%zu fnum=%u refs=%zu",
+                     "CodecDxvaVideo: H.264 flush#%u nal=%u poc=%d dpb=%u slices=%zu bs_bytes=%zu fnum=%u refs=%zu raw=%u",
                      pic_count, cur_nal_type, cur_poc, cur_dpb_idx,
                      h264_slice_ctrl.size(), bitstream_buf.size(),
-                     cur_h264_frame_num, h264_ref_list.size());
+                     cur_h264_frame_num, h264_ref_list.size(), cfg_bitstream_raw);
+            // Bitstream 首 32 字节 hex 转储 — 验证 start code(00 00 00 01 / 00 00 01) +
+            // NAL header + 切片首字节是否合理。
+            char hex[32 * 3 + 1];
+            const std::size_t n = std::min<std::size_t>(32, bitstream_buf.size());
+            for (std::size_t k = 0; k < n; ++k) {
+                std::snprintf(hex + k * 3, 4, "%02X ", bitstream_buf[k]);
+            }
+            hex[n * 3 ? n * 3 - 1 : 0] = 0;
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecDxvaVideo: H.264 flush#%u bitstream[0..%zu]= %s",
+                     pic_count, n, hex);
+            // Slice ctrl 表(首 3 项)
+            const std::size_t ns = std::min<std::size_t>(3, h264_slice_ctrl.size());
+            for (std::size_t k = 0; k < ns; ++k) {
+                MCP_LOGF(pal::LogLevel::info,
+                         "CodecDxvaVideo: H.264 flush#%u slice[%zu] loc=%u bytes=%u chop=%u",
+                         pic_count, k,
+                         h264_slice_ctrl[k].BSNALunitDataLocation,
+                         h264_slice_ctrl[k].SliceBytesInBuffer,
+                         h264_slice_ctrl[k].wBadSliceChopping);
+            }
         }
 
         // 把 deque 转 contiguous span 给 fill_pic_params（最多 16 ref）。
@@ -1315,6 +1443,70 @@ struct CodecDxvaVideo::Impl {
             return SUCCEEDED(video_ctx->ReleaseDecoderBuffer(decoder.Get(), type));
         };
 
+        // PicParams 字节级 dump(首帧),用于 spec 对照核验各字段在期望偏移上的值。
+        if (pic_count == 1) {
+            char path[64];
+            std::snprintf(path, sizeof(path), "dxva-h264-picparams%u.bin", pic_count);
+            if (FILE* fp = std::fopen(path, "wb")) {
+                std::fwrite(&pp, 1, sizeof(pp), fp);
+                std::fclose(fp);
+                MCP_LOGF(pal::LogLevel::info,
+                         "CodecDxvaVideo: H.264 dumped PicParams (%zu bytes) to %s",
+                         sizeof(pp), path);
+            }
+            // 关键字段 hex 一行打印 — 按 SDK 头文件偏移逐字段对照。
+            const auto* pb = reinterpret_cast<const uint8_t*>(&pp);
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecDxvaVideo: H.264 PicParams[0..15]= "
+                     "%02X%02X %02X%02X %02X %02X %02X%02X %02X %02X %02X%02X %02X%02X%02X%02X "
+                     "(wW-1=%u wH-1=%u CurrPic=%02X num_ref=%u wBits=0x%04X bd_l=%u bd_c=%u Res16=%04X SRid=%u)",
+                     pb[0], pb[1], pb[2], pb[3], pb[4], pb[5], pb[6], pb[7],
+                     pb[8], pb[9], pb[10], pb[11], pb[12], pb[13], pb[14], pb[15],
+                     pp.wFrameWidthInMbsMinus1, pp.wFrameHeightInMbsMinus1,
+                     pp.CurrPic.bPicEntry, pp.num_ref_frames, pp.wBitFields,
+                     pp.bit_depth_luma_minus8, pp.bit_depth_chroma_minus8,
+                     pp.Reserved16Bits, pp.StatusReportFeedbackNumber);
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecDxvaVideo: H.264 PicParams parse[168..175]= "
+                     "qs=%d cqp=%d cqp2=%d Cont=%u qp=%d nl0=%u nl1=%u Res8A=%u",
+                     pp.pic_init_qs_minus26, pp.chroma_qp_index_offset,
+                     pp.second_chroma_qp_index_offset, pp.ContinuationFlag,
+                     pp.pic_init_qp_minus26, pp.num_ref_idx_l0_active_minus1,
+                     pp.num_ref_idx_l1_active_minus1, pp.Reserved8BitsA);
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecDxvaVideo: H.264 PicParams seq[208..223]= "
+                     "UsedRef=0x%08X NonExist=0x%04X frame_num=%u "
+                     "log2maxF=%u poc_t=%u log2maxPL=%u dpoc0=%u "
+                     "d8x8=%u entropy=%u poc_pres=%u nslg=%u",
+                     pp.UsedForReferenceFlags, pp.NonExistingFrameFlags, pp.frame_num,
+                     pp.log2_max_frame_num_minus4, pp.pic_order_cnt_type,
+                     pp.log2_max_pic_order_cnt_lsb_minus4, pp.delta_pic_order_always_zero_flag,
+                     pp.direct_8x8_inference_flag, pp.entropy_coding_mode_flag,
+                     pp.pic_order_present_flag, pp.num_slice_groups_minus1);
+            // RefFrameList[0..3] hex (offset 16..19) — IDR 应全 0xFF。
+            char rfl[4 * 3 + 1] = {0};
+            for (int k = 0; k < 4; ++k) {
+                std::snprintf(rfl + k * 3, 4, "%02X ", pb[16 + k]);
+            }
+            // CurrFieldOrderCnt[2] (offset 32..39) - INT[2] LE
+            const int32_t cfoc0 = *reinterpret_cast<const int32_t*>(pb + 32);
+            const int32_t cfoc1 = *reinterpret_cast<const int32_t*>(pb + 36);
+            // First 4 ref's FieldOrderCntList (offset 40..71) and FrameNumList (offset 176..183)
+            const int32_t focl0_top = *reinterpret_cast<const int32_t*>(pb + 40);
+            const int32_t focl0_bot = *reinterpret_cast<const int32_t*>(pb + 44);
+            const uint16_t fnl0 = *reinterpret_cast<const uint16_t*>(pb + 176);
+            const uint16_t fnl1 = *reinterpret_cast<const uint16_t*>(pb + 178);
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecDxvaVideo: H.264 PicParams ref[16..19]= %s| CurrFOC=[%d,%d] "
+                     "FOCL[0]=[%d,%d] FNL[0..1]=[%u,%u] slice_group_map_type=%u "
+                     "deblock_ctrl=%u redundant=%u Res8B=%u sgrate=%u",
+                     rfl, cfoc0, cfoc1, focl0_top, focl0_bot, fnl0, fnl1,
+                     pp.slice_group_map_type,
+                     pp.deblocking_filter_control_present_flag,
+                     pp.redundant_pic_cnt_present_flag, pp.Reserved8BitsB,
+                     pp.slice_group_change_rate_minus1);
+        }
+
         const bool ok_pp = submit_buffer(D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS,
                                           &pp, sizeof(pp));
         const bool ok_sc = submit_buffer(D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL,
@@ -1332,10 +1524,15 @@ struct CodecDxvaVideo::Impl {
             bd[2].BufferType = D3D11_VIDEO_DECODER_BUFFER_BITSTREAM;
             bd[2].DataSize   = static_cast<UINT>(bitstream_buf.size());
             hr = video_ctx->SubmitDecoderBuffers(decoder.Get(), 3, bd);
+            const bool have_vctx1 = false;     // SubmitDecoderBuffers1 测试无差异,回归 legacy。
             if (FAILED(hr)) {
                 MCP_LOGF(pal::LogLevel::warn,
                          "CodecDxvaVideo: H.264 SubmitDecoderBuffers hr=0x%08lX", hr);
+            } else if (trace_first) {
+                MCP_LOGF(pal::LogLevel::info,
+                         "CodecDxvaVideo: H.264 SubmitDecoderBuffers#%u OK", pic_count);
             }
+            (void)have_vctx1;
         } else {
             MCP_LOGF(pal::LogLevel::warn,
                      "CodecDxvaVideo: H.264 GetDecoderBuffer/Release failed (pp=%d sc=%d bs=%d)",
@@ -1346,6 +1543,13 @@ struct CodecDxvaVideo::Impl {
         if (FAILED(hr)) {
             MCP_LOGF(pal::LogLevel::warn,
                      "CodecDxvaVideo: H.264 DecoderEndFrame hr=0x%08lX", hr);
+        } else if (trace_first) {
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecDxvaVideo: H.264 DecoderEndFrame#%u OK", pic_count);
+        }
+        if (trace_first) {
+            char tag[24]; std::snprintf(tag, sizeof(tag), "h264.flush#%u", pic_count);
+            drain_d3d11_messages(tag);
         }
 
         // 标记 DPB 槽
@@ -1359,6 +1563,85 @@ struct CodecDxvaVideo::Impl {
         }
         ctx->CopySubresourceRegion(out_pool.Get(), out_slice, 0, 0, 0,
                                     dpb_tex.Get(), cur_dpb_idx, nullptr);
+
+        // 把首帧 bitstream 同步落盘,可独立用 ffmpeg/ffplay 验证编码是否正确。
+        if (pic_count == 1) {
+            if (FILE* fp = std::fopen("dxva-h264-pic1.bin", "wb")) {
+                std::fwrite(bitstream_buf.data(), 1, bitstream_buf.size(), fp);
+                std::fclose(fp);
+                MCP_LOGF(pal::LogLevel::info,
+                         "CodecDxvaVideo: H.264 dumped pic1 bitstream (%zu bytes) to dxva-h264-pic1.bin",
+                         bitstream_buf.size());
+            }
+        }
+
+        // 首 3 帧 NV12 内容 readback — 验证 driver 是否真的写入了 DPB 纹理。
+        // 步骤:从 DPB[cur_dpb_idx] 拷到 staging,Map 后取 Y 平面前 64 字节求和。
+        // 若全 0 → 驱动 silent fail,DPB 未被写入 → 这就是黑屏/暗绿屏的根因。
+        if (trace_first) {
+            ComPtr<ID3D11Texture2D> staging;
+            D3D11_TEXTURE2D_DESC sd{};
+            sd.Width            = dec_w;
+            sd.Height           = dec_h + dec_h / 2;     // NV12 总高 = Y + UV/2
+            sd.MipLevels        = 1;
+            sd.ArraySize        = 1;
+            sd.Format           = DXGI_FORMAT_NV12;
+            sd.SampleDesc.Count = 1;
+            sd.Usage            = D3D11_USAGE_STAGING;
+            sd.BindFlags        = 0;
+            sd.CPUAccessFlags   = D3D11_CPU_ACCESS_READ;
+            HRESULT hr_st = cfg.device->CreateTexture2D(&sd, nullptr, &staging);
+            if (SUCCEEDED(hr_st)) {
+                ctx->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0,
+                                            dpb_tex.Get(), cur_dpb_idx, nullptr);
+                D3D11_MAPPED_SUBRESOURCE m{};
+                HRESULT hr_map = ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m);
+                if (SUCCEEDED(hr_map)) {
+                    const uint8_t* y_base = static_cast<const uint8_t*>(m.pData);
+                    // 扫描全 Y 平面计算 min/max/有效像素比例,判定是否驱动只画了均匀灰。
+                    uint64_t y_sum = 0;
+                    uint8_t  y_min = 255, y_max = 0;
+                    uint64_t nonconst_count = 0;     // 像素值非 128 的数量
+                    const UINT step = 16;             // 每 16 像素采样,降扫描成本
+                    UINT n_sampled = 0;
+                    for (UINT r = 0; r < dec_h; r += step) {
+                        const uint8_t* row = y_base + static_cast<std::size_t>(r) * m.RowPitch;
+                        for (UINT c = 0; c < dec_w; c += step) {
+                            const uint8_t b = row[c];
+                            y_sum += b;
+                            ++n_sampled;
+                            if (b < y_min) y_min = b;
+                            if (b > y_max) y_max = b;
+                            if (b != 128) ++nonconst_count;
+                        }
+                    }
+                    // 取首行像素 hex 一段,直接判定 driver 写入了什么。
+                    char first_row_hex[16 * 3 + 1] = {0};
+                    for (UINT c = 0; c < 16; ++c) {
+                        std::snprintf(first_row_hex + c * 3, 4, "%02X ", y_base[c]);
+                    }
+                    MCP_LOGF(pal::LogLevel::info,
+                             "CodecDxvaVideo: H.264 NV12 readback#%u Y全图[step=%u n=%u] "
+                             "sum=%llu avg=%llu min=%u max=%u nonconst=%llu/%u (%.1f%%) Y[0..15]=%s",
+                             pic_count, step, n_sampled,
+                             static_cast<unsigned long long>(y_sum),
+                             n_sampled ? static_cast<unsigned long long>(y_sum / n_sampled) : 0ull,
+                             y_min, y_max,
+                             static_cast<unsigned long long>(nonconst_count), n_sampled,
+                             n_sampled ? 100.0 * nonconst_count / n_sampled : 0.0,
+                             first_row_hex);
+                    ctx->Unmap(staging.Get(), 0);
+                } else {
+                    MCP_LOGF(pal::LogLevel::warn,
+                             "CodecDxvaVideo: H.264 NV12 readback#%u Map hr=0x%08lX",
+                             pic_count, hr_map);
+                }
+            } else {
+                MCP_LOGF(pal::LogLevel::warn,
+                         "CodecDxvaVideo: H.264 NV12 readback#%u staging create hr=0x%08lX",
+                         pic_count, hr_st);
+            }
+        }
 
         // emit
         VideoFrame f;
@@ -1414,6 +1697,18 @@ struct CodecDxvaVideo::Impl {
     }
 
     void on_au_h264(std::span<const uint8_t> au, int64_t pts_us, int64_t arrival_qpc_ns = 0) noexcept {
+        // 首两个 AU 全量落盘(含 SPS/PPS/IDR/...slice),用 ffmpeg 软解验证比特流可解性。
+        if (pic_count < 2) {
+            char path[64];
+            std::snprintf(path, sizeof(path), "dxva-h264-au%u.bin", static_cast<unsigned>(pic_count));
+            if (FILE* fp = std::fopen(path, "wb")) {
+                std::fwrite(au.data(), 1, au.size(), fp);
+                std::fclose(fp);
+                MCP_LOGF(pal::LogLevel::info,
+                         "CodecDxvaVideo: H.264 dumped FULL AU (%zu bytes) to %s",
+                         au.size(), path);
+            }
+        }
         std::size_t i = find_start_code(au, 0);
         while (i < au.size()) {
             const bool        leading_zero = (i > 0 && au[i - 1] == 0);
@@ -1437,7 +1732,21 @@ struct CodecDxvaVideo::Impl {
                     extract_rbsp(ebsp.data(), ebsp.size(), scratch_rbsp);
                     h264::Sps s{};
                     if (h264::parse_sps(scratch_rbsp, s)) {
+                        const bool first = h264_sps.find(s.id) == h264_sps.end();
                         h264_sps[s.id] = s;
+                        if (first) {
+                            MCP_LOGF(pal::LogLevel::info,
+                                     "CodecDxvaVideo: H.264 SPS id=%u profile=%u level=%u chroma=%u "
+                                     "size=%ux%u num_ref=%u poc_type=%u log2_max_fnum=%u log2_max_poc_lsb=%u "
+                                     "frame_mbs_only=%u vui=%u colour_present=%u (rbsp_bytes=%zu)",
+                                     s.id, s.profile_idc, s.level_idc, s.chroma_format_idc,
+                                     s.pic_width_in_samples_l, s.pic_height_in_samples_l,
+                                     s.num_ref_frames, s.pic_order_cnt_type,
+                                     s.log2_max_frame_num_minus4 + 4u,
+                                     s.log2_max_pic_order_cnt_lsb_minus4 + 4u,
+                                     s.frame_mbs_only_flag, s.vui_parameters_present_flag,
+                                     s.colour_description_present_flag, scratch_rbsp.size());
+                        }
                     } else {
                         MCP_LOGF(pal::LogLevel::warn,
                                  "CodecDxvaVideo: H.264 SPS reject (profile=%u chroma=%u poc_type=%u "
@@ -1453,7 +1762,27 @@ struct CodecDxvaVideo::Impl {
                     h264::Pps p{};
                     // 取首个有效 SPS 解析 PPS（IPC 流通常只有 1 套 SPS/PPS）。
                     if (h264::parse_pps(scratch_rbsp, h264_sps.begin()->second, p)) {
+                        const bool first = h264_pps.find(p.id) == h264_pps.end();
                         h264_pps[p.id] = p;
+                        if (first) {
+                            MCP_LOGF(pal::LogLevel::info,
+                                     "CodecDxvaVideo: H.264 PPS id=%u sps_id=%u entropy_cabac=%u "
+                                     "num_ref_l0=%u num_ref_l1=%u weighted_pred=%u weighted_bipred=%u "
+                                     "transform_8x8=%u scaling_matrix=%u qp_init=%d chroma_qp_off=%d "
+                                     "deblock_ctrl=%u cintra=%u (rbsp_bytes=%zu)",
+                                     p.id, p.sps_id, p.entropy_coding_mode_flag,
+                                     p.num_ref_idx_l0_default_active_minus1,
+                                     p.num_ref_idx_l1_default_active_minus1,
+                                     p.weighted_pred_flag, p.weighted_bipred_idc,
+                                     p.transform_8x8_mode_flag, p.pic_scaling_matrix_present_flag,
+                                     static_cast<int>(p.pic_init_qp_minus26),
+                                     static_cast<int>(p.chroma_qp_index_offset),
+                                     p.deblocking_filter_control_present_flag,
+                                     p.constrained_intra_pred_flag, scratch_rbsp.size());
+                        }
+                    } else {
+                        MCP_LOGF(pal::LogLevel::warn, "CodecDxvaVideo: H.264 PPS reject (rbsp_bytes=%zu)",
+                                 scratch_rbsp.size());
                     }
                     break;
                 }
@@ -1504,6 +1833,8 @@ struct CodecDxvaVideo::Impl {
 
                     if (!has_pic) break;
 
+                    // DXVA H.264 spec 4.1.1.4: bitstream 含 start code prefix(00 00 01 / 00 00 00 01),
+                    // BSNALunitDataLocation 指向 start code 起始,SliceBytesInBuffer 含 start code。
                     DXVA_Slice_H264_Short sc{};
                     sc.BSNALunitDataLocation = static_cast<UINT>(bitstream_buf.size());
                     sc.SliceBytesInBuffer    = static_cast<UINT>(nal_full.size());

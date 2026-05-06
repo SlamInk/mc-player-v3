@@ -48,6 +48,33 @@ public:
     }
     [[nodiscard]] bool bad() const noexcept { return bad_; }
 
+    // H.264 §7.2 more_rbsp_data():
+    //   RBSP trailing bits = 1 个 stop_one_bit + 0..7 个 alignment_zero_bit (到字节边界)。
+    //   "More RBSP data" 当且仅当当前 bit 位置之后,还存在比 trailing 更靠后的 '1' bit。
+    //
+    // 实现:从 RBSP 末尾向前扫描,定位最后一个 '1' bit (即 stop_one_bit) 的 bit 索引;
+    //       若 pos_ 严格小于该索引 → 还有真实语法 → true。
+    [[nodiscard]] bool more_rbsp_data() const noexcept {
+        if (pos_ >= bits_) return false;
+        std::size_t last_set = 0;
+        bool        found    = false;
+        const std::size_t total_bytes = (bits_ + 7) / 8;
+        for (std::size_t b = total_bytes; b > 0 && !found; --b) {
+            const std::size_t byte_idx = b - 1;
+            const uint8_t     byte     = data_[byte_idx];
+            if (byte == 0) continue;
+            for (int bit = 0; bit < 8; ++bit) {
+                if ((byte >> bit) & 1u) {
+                    last_set = byte_idx * 8u + (7u - static_cast<std::size_t>(bit));
+                    found    = true;
+                    break;
+                }
+            }
+        }
+        if (!found) return false;
+        return pos_ < last_set;
+    }
+
 private:
     const uint8_t* data_;
     std::size_t    bits_;
@@ -237,17 +264,18 @@ bool parse_pps(std::span<const uint8_t> rbsp, const Sps& sps, Pps& out) noexcept
     out.constrained_intra_pred_flag            = static_cast<uint8_t>(br.read_bits(1));
     out.redundant_pic_cnt_present_flag         = static_cast<uint8_t>(br.read_bits(1));
 
-    // High profile 后续可选字段：transform_8x8_mode + pic_scaling_matrix +
-    //   second_chroma_qp_index_offset。检测方法：剩余比特数 > rbsp_trailing_bits（8 bit
-    //   stop_one + zero padding）则继续读。
-    // 简化：用 SPS profile 是否 FRExt 判别（IPC 摄像机 PPS 字节较短，可靠）。
-    const bool is_frext =
-        sps.profile_idc == 100 || sps.profile_idc == 110 ||
-        sps.profile_idc == 122 || sps.profile_idc == 244 ||
-        sps.profile_idc == 44  || sps.profile_idc == 83  ||
-        sps.profile_idc == 86  || sps.profile_idc == 118 ||
-        sps.profile_idc == 128;
-    if (is_frext) {
+    // H.264 §7.3.2.2：FRExt 扩展字段不按 profile 门控,而按 more_rbsp_data() 判别。
+    //   if (more_rbsp_data()) {
+    //       transform_8x8_mode_flag      u(1)
+    //       pic_scaling_matrix_present   u(1)
+    //       if (pic_scaling_matrix_present) for(...) scaling_list
+    //       second_chroma_qp_index_offset se(v)
+    //   }
+    // 历史 bug：用 sps.profile_idc∈FRExt 列表替代 more_rbsp_data() —— 当 High profile 编码器精简地
+    //   只发到 redundant_pic_cnt_present_flag 即写 stop_bit + padding 时,旧代码会把 0x80 的 stop_bit
+    //   误读成 transform_8x8_mode_flag=1,后续比特位移错位 → DXVA PicParams 字段污染 → driver silent fail
+    //   → DPB 全 0 → NV12 渲染呈 BT.709 limited 暗绿。
+    if (br.more_rbsp_data()) {
         out.transform_8x8_mode_flag         = static_cast<uint8_t>(br.read_bits(1));
         out.pic_scaling_matrix_present_flag = static_cast<uint8_t>(br.read_bits(1));
         if (out.pic_scaling_matrix_present_flag) {
@@ -356,16 +384,28 @@ int32_t compute_poc(PocState&      state,
 
 namespace {
 
-// PicEntry_H264 标准编码：Index7Bits = DPB 索引（0..127），AssociatedFlag = 1 即未使用。
-DXVA_PicEntry_H264 make_pic_entry(uint8_t dpb_idx, uint8_t long_term, uint8_t bottom = 0) noexcept {
+// DXVA_PicEntry_H264 编码 — SDK 头明确:
+//   CurrPic       — AssociatedFlag = bottom_field_flag (frame-coded 进 0)
+//   RefFrameList  — AssociatedFlag = long_term flag    (短时 ref 进 0)
+// bPicEntry == 0xFF 表示 unused ref slot;非 0xFF 时 Index7Bits=DPB 索引。
+DXVA_PicEntry_H264 make_curr_pic(uint8_t dpb_idx, uint8_t bottom_field) noexcept {
     DXVA_PicEntry_H264 e{};
     if (dpb_idx == 0xFF) {
-        e.bPicEntry = 0xFF;     // 整字节 0xFF = 未占用 ref slot
+        e.bPicEntry = 0xFF;
     } else {
         e.Index7Bits     = static_cast<UCHAR>(dpb_idx & 0x7Fu);
-        e.AssociatedFlag = static_cast<UCHAR>(bottom & 0x01u);
-        (void)long_term;        // long-term 信息走 UsedForReferenceFlags + LongTermPicNumList，
-                                 // PicEntry 仅区分 frame/field（progressive 一律 frame）。
+        e.AssociatedFlag = static_cast<UCHAR>(bottom_field & 0x01u);
+    }
+    return e;
+}
+
+DXVA_PicEntry_H264 make_ref_pic(uint8_t dpb_idx, uint8_t long_term_flag) noexcept {
+    DXVA_PicEntry_H264 e{};
+    if (dpb_idx == 0xFF) {
+        e.bPicEntry = 0xFF;
+    } else {
+        e.Index7Bits     = static_cast<UCHAR>(dpb_idx & 0x7Fu);
+        e.AssociatedFlag = static_cast<UCHAR>(long_term_flag & 0x01u);
     }
     return e;
 }
@@ -388,10 +428,9 @@ void fill_pic_params(DXVA_PicParams_H264&         pp,
     pp.wFrameWidthInMbsMinus1  = static_cast<USHORT>(sps.pic_width_in_mbs_minus1);
     pp.wFrameHeightInMbsMinus1 = static_cast<USHORT>(sps.pic_height_in_map_units_minus1);
 
-    // CurrPic — progressive 路径，bottom flag 跟 SliceHeader 走（一般 0）。
-    pp.CurrPic = make_pic_entry(static_cast<uint8_t>(curr_dpb_idx),
-                                  /*long_term=*/0,
-                                  sh.bottom_field_flag);
+    // CurrPic — progressive 路径,SDK 注释 "/* flag is bot field flag */"。
+    pp.CurrPic = make_curr_pic(static_cast<uint8_t>(curr_dpb_idx),
+                                sh.bottom_field_flag);
     pp.CurrFieldOrderCnt[0] = curr_poc;
     pp.CurrFieldOrderCnt[1] = curr_poc;
 
@@ -418,7 +457,7 @@ void fill_pic_params(DXVA_PicParams_H264&         pp,
 
     pp.StatusReportFeedbackNumber = status_report_id ? status_report_id : 1;
 
-    // RefFrameList[16] 默认全 0xFF（未占用）。
+    // RefFrameList[16] 默认全 0xFF (未占用),SDK 注释 "/* flag LT */" — AssociatedFlag = long_term。
     for (auto& e : pp.RefFrameList) e.bPicEntry = 0xFF;
     for (auto& fc : pp.FieldOrderCntList) { fc[0] = 0; fc[1] = 0; }
     for (auto& fn : pp.FrameNumList) fn = 0;
@@ -429,11 +468,11 @@ void fill_pic_params(DXVA_PicParams_H264&         pp,
     for (const auto& r : refs) {
         if (slot >= 16) break;
         if (!r.used || r.dpb_index == 0xFF) continue;
-        pp.RefFrameList[slot]              = make_pic_entry(r.dpb_index, r.long_term);
+        pp.RefFrameList[slot]              = make_ref_pic(r.dpb_index, r.long_term);
         pp.FieldOrderCntList[slot][0]      = r.field_order_cnt[0];
         pp.FieldOrderCntList[slot][1]      = r.field_order_cnt[1];
         pp.FrameNumList[slot]              = static_cast<USHORT>(r.frame_num);
-        // UsedForReferenceFlags：每张 ref 占两 bit（top + bottom）；progressive 都置 1。
+        // UsedForReferenceFlags:每张 ref 两 bit (top + bottom);progressive 都置 1。
         pp.UsedForReferenceFlags |= (0x3u << (2 * slot));
         ++slot;
     }

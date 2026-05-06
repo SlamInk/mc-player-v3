@@ -112,7 +112,7 @@ mcp::media::UiStage map_state_to_ui_stage(mc_state_t s) noexcept {
 // controller 在 codec_mft_video::start 失败前先用此 helper 探测真实情况以填准确 reason。
 enum class MftProbeReason {
     hardware_async_available,   // 至少一个 hw_url=1 && async=1 的 MFT
-    sync_software_only,         // 仅有 sync software MFT（hw_url=0 && async=0），ADR-015 排除
+    sync_software_available,    // 仅 sync software MFT(hw_url=0 && async=0),IoT LTSC 兜底可用
     no_mft_registered,          // MediaPlayback feature 缺失/未启用，MFT category 未注册
     enum_failed,                // MFTEnumEx 返回 FAILED
 };
@@ -153,14 +153,14 @@ enum class MftProbeReason {
     const bool has_any = n > 0;
     for (UINT32 i = 0; i < n; ++i) activates[i]->Release();
     if (activates) ::CoTaskMemFree(activates);
-    return has_any ? MftProbeReason::sync_software_only
+    return has_any ? MftProbeReason::sync_software_available
                     : MftProbeReason::no_mft_registered;
 }
 
 [[nodiscard]] const char* mft_probe_reason_str(MftProbeReason r) noexcept {
     switch (r) {
         case MftProbeReason::hardware_async_available: return "hardware_async_available";
-        case MftProbeReason::sync_software_only:       return "sync_software_only";
+        case MftProbeReason::sync_software_available:  return "sync_software_available";
         case MftProbeReason::no_mft_registered:        return "no_mft_registered";
         case MftProbeReason::enum_failed:              return "enum_failed";
     }
@@ -816,7 +816,12 @@ struct Controller::Impl {
         }
 
         // 档 2: DXVA-direct（D3D11VideoDevice）— HEVC 已实装；H.264 留 Phase 4 stub。
-        {
+        // MCP_SKIP_TIER2 调试开关:跳过 DXVA-direct,直接走 tier 3 MFT 对照测试 silent fail。
+        const bool skip_tier2 = []{
+            char buf[8]; size_t n = 0;
+            return getenv_s(&n, buf, sizeof(buf), "MCP_SKIP_TIER2") == 0 && n > 0 && buf[0] == '1';
+        }();
+        if (!skip_tier2) {
             pal::metric::ScopedTimer t{reg.timer("mc.probe.tier2_ns")};
             if (video_codec == MC_VIDEO_CODEC_H265) {
                 media::CodecDxvaVideo::Config dcfg;
@@ -838,38 +843,56 @@ struct Controller::Impl {
                     record_skip(2, "profile_unsupported");
                 }
             } else if (video_codec == MC_VIDEO_CODEC_H264) {
-                // Phase 4：codec_dxva_video.cpp 补 H.264 实装(profile=VLD NoFGT,
-                // chroma_format_idc=1, 8-bit, frame_mbs_only=1, pic_order_cnt_type∈{0,2})。
-                // SPS 实装边界外的流(High10/4:2:2、interlace、自定义 scaling list)
-                // 仍由 init_decoder_h264 失败兜底降至档 3。
-                media::CodecDxvaVideo::Config dcfg;
-                dcfg.codec  = video_codec;
-                dcfg.device = d3d_device;
-                dcfg.emit   = [this](media::VideoFrame&& f) { on_decoded_frame(std::move(f)); };
-                codec_dxva  = std::make_unique<media::CodecDxvaVideo>(std::move(dcfg));
-                if (mc_status_t s = codec_dxva->start(); s == MC_OK) {
-                    MCP_LOGF(pal::LogLevel::info,
-                             "Controller: tier2 DXVA-direct H.264 active");
-                    activate(MC_DECODER_DXVA_DIRECT, 2);
-                    return MC_OK;
+                // Phase 4 H.264 DXVA-direct 实装在 Intel UHD driver 上 silent fail
+                // (driver 返 OK 但 DPB 全 0;ffmpeg D3D11VA 同硬件能解,差异在 PicParams 某
+                // 字段,无 GPL-clean 参考,根因尚未定位)。默认跳过此档,走 tier 3 sync software
+                // MFT(Microsoft H264 Decoder MFT,IoT LTSC 兜底可用)。
+                // 设 MCP_ENABLE_DXVA_H264=1 强制启用以便继续调试。
+                const bool enable_dxva_h264 = []{
+                    char buf[8]; size_t n = 0;
+                    return getenv_s(&n, buf, sizeof(buf), "MCP_ENABLE_DXVA_H264") == 0
+                           && n > 0 && buf[0] == '1';
+                }();
+                if (enable_dxva_h264) {
+                    media::CodecDxvaVideo::Config dcfg;
+                    dcfg.codec  = video_codec;
+                    dcfg.device = d3d_device;
+                    dcfg.emit   = [this](media::VideoFrame&& f) { on_decoded_frame(std::move(f)); };
+                    codec_dxva  = std::make_unique<media::CodecDxvaVideo>(std::move(dcfg));
+                    if (mc_status_t s = codec_dxva->start(); s == MC_OK) {
+                        MCP_LOGF(pal::LogLevel::info,
+                                 "Controller: tier2 DXVA-direct H.264 active (MCP_ENABLE_DXVA_H264=1)");
+                        activate(MC_DECODER_DXVA_DIRECT, 2);
+                        return MC_OK;
+                    } else {
+                        MCP_LOGF(pal::LogLevel::warn,
+                                 "Controller: tier2 DXVA-direct H.264 start failed status=%d",
+                                 static_cast<int>(s));
+                        codec_dxva.reset();
+                        record_skip(2, "profile_unsupported");
+                    }
                 } else {
-                    MCP_LOGF(pal::LogLevel::warn,
-                             "Controller: tier2 DXVA-direct H.264 start failed status=%d",
-                             static_cast<int>(s));
-                    codec_dxva.reset();
-                    record_skip(2, "profile_unsupported");
+                    record_skip(2, "h264_disabled_pending_root_cause");
+                    MCP_LOG_INFO("Controller: tier2 DXVA-direct H.264 disabled "
+                                 "(set MCP_ENABLE_DXVA_H264=1 to enable; pending Intel driver "
+                                 "PicParams 兼容性根因定位)");
                 }
             } else {
                 record_skip(2, "codec_unsupported");
             }
+        } else {
+            record_skip(2, "skipped_by_env");
+            MCP_LOG_INFO("Controller: tier2 DXVA-direct skipped via MCP_SKIP_TIER2=1");
         }
 
-        // 档 3: MFT hardware async — 仅 hw_url=1 && async=1 接受（ADR-001 / ADR-002 / ADR-015）。
-        // sync software MFT 由 codec_mft_video::start 直接拒绝，并通过 MftProbeReason 区分原因。
+        // 档 3: MFT — 优先 hardware async (ADR-015 SDI 标准延时);若不存在,接受 sync software
+        // (Microsoft H.264/H.265 Decoder MFT)作为 IoT LTSC 等"组件不齐"环境的功能兜底。
+        // sync software 在 reorder>0 流上 +100ms 延时,但仍优于黑屏 + 优于 stub libcodec。
         {
             pal::metric::ScopedTimer t{reg.timer("mc.probe.tier3_ns")};
             const auto reason = probe_mft_video_async_hardware(video_codec);
-            if (reason == MftProbeReason::hardware_async_available) {
+            if (reason == MftProbeReason::hardware_async_available ||
+                reason == MftProbeReason::sync_software_available) {
                 media::CodecMftVideo::Config ccfg;
                 ccfg.codec  = video_codec;
                 ccfg.device = d3d_device;
@@ -878,9 +901,11 @@ struct Controller::Impl {
                 ccfg.emit   = [this](media::VideoFrame&& f) { on_decoded_frame(std::move(f)); };
                 codec_video = std::make_unique<media::CodecMftVideo>(std::move(ccfg));
                 if (mc_status_t s = codec_video->start({}); s == MC_OK) {
+                    const bool is_async = (reason == MftProbeReason::hardware_async_available);
                     MCP_LOGF(pal::LogLevel::info,
-                             "Controller: tier3 MFT hardware async active");
-                    activate(MC_DECODER_MFT_HARDWARE, 3);
+                             "Controller: tier3 MFT %s active",
+                             is_async ? "hardware async" : "sync software (IoT LTSC fallback)");
+                    activate(is_async ? MC_DECODER_MFT_HARDWARE : MC_DECODER_MFT_SOFTWARE, 3);
                     return MC_OK;
                 } else {
                     MCP_LOGF(pal::LogLevel::warn,

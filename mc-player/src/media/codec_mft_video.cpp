@@ -827,25 +827,37 @@ mc_status_t CodecMftVideo::start(std::span<const uint8_t> /*extradata*/) noexcep
         if (all) ::CoTaskMemFree(all);
     }
 
-    // ADR-015 / ADR-002 + plan Phase 1: 本档（ADR-015 档 3 MFT hardware async）仅接受
-     // hw_url=1 && async=1 的 MFT。sync software MFT（如 Microsoft H264/H265 Video Decoder MFT，
-     // hw_url=0 && async=0）在 SPS reorder>0 流上强制缓 ≥3 帧（实测 +100ms vs VLC，本仓库
-     // commit 历史已记录），不当作硬解；codec_mft_video::start 在仅 sync software 可用时
-     // 直接返回 MC_ERR_NO_HARDWARE，由 controller 路由到 ADR-015 档 4 mc-libcodec 软解。
-     // 退路 1（software async）+ 退路 2（sync software）已在 Phase 1 删除（ADR-015 + ADR-002 范围澄清）。
-    UINT32      flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT |
-                        MFT_ENUM_FLAG_SORTANDFILTER;
+    // ADR-015 性能优先 + IoT LTSC 功能兜底:
+    //   首选 hw_url=1 && async=1 的 hardware async MFT(性能基线达 SDI 替代标准)。
+    //   失败回退 hw_url=0 && async=0 的 sync software MFT(Microsoft H264/H265 Decoder MFT)。
+    //   sync software 在 reorder>0 B-frame 流上强制缓 ≥3 帧 → +100ms 端到端延时,但仍正常解码;
+    //   IoT LTSC 上 hardware MFT 不存在(MediaPlayback feature 被裁剪),sync software 是
+    //   OS 级唯一可用 H.264 解码器,**phase-1 错误地把它一并删除导致 IoT LTSC 全黑屏**。
+    //   现在恢复:hardware async > sync software > MC_ERR_NO_HARDWARE 三段式探测。
     IMFActivate** activates = nullptr;
     UINT32       n_activates = 0;
-    HRESULT      hr = ::MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, flags,
+    HRESULT      hr = ::MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,
+                                   MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT |
+                                     MFT_ENUM_FLAG_SORTANDFILTER,
                                    &in_info, nullptr, &activates, &n_activates);
+    bool picked_sync = false;
     if (FAILED(hr) || n_activates == 0) {
-        if (activates) ::CoTaskMemFree(activates);
+        if (activates) { ::CoTaskMemFree(activates); activates = nullptr; }
+        // 二段:试 sync software MFT。SYNCMFT flag 包含 hw_url=0 && async=0(MS Decoder)。
+        hr = ::MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,
+                          MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER,
+                          &in_info, nullptr, &activates, &n_activates);
+        if (FAILED(hr) || n_activates == 0) {
+            if (activates) ::CoTaskMemFree(activates);
+            MCP_LOGF(pal::LogLevel::warn,
+                     "CodecMftVideo: no MFT (hardware async + sync software) for %s",
+                     codec_name(impl_->cfg.codec));
+            return MC_ERR_NO_HARDWARE;
+        }
+        picked_sync = true;
         MCP_LOGF(pal::LogLevel::warn,
-                 "CodecMftVideo: no hardware async MFT for %s "
-                 "(sync software MFT excluded by ADR-015); will fall through to libcodec",
-                 codec_name(impl_->cfg.codec));
-        return MC_ERR_NO_HARDWARE;
+                 "CodecMftVideo: hardware async MFT not available; fallback to "
+                 "sync software MFT (+100ms latency expected on B-frame streams)");
     }
 
     hr = activates[0]->ActivateObject(IID_PPV_ARGS(&impl_->transform));
@@ -856,6 +868,7 @@ mc_status_t CodecMftVideo::start(std::span<const uint8_t> /*extradata*/) noexcep
                  "CodecMftVideo: ActivateObject hr=0x%08lX", hr);
         return pal::status_from_hresult(hr);
     }
+    impl_->is_sync_mft = picked_sync;
     MCP_LOGF(pal::LogLevel::info,
              "CodecMftVideo: ActivateObject ok, sync=%d", impl_->is_sync_mft);
 

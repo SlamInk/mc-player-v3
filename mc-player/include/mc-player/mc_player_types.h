@@ -94,6 +94,7 @@ typedef enum mc_decoder_kind_e {
     MC_DECODER_VENDOR_SDK_AMF       = 3,    /* 档 1 AMD AMF */
     MC_DECODER_DXVA_DIRECT          = 4,    /* 档 2 ID3D11VideoDevice 直驱 */
     MC_DECODER_MFT_HARDWARE         = 5,    /* 档 3 hardware async MFT */
+    MC_DECODER_MFT_SOFTWARE         = 7,    /* 档 3 sync software MFT (IoT LTSC 兜底,+100ms) */
     MC_DECODER_LIBCODEC             = 6     /* 档 4 mc-libcodec 自研软解 */
 } mc_decoder_kind_t;
 
