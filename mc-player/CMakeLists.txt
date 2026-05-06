@@ -82,6 +82,9 @@ set(MCP_MEDIA_SOURCES
     src/media/codec_libcodec.cpp
     src/media/codec_dxva_video.h
     src/media/codec_dxva_video.cpp
+    src/media/codec_nvdec.h
+    src/media/codec_nvdec.cpp
+    src/media/codec_vendor_base.h
     src/media/dxva_h264.h
     src/media/dxva_h264.cpp
     src/media/codec_mft_audio.h

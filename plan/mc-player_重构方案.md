@@ -361,15 +361,19 @@ before/after（720p H.264，UHD 730）：
 - runtime LoadLibrary `nvcuvid.dll` + GetProcAddress 动态绑定（缺失时档 1 跳过，不阻断启动）。
 - 抽象 vendor SDK 公共接口（CodecVendorBase），便于 Phase 6/7 复用。
 
+> 实装期 reality：开发机 Intel UHD 730（无 NVIDIA dGPU）无法验证实际 cuvid* 解码循环。本 Phase 拆 5a / 5b：
+>   - **5a**（本 commit）：结构性骨架——CodecVendorBase 抽象 + nvcuvid.dll 动态加载 + entry-point probing + controller VendorId 路由 + dxgi_caps_probe SDK 探测。Intel 机器跑 demo 应见 `mc.probe.tier_skip_reason.tier1.vendor_mismatch++`。
+>   - **5b**（NV 硬件可达时收尾）：cuvidParseVideoData 回调 + cuvidDecodePicture + cuvidMapVideoFrame64 + CUDA-D3D11 fence 同步；落到 NVIDIA dGPU 测试机后验 `mc.decoder.kind=VENDOR_SDK_NVDEC` + decode_actual_p95 ≤5ms。
+
 ### 5.1 改动范围
 
-| 文件 | 动作 |
-|---|---|
-| `mc-player/src/media/codec_vendor_base.{h,cpp}`（新增） | vendor SDK 抽象基类：probe / open / submit / pull / close 五件套 |
-| `mc-player/src/media/codec_nvdec.{h,cpp}`（新增 ~800 行） | NVDEC 实装；动态加载 nvcuvid.dll + cudart64_*.dll |
-| `mc-player/src/media/cuda_d3d11_interop.{h,cpp}`（新增） | `cudaGraphicsD3D11RegisterResource` + `cuGraphicsMapResources` 互通 |
-| `mc-player/src/controller/controller.cpp` | start_decode_pipeline 档 1 NVDEC stub 替换为真实实装；`DXGI_ADAPTER_DESC1::VendorId == 0x10DE` 才尝试 |
-| `mc-player/src/pal/dxgi_caps_probe.cpp` | 加 `nvcuvid.dll` 存在性 probe + version 字符串 |
+| 文件 | 动作 | Phase |
+|---|---|---|
+| `mc-player/src/media/codec_vendor_base.h`（新增） | vendor SDK 概念锚点：VendorId 常量 + skip reason 分类规范（不强制继承,仅 review 导航）| 5a |
+| `mc-player/src/media/codec_nvdec.{h,cpp}`（新增 ~250 行） | NVDEC 类骨架：动态加载 nvcuvid.dll + 13 个 cuvid 入口 GetProcAddress + start() 按 vendor/SDK/entry-point 失败分类返 `last_start_reason` | 5a |
+| `mc-player/src/media/codec_nvdec.cpp`（追加 ~600 行） | cuvidParseVideoData 回调 + DPB 管理 + cuvidMapVideoFrame64 + cudaGraphicsD3D11RegisterResource + D3D11 fence 同步 | 5b |
+| `mc-player/src/controller/controller.cpp` | start_decode_pipeline 档 1 stub 替换为真实 `CodecNvdec` 启动；失败时 `record_skip(1, reason_label(last_start_reason()))` | 5a |
+| `mc-player/src/pal/dxgi_caps_probe.{h,cpp}` | AdapterCaps 加 `vendor_id` + `nvcuvid_dll_present` + `onevpl_dll_present` + `amf_dll_present`；进程级单次 LoadLibraryW 探测 | 5a |
 
 ### 5.2 实施步骤
 
@@ -382,13 +386,23 @@ before/after（720p H.264，UHD 730）：
 
 ### 5.3 验收 metric
 
-| metric | 阈值（NVIDIA 测试机）|
+5a 验收（Intel / AMD 开发机即可）：
+| metric | 阈值 |
+|---|---|
+| build / dump_stats --self_test | pass（无回归）|
+| `mc.probe.tier_skip_reason.tier1.vendor_mismatch`（Intel/AMD） | ≥1（VendorId != 0x10DE）|
+| `mc.probe.tier_skip_reason.tier1.sdk_missing`（NV 但无 nvcuvid.dll） | ≥1（仅在该机型适用）|
+| `mc.probe.tier_skip_reason.tier1.sdk_decode_pending`（NV + nvcuvid.dll 已装） | ≥1（5b 完成前期望值）|
+| `mc.gate.drop_*_count` warm_steady | 0（不变量保持）|
+| `mc.render.epoch_pair_skew_count` | 0（不变量保持）|
+
+5b 验收（NVIDIA 测试机，完整解码路径）：
+| metric | 阈值 |
 |---|---|
 | `mc.decoder.kind`（H.264 / H.265）| `VENDOR_SDK_NVDEC` |
 | `mc.stage.decode_actual_ns` p95 | ≤5ms（ADD §1.2 档 1）|
 | `mc.stage.decode_alloc_ns` | ~30μs（SDK 自管 staging）|
 | vs VLC 时钟差 | ≤+2ms |
-| 在 Intel / AMD 机器（无 nvcuvid.dll）| `mc.probe.tier_skip_reason{tier=1}` = `vendor_mismatch` 或 `sdk_missing` |
 
 ### 5.4 已知风险
 

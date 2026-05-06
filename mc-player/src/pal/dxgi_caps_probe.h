@@ -45,6 +45,13 @@ struct AdapterCaps {
 
     // outputs：每个 monitor handle 对应的 adapter，用于 HWND→adapter 解析。
     std::vector<HMONITOR> monitors;
+
+    // Vendor SDK 直驱档 1 探测（ADR-015 / plan Phase 5/6/7）。
+    // 仅记录 SDK DLL 是否在搜索路径,实际是否能 decode 由具体 codec 实装 start() 探测。
+    uint32_t vendor_id              = 0;       // DXGI_ADAPTER_DESC1::VendorId
+    bool     nvcuvid_dll_present    = false;   // nvcuvid.dll (NVIDIA NVDEC)
+    bool     onevpl_dll_present     = false;   // vpl.dll 或 libmfx.dll (Intel oneVPL / Media SDK)
+    bool     amf_dll_present        = false;   // amfrt64.dll (AMD AMF)
 };
 
 class DxgiCapsProbe {

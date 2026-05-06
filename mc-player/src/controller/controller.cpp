@@ -21,6 +21,7 @@
 #include "controller/adapter_picker.h"
 #include "media/audio_render_wasapi.h"
 #include "media/codec_dxva_video.h"
+#include "media/codec_nvdec.h"
 #include "media/codec_g711.h"
 #include "media/codec_libcodec.h"
 #include "media/codec_mft_audio.h"
@@ -191,6 +192,7 @@ struct Controller::Impl {
     std::unique_ptr<media::DepackH265>            depack_h265;
     std::unique_ptr<media::CodecMftVideo>         codec_video;
     std::unique_ptr<media::CodecDxvaVideo>        codec_dxva;
+    std::unique_ptr<media::CodecNvdec>            codec_nvdec;
     std::unique_ptr<media::CodecLibcodecVideo>    codec_libcodec;
     std::unique_ptr<media::FrameValidityGate>     gate;
     std::unique_ptr<media::RenderD3d11>           render;
@@ -713,13 +715,31 @@ struct Controller::Impl {
             reg.gauge("mc.probe.tier_selected").set(tier);
         };
 
-        // 档 1: Vendor SDK 直驱（NVDEC / oneVPL / AMF）— Phase 5/6/7 实装。
+        // 档 1: Vendor SDK 直驱（NVDEC / oneVPL / AMF）— ADR-015 §5.6.2.1。
+        // Phase 5: NVDEC 结构性骨架（vendor 探测 + SDK 加载 + entry-point probing
+        //          落地;实际 cuvid* 解码循环留 Phase 5b 等 NV 硬件可达时实装）。
+        // Phase 6/7: oneVPL / AMF 留 stub（同结构,本档暂时按 sdk_missing skip）。
         {
             pal::metric::ScopedTimer t{reg.timer("mc.probe.tier1_ns")};
-            // stub: 永远 fail（vendor SDK 未实装；ADR-016 HDCM 下载面板亦待 Phase 8）。
-            record_skip(1, "sdk_missing");
+            media::CodecNvdec::Config ncfg;
+            ncfg.codec  = video_codec;
+            ncfg.device = d3d_device;
+            ncfg.emit   = [this](media::VideoFrame&& f) { on_decoded_frame(std::move(f)); };
+            codec_nvdec = std::make_unique<media::CodecNvdec>(std::move(ncfg));
+            const mc_status_t s = codec_nvdec->start();
+            if (s == MC_OK) {
+                MCP_LOGF(pal::LogLevel::info, "Controller: tier1 NVDEC active");
+                activate(MC_DECODER_VENDOR_SDK_NVDEC, 1);
+                return MC_OK;
+            }
+            // 失败按 NVDEC 实装的 last_start_reason 分类填 mc.probe.tier_skip_reason.tier1.*。
+            const char* reason =
+                media::CodecNvdec::reason_label(codec_nvdec->last_start_reason());
+            record_skip(1, reason);
+            codec_nvdec.reset();
             MCP_LOGF(pal::LogLevel::info,
-                     "Controller: tier1 vendor SDK skipped (sdk_missing; Phase 5/6/7 实装)");
+                     "Controller: tier1 NVDEC skip reason=%s (status=%d)",
+                     reason, static_cast<int>(s));
         }
 
         // 档 2: DXVA-direct（D3D11VideoDevice）— HEVC 已实装；H.264 留 Phase 4 stub。

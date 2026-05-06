@@ -83,6 +83,16 @@ void enumerate_outputs(IDXGIAdapter1* adapter, std::vector<HMONITOR>& out) noexc
     }
 }
 
+// vendor SDK DLL 轻量探测：LoadLibraryW 试打开 → FreeLibrary 关闭。
+// 仅判存在性 + 版本兼容性 (driver 加载需求)；实际 decode 能力由具体 codec impl 验。
+bool dll_loadable(const wchar_t* name) noexcept {
+    if (!name) return false;
+    HMODULE h = ::LoadLibraryW(name);
+    if (!h) return false;
+    ::FreeLibrary(h);
+    return true;
+}
+
 }  // namespace
 
 mc_status_t DxgiCapsProbe::probe() noexcept {
@@ -110,6 +120,7 @@ mc_status_t DxgiCapsProbe::probe() noexcept {
         caps.shared_system_memory    = desc.SharedSystemMemory;
         caps.is_software             = (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0;
         caps.allow_tearing_supported = tearing_global;
+        caps.vendor_id               = desc.VendorId;
 
         enumerate_outputs(adapter.Get(), caps.monitors);
 
@@ -156,17 +167,30 @@ mc_status_t DxgiCapsProbe::probe() noexcept {
     if (adapters_.empty()) {
         MCP_LOG_WARN("DxgiCapsProbe: no DXGI adapters enumerated");
     }
+
+    // Vendor SDK 探测进程级单次执行（DLL 名是机器属性,与 adapter 无关）；
+    // 结果灌到每个 adapter 的 *_dll_present 便于 caps 表统一查询。
+    const bool nvcuvid = dll_loadable(L"nvcuvid.dll");
+    const bool onevpl  = dll_loadable(L"vpl.dll") || dll_loadable(L"libmfx.dll");
+    const bool amf     = dll_loadable(L"amfrt64.dll");
+    for (auto& a : adapters_) {
+        a.nvcuvid_dll_present = nvcuvid;
+        a.onevpl_dll_present  = onevpl;
+        a.amf_dll_present     = amf;
+    }
+
     for (const auto& a : adapters_) {
         // 转 description 到 ASCII（MCP_LOGF 取 char*）。
         char desc[128]{};
         ::WideCharToMultiByte(CP_UTF8, 0, a.description.c_str(), -1,
                               desc, sizeof(desc) - 1, nullptr, nullptr);
         MCP_LOGF(LogLevel::info,
-                 "DxgiCapsProbe: adapter='%s' sw=%d h264=%d hevc_main=%d hevc_main10=%d "
-                 "av1=%d dual_bind=%d tearing=%d",
-                 desc, a.is_software, a.h264_supported, a.hevc_main_supported,
+                 "DxgiCapsProbe: adapter='%s' vid=0x%04X sw=%d h264=%d hevc_main=%d hevc_main10=%d "
+                 "av1=%d dual_bind=%d tearing=%d sdk{nv=%d vpl=%d amf=%d}",
+                 desc, a.vendor_id, a.is_software, a.h264_supported, a.hevc_main_supported,
                  a.hevc_main10_supported, a.av1_supported,
-                 a.dual_bind_supported, a.allow_tearing_supported);
+                 a.dual_bind_supported, a.allow_tearing_supported,
+                 a.nvcuvid_dll_present, a.onevpl_dll_present, a.amf_dll_present);
     }
     return MC_OK;
 }
