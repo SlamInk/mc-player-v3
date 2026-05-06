@@ -20,6 +20,7 @@
 
 #include "controller/adapter_picker.h"
 #include "media/audio_render_wasapi.h"
+#include "media/codec_amf.h"
 #include "media/codec_dxva_video.h"
 #include "media/codec_nvdec.h"
 #include "media/codec_onevpl.h"
@@ -195,6 +196,7 @@ struct Controller::Impl {
     std::unique_ptr<media::CodecDxvaVideo>        codec_dxva;
     std::unique_ptr<media::CodecNvdec>            codec_nvdec;
     std::unique_ptr<media::CodecOneVPL>           codec_onevpl;
+    std::unique_ptr<media::CodecAmf>              codec_amf;
     std::unique_ptr<media::CodecLibcodecVideo>    codec_libcodec;
     std::unique_ptr<media::FrameValidityGate>     gate;
     std::unique_ptr<media::RenderD3d11>           render;
@@ -782,8 +784,31 @@ struct Controller::Impl {
                 codec_onevpl.reset();
             }
 
-            // AMD AMF 留 Phase 7 stub。当前若 adapter 是 AMD,vendor_mismatch
-            // 同时命中 NVDEC + oneVPL → tier1_recorded 仍为 false → 走 fallback。
+            // AMF(AMD 0x1002 命中)
+            if (!tier1_recorded) {
+                media::CodecAmf::Config acfg;
+                acfg.codec  = video_codec;
+                acfg.device = d3d_device;
+                acfg.emit   = [this](media::VideoFrame&& f) { on_decoded_frame(std::move(f)); };
+                codec_amf   = std::make_unique<media::CodecAmf>(std::move(acfg));
+                const mc_status_t s = codec_amf->start();
+                if (s == MC_OK) {
+                    MCP_LOGF(pal::LogLevel::info, "Controller: tier1 AMF active");
+                    activate(MC_DECODER_VENDOR_SDK_AMF, 1);
+                    return MC_OK;
+                }
+                const auto reason = codec_amf->last_start_reason();
+                if (reason != media::CodecAmf::StartReason::vendor_mismatch) {
+                    record_skip(1, media::CodecAmf::reason_label(reason));
+                    tier1_recorded = true;
+                    MCP_LOGF(pal::LogLevel::info,
+                             "Controller: tier1 AMF skip reason=%s (status=%d)",
+                             media::CodecAmf::reason_label(reason), static_cast<int>(s));
+                }
+                codec_amf.reset();
+            }
+
+            // 全档非匹配兜底(罕见 adapter,如 ARM Mali / 软件 WARP)
             if (!tier1_recorded) {
                 record_skip(1, "vendor_mismatch");
             }

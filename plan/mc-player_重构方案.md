@@ -507,12 +507,18 @@ before/after（Intel UHD 730，720p H.264）：
 - 严格按修订后的性能规范：`AMF_VIDEO_DECODER_REORDER_MODE = AMF_VIDEO_DECODER_MODE_LOW_LATENCY`（**不是** `AMF_VIDEO_DECODER_LOW_LATENCY` 这个错的属性名）。
 - runtime LoadLibrary `amfrt64.dll`（AMD GPU 驱动通常自带）。
 
+> 实装期 reality：开发机 Intel UHD 730 无 AMD GPU,无法验证实际 AMF 解码。镜像 Phase 5/6 模式拆 7a/7b。
+>
+>   - **7a**(本 commit)：结构性骨架 — codec_amf.{h,cpp} 加载 amfrt64.dll + entry-point probing + start() 失败分类。controller tier 1 增加 AMD 0x1002 → AMF 路由。
+>   - **7b**(AMD 硬件可达时)：AMFInit + Factory + Context::InitDX11 + Component decoder + Submit/QueryOutput + AMFSurface → D3D11 共享。
+
 ### 7.1 改动范围
 
-| 文件 | 动作 |
-|---|---|
-| `mc-player/src/media/codec_amf.{h,cpp}`（新增 ~500 行）| AMF 实装 |
-| `mc-player/src/controller/controller.cpp` | 档 1 AMF：`VendorId == 0x1002` 才尝试 |
+| 文件 | 动作 | Phase |
+|---|---|---|
+| `mc-player/src/media/codec_amf.{h,cpp}`(新增 ~200 行) | AMF 类骨架:动态加载 amfrt64.dll + 关键 AMF 入口 GetProcAddress + start() 按 vendor/SDK/entry-point 失败分类 | 7a |
+| `mc-player/src/media/codec_amf.cpp`(追加 ~300 行) | AMFInit + Factory::CreateContext + InitDX11 + CreateComponent(Decoder UVD H.264/HEVC) + REORDER_MODE=LOW_LATENCY + Submit/QueryOutput 异步管线 | 7b |
+| `mc-player/src/controller/controller.cpp` | 档 1 多 vendor 轮询追加 AMF 子档(VendorId 0x1002) | 7a |
 
 ### 7.2 实施步骤
 
