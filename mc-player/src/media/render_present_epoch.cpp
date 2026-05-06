@@ -75,4 +75,17 @@ void PresentEpoch::force_redraw() noexcept {
     }
 }
 
+void PresentEpoch::set_present_mode(PresentMode m) noexcept {
+    present_mode_.store(m, std::memory_order_release);
+    // Phase 9.4 主线: T5 渲染线程根据 present_mode 决策:
+    //   - VsyncAligned: SwapChain::present(allow_tearing=false), interval=1
+    //   - AllowTearing: SwapChain::present(allow_tearing=true),  interval=0
+    //   - RaceToDisplay: 解码完即 Present, 不等 frame_latency waitable 信号,
+    //                    依赖 VRR 显示器 + ALLOW_TEARING flag 协同
+    pal::metric::Registry::instance().gauge("mc.present.mode")
+        .set(static_cast<int64_t>(m));
+    pal::metric::Registry::instance().gauge("mc.present.race_to_display_active")
+        .set(m == PresentMode::RaceToDisplay ? 1 : 0);
+}
+
 }  // namespace mcp::media

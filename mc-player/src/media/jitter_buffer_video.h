@@ -47,6 +47,17 @@ public:
     [[nodiscard]] uint32_t target_delay_ms() const noexcept { return target_delay_ms_; }
     [[nodiscard]] uint32_t jitter_estimate_ms() const noexcept { return jitter_estimate_ms_; }
 
+    // Phase 9.3 子目标 3:ZeroJitter mode(LAN-switched 链路替代 Kalman aggressive)。
+    //   target_delay 0~1ms,反馈链路最低延时;损失 jitter 容忍度。
+    //   非 LAN-switched 链路下 PresetApply graceful degrade 退到 Kalman aggressive。
+    enum class Mode : uint8_t {
+        Kalman_Aggressive = 0,
+        Kalman_Adaptive   = 1,
+        ZeroJitter        = 2,
+    };
+    void set_mode(Mode m) noexcept;
+    [[nodiscard]] Mode mode() const noexcept { return mode_; }
+
 private:
     EmitFn   emit_;
     NackFn   nack_;
@@ -54,6 +65,7 @@ private:
     uint32_t max_target_ms_      = 0;
     uint32_t target_delay_ms_    = 0;
     uint32_t jitter_estimate_ms_ = 0;
+    Mode     mode_               = Mode::Kalman_Aggressive;
 };
 
 }  // namespace mcp::media

@@ -46,6 +46,19 @@ public:
 
     [[nodiscard]] uint64_t skip_count() const noexcept { return skip_count_.load(std::memory_order_relaxed); }
 
+    // Phase 9.4 子目标 4:Race-to-display Present(Reflex 风格)。
+    //   一帧解码就绪即 Present,依赖 ALLOW_TEARING + VRR;非 VRR 路径 PresetApply
+    //   graceful degrade 退到 vsync-aligned。
+    enum class PresentMode : uint8_t {
+        VsyncAligned    = 0,
+        AllowTearing    = 1,
+        RaceToDisplay   = 2,
+    };
+    void set_present_mode(PresentMode m) noexcept;
+    [[nodiscard]] PresentMode present_mode() const noexcept {
+        return present_mode_.load(std::memory_order_acquire);
+    }
+
 private:
     RedrawFn                redraw_;
     CommitFn                commit_;
@@ -53,6 +66,7 @@ private:
     std::atomic<int64_t>    last_present_ns_{0};
     std::atomic<bool>       commit_pending_in_epoch_{false};
     std::atomic<uint64_t>   skip_count_{0};
+    std::atomic<PresentMode> present_mode_{PresentMode::AllowTearing};
 };
 
 }  // namespace mcp::media

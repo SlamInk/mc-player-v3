@@ -1,10 +1,12 @@
 #include "media/codec_nvdec.h"
 
+#include <atomic>
 #include <dxgi.h>
 
 #include "media/codec_vendor_base.h"
 #include "pal/error.h"
 #include "pal/log.h"
+#include "pal/metric.h"
 
 using Microsoft::WRL::ComPtr;
 
@@ -56,6 +58,7 @@ struct CodecNvdec::Impl {
     Config                       cfg;
     HMODULE                      nvcuvid_handle = nullptr;
     CodecNvdec::StartReason      last_reason    = CodecNvdec::StartReason::ok;
+    std::atomic<bool>            cuda_graphs_on{false};
 
     bool load_sdk() noexcept {
         nvcuvid_handle = ::LoadLibraryW(L"nvcuvid.dll");
@@ -152,6 +155,20 @@ bool CodecNvdec::probe_sdk_dll_present() noexcept {
     if (!h) return false;
     ::FreeLibrary(h);
     return true;
+}
+
+void CodecNvdec::enable_cuda_graphs(bool on) noexcept {
+    if (!impl_) return;
+    impl_->cuda_graphs_on.store(on, std::memory_order_release);
+    // Phase 9.5 实装(NVDEC 硬件可达 + 5b decode pipeline 完成后):
+    //   on=true 时主 decode loop 改走 cuGraphCreate + cuGraphAddNode + cuGraphLaunch;
+    //   失败 fallback 到 streaming 提交(cuvidParseVideoData + cuvidDecodePicture)。
+    pal::metric::Registry::instance().gauge("mc.decoder.cuda_graph_active")
+        .set(on ? 1 : 0);
+}
+
+bool CodecNvdec::cuda_graphs_active() const noexcept {
+    return impl_ && impl_->cuda_graphs_on.load(std::memory_order_acquire);
 }
 
 const char* CodecNvdec::reason_label(StartReason r) noexcept {

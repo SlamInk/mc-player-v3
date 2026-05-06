@@ -87,6 +87,12 @@ public:
     [[nodiscard]] static bool probe_sdk_dll_present() noexcept;
     [[nodiscard]] static const char* reason_label(StartReason r) noexcept;
 
+    // Phase 9.5 子目标 5:CUDA Graphs 探索(NVDEC 路径专属,可选)。
+    //   把 alloc + parse + decode + map 打包成单次 CUDA Graph 提交,预期 -1~2ms。
+    //   失败 fallback 到原 streaming 提交;不影响 SDI_REPLACEMENT 命中(探索性)。
+    void enable_cuda_graphs(bool on) noexcept;
+    [[nodiscard]] bool cuda_graphs_active() const noexcept;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
