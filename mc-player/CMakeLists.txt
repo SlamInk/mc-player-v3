@@ -94,6 +94,21 @@ set(MCP_MEDIA_SOURCES
     src/hdcm/installer_c_feature.cpp
     src/hdcm/installer_d_driver.h
     src/hdcm/installer_d_driver.cpp
+    src/probe/capability_snapshot.h
+    src/probe/hardware_probe.h
+    src/probe/hardware_probe.cpp
+    src/probe/network_probe.h
+    src/probe/network_probe.cpp
+    src/probe/encoder_probe.h
+    src/probe/encoder_probe.cpp
+    src/probe/render_probe.h
+    src/probe/render_probe.cpp
+    src/preset/preset_definitions.h
+    src/preset/preset_definitions.cpp
+    src/preset/preset_selector.h
+    src/preset/preset_selector.cpp
+    src/preset/preset_apply.h
+    src/preset/preset_apply.cpp
     src/media/codec_amf.h
     src/media/codec_amf.cpp
     src/media/codec_nvdec.h
