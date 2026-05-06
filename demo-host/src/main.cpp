@@ -117,10 +117,13 @@ void on_event(void* /*user*/, const mc_event_t* evt) {
 
         const char* dec_label = "unknown";
         switch (evt->stream_info->video_decoder_kind) {
-            case MC_DECODER_NONE:         dec_label = "none";                   break;
-            case MC_DECODER_MFT_HARDWARE: dec_label = "MFT 硬解";                break;
-            case MC_DECODER_MFT_SOFTWARE: dec_label = "MFT 软解 (OS software)"; break;
-            case MC_DECODER_LIBCODEC:     dec_label = "mc-libcodec 软解";        break;
+            case MC_DECODER_NONE:                 dec_label = "none";                              break;
+            case MC_DECODER_VENDOR_SDK_NVDEC:     dec_label = "档 1 NVDEC (NVIDIA Video Codec SDK)"; break;
+            case MC_DECODER_VENDOR_SDK_ONEVPL:    dec_label = "档 1 oneVPL (Intel)";                 break;
+            case MC_DECODER_VENDOR_SDK_AMF:       dec_label = "档 1 AMF (AMD)";                      break;
+            case MC_DECODER_DXVA_DIRECT:          dec_label = "档 2 DXVA-direct (D3D11VideoDevice)"; break;
+            case MC_DECODER_MFT_HARDWARE:         dec_label = "档 3 MFT hardware async";             break;
+            case MC_DECODER_LIBCODEC:             dec_label = "档 4 mc-libcodec 软解";                break;
         }
         const char* gpu_label = "unknown";
         switch (evt->stream_info->gpu_kind) {

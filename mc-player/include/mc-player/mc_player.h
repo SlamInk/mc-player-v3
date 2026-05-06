@@ -44,9 +44,12 @@ extern "C" {
 /* struct_version 当前默认值；按字段追加单调递增。 */
 #define MC_OPEN_OPTIONS_VERSION  1
 #define MC_INIT_OPTIONS_VERSION  2
-#define MC_STREAM_INFO_VERSION   2     /* +gpu_kind / gpu_description */
+#define MC_STREAM_INFO_VERSION   3     /* v3: mc_decoder_kind_t 扩 7 值 (ADR-015 四级降级链);
+                                          MC_DECODER_MFT_SOFTWARE 删除;
+                                          MC_DECODER_MFT_HARDWARE 数值 1→5 (Phase 1) */
 #define MC_EVENT_VERSION         1
-#define MC_STATS_VERSION         2     /* +gate_poisoned/last_source/enter_count/poison_drops */
+#define MC_STATS_VERSION         3     /* v3: Phase 0 加 9 段 timer / 队列水位 / Preset / HDCM ;
+                                          Phase 1 mc_decoder_kind_t enum 数值变更同步 */
 
 /* ──────────────────────────────────────────────────────────────
  * 全局初始化（进程级一次性 — MFStartup / WSAStartup / COM）

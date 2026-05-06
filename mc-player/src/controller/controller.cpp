@@ -4,6 +4,8 @@
 #include <d3d11.h>
 #include <d3d11_4.h>          // ID3D11Multithread（同 device 上的并发保护开关）
 #include <dxgi1_6.h>
+#include <mfapi.h>            // MFTEnumEx / MFT_CATEGORY_VIDEO_DECODER (Phase 1 probe_mft_video_async_hardware)
+#include <mfobjects.h>
 #include <wrl/client.h>
 
 #include <array>
@@ -99,6 +101,66 @@ mcp::media::UiStage map_state_to_ui_stage(mc_state_t s) noexcept {
         case MC_STATE_ERROR:     return mcp::media::UiStage::error;
     }
     return mcp::media::UiStage::empty;
+}
+
+// ADR-015 + plan Phase 1：档 3 MFT hardware async probe 结果 → 区分 tier_skip_reason。
+// codec_mft_video::start 在 sync only 时也返 MC_ERR_NO_HARDWARE,无法从 status 区分原因;
+// controller 在 codec_mft_video::start 失败前先用此 helper 探测真实情况以填准确 reason。
+enum class MftProbeReason {
+    hardware_async_available,   // 至少一个 hw_url=1 && async=1 的 MFT
+    sync_software_only,         // 仅有 sync software MFT（hw_url=0 && async=0），ADR-015 排除
+    no_mft_registered,          // MediaPlayback feature 缺失/未启用，MFT category 未注册
+    enum_failed,                // MFTEnumEx 返回 FAILED
+};
+
+[[nodiscard]] MftProbeReason probe_mft_video_async_hardware(mc_video_codec_t codec) noexcept {
+    GUID subtype = GUID_NULL;
+    switch (codec) {
+        case MC_VIDEO_CODEC_H264: subtype = MFVideoFormat_H264; break;
+        case MC_VIDEO_CODEC_H265: subtype = MFVideoFormat_HEVC; break;
+        case MC_VIDEO_CODEC_AV1:  subtype = MFVideoFormat_AV1;  break;
+        default: return MftProbeReason::no_mft_registered;
+    }
+    MFT_REGISTER_TYPE_INFO in_info{MFMediaType_Video, subtype};
+
+    // 先试 HARDWARE | ASYNCMFT — 命中即可用。
+    IMFActivate** activates = nullptr;
+    UINT32        n         = 0;
+    HRESULT       hr        = ::MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,
+                                            MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT |
+                                              MFT_ENUM_FLAG_SORTANDFILTER,
+                                            &in_info, nullptr, &activates, &n);
+    if (SUCCEEDED(hr) && n > 0) {
+        for (UINT32 i = 0; i < n; ++i) activates[i]->Release();
+        ::CoTaskMemFree(activates);
+        return MftProbeReason::hardware_async_available;
+    }
+    if (activates) ::CoTaskMemFree(activates);
+
+    // 没有硬件 async — 看 ALL 列表分辨"仅 sync software" vs "无注册"。
+    activates = nullptr;
+    n         = 0;
+    hr        = ::MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_ALL,
+                              &in_info, nullptr, &activates, &n);
+    if (FAILED(hr)) {
+        if (activates) ::CoTaskMemFree(activates);
+        return MftProbeReason::enum_failed;
+    }
+    const bool has_any = n > 0;
+    for (UINT32 i = 0; i < n; ++i) activates[i]->Release();
+    if (activates) ::CoTaskMemFree(activates);
+    return has_any ? MftProbeReason::sync_software_only
+                    : MftProbeReason::no_mft_registered;
+}
+
+[[nodiscard]] const char* mft_probe_reason_str(MftProbeReason r) noexcept {
+    switch (r) {
+        case MftProbeReason::hardware_async_available: return "hardware_async_available";
+        case MftProbeReason::sync_software_only:       return "sync_software_only";
+        case MftProbeReason::no_mft_registered:        return "no_mft_registered";
+        case MftProbeReason::enum_failed:              return "enum_failed";
+    }
+    return "unknown";
 }
 
 const transport::SdpMedia* find_media(const transport::SdpSession& sdp,
@@ -621,44 +683,103 @@ struct Controller::Impl {
         gate = std::make_unique<media::FrameValidityGate>(
             [this](const media::VideoFrame& f) { on_admitted(f); });
 
-        // 解码器选择链：MFT（首选）→ DXVA-direct（HEVC Extension 缺席兜底）→ libcodec（纯软解）。
-        media::CodecMftVideo::Config ccfg;
-        ccfg.codec  = video_codec;
-        ccfg.device = d3d_device;
-        ccfg.prefer_low_latency = decoded_no_b_frames;     // ADD §5.6.4 B-Frame Policy
-        ccfg.color  = resolved_color;                       // ADD §5.12 三级兜底结果
-        ccfg.emit   = [this](media::VideoFrame&& f) { on_decoded_frame(std::move(f)); };
-        codec_video = std::make_unique<media::CodecMftVideo>(std::move(ccfg));
-        if (mc_status_t s = codec_video->start({}); s == MC_OK) {
-            decoder_kind = MC_DECODER_MFT_HARDWARE;
-            pal::metric::Registry::instance().gauge("mc.decoder.kind").set(decoder_kind);
-            return MC_OK;
-        } else {
-            MCP_LOGF(pal::LogLevel::warn,
-                     "Controller: MFT codec start failed status=%d", static_cast<int>(s));
-            codec_video.reset();
+        // ADR-015 四级降级链 (plan Phase 1)：vendor SDK → DXVA-direct → MFT hardware async → libcodec
+        // 原则：硬件 path 最短优先（host 抽象层数从短到长）。前一档失败立即降级，每档独立 probe。
+        // tier_skip_reason / tierN_ns / tier_selected metric 上报对位性能量度规范 §2.4。
+        auto& reg = pal::metric::Registry::instance();
+
+        auto record_skip = [&reg](int tier, const char* reason) {
+            char name[96];
+            std::snprintf(name, sizeof(name),
+                          "mc.probe.tier_skip_reason.tier%d.%s", tier, reason);
+            reg.counter(name).inc();
+            char count_name[64];
+            std::snprintf(count_name, sizeof(count_name),
+                          "mc.probe.tier%d_skip_count", tier);
+            reg.counter(count_name).inc();
+        };
+
+        auto activate = [&reg, this](mc_decoder_kind_t k, int tier) {
+            decoder_kind = k;
+            reg.gauge("mc.decoder.kind").set(k);
+            reg.gauge("mc.probe.tier_selected").set(tier);
+        };
+
+        // 档 1: Vendor SDK 直驱（NVDEC / oneVPL / AMF）— Phase 5/6/7 实装。
+        {
+            pal::metric::ScopedTimer t{reg.timer("mc.probe.tier1_ns")};
+            // stub: 永远 fail（vendor SDK 未实装；ADR-016 HDCM 下载面板亦待 Phase 8）。
+            record_skip(1, "sdk_missing");
+            MCP_LOGF(pal::LogLevel::info,
+                     "Controller: tier1 vendor SDK skipped (sdk_missing; Phase 5/6/7 实装)");
         }
 
-        // DXVA-direct 仅对 HEVC 有意义（H.264 已被 MFT 覆盖；MFT 失败说明系统层全坏）。
-        if (video_codec == MC_VIDEO_CODEC_H265) {
-            media::CodecDxvaVideo::Config dcfg;
-            dcfg.codec  = video_codec;
-            dcfg.device = d3d_device;
-            dcfg.emit   = [this](media::VideoFrame&& f) { on_decoded_frame(std::move(f)); };
-            codec_dxva  = std::make_unique<media::CodecDxvaVideo>(std::move(dcfg));
-            if (mc_status_t s = codec_dxva->start(); s == MC_OK) {
-                MCP_LOGF(pal::LogLevel::info,
-                         "Controller: HEVC running on DXVA-direct (no HEVC Extension required)");
-                decoder_kind = MC_DECODER_MFT_HARDWARE;     // 共用枚举：仍是硬件解码
-                return MC_OK;
+        // 档 2: DXVA-direct（D3D11VideoDevice）— HEVC 已实装；H.264 留 Phase 4 stub。
+        {
+            pal::metric::ScopedTimer t{reg.timer("mc.probe.tier2_ns")};
+            if (video_codec == MC_VIDEO_CODEC_H265) {
+                media::CodecDxvaVideo::Config dcfg;
+                dcfg.codec  = video_codec;
+                dcfg.device = d3d_device;
+                dcfg.emit   = [this](media::VideoFrame&& f) { on_decoded_frame(std::move(f)); };
+                codec_dxva  = std::make_unique<media::CodecDxvaVideo>(std::move(dcfg));
+                if (mc_status_t s = codec_dxva->start(); s == MC_OK) {
+                    MCP_LOGF(pal::LogLevel::info,
+                             "Controller: tier2 DXVA-direct H.265 active "
+                             "(HEVC Extension not required)");
+                    activate(MC_DECODER_DXVA_DIRECT, 2);
+                    return MC_OK;
+                } else {
+                    MCP_LOGF(pal::LogLevel::warn,
+                             "Controller: tier2 DXVA-direct H.265 start failed status=%d",
+                             static_cast<int>(s));
+                    codec_dxva.reset();
+                    record_skip(2, "profile_unsupported");
+                }
+            } else if (video_codec == MC_VIDEO_CODEC_H264) {
+                // 档 2 H.264 实装在 Phase 4 路线（codec_dxva_video.cpp 补 H.264 picparams + DPB）。
+                record_skip(2, "h264_not_implemented_phase4");
             } else {
-                MCP_LOGF(pal::LogLevel::warn,
-                         "Controller: DXVA-direct start failed status=%d", static_cast<int>(s));
-                codec_dxva.reset();
+                record_skip(2, "codec_unsupported");
             }
         }
 
+        // 档 3: MFT hardware async — 仅 hw_url=1 && async=1 接受（ADR-001 / ADR-002 / ADR-015）。
+        // sync software MFT 由 codec_mft_video::start 直接拒绝，并通过 MftProbeReason 区分原因。
+        {
+            pal::metric::ScopedTimer t{reg.timer("mc.probe.tier3_ns")};
+            const auto reason = probe_mft_video_async_hardware(video_codec);
+            if (reason == MftProbeReason::hardware_async_available) {
+                media::CodecMftVideo::Config ccfg;
+                ccfg.codec  = video_codec;
+                ccfg.device = d3d_device;
+                ccfg.prefer_low_latency = decoded_no_b_frames;     // ADD §5.6.4 B-Frame Policy
+                ccfg.color  = resolved_color;                       // ADD §5.12 三级兜底结果
+                ccfg.emit   = [this](media::VideoFrame&& f) { on_decoded_frame(std::move(f)); };
+                codec_video = std::make_unique<media::CodecMftVideo>(std::move(ccfg));
+                if (mc_status_t s = codec_video->start({}); s == MC_OK) {
+                    MCP_LOGF(pal::LogLevel::info,
+                             "Controller: tier3 MFT hardware async active");
+                    activate(MC_DECODER_MFT_HARDWARE, 3);
+                    return MC_OK;
+                } else {
+                    MCP_LOGF(pal::LogLevel::warn,
+                             "Controller: tier3 MFT codec start failed status=%d",
+                             static_cast<int>(s));
+                    codec_video.reset();
+                    record_skip(3, "activate_failed");
+                }
+            } else {
+                record_skip(3, mft_probe_reason_str(reason));
+                MCP_LOGF(pal::LogLevel::info,
+                         "Controller: tier3 MFT skipped reason=%s",
+                         mft_probe_reason_str(reason));
+            }
+        }
+
+        // 档 4: mc-libcodec 软解（final fallback）。allow_software_decode=0 时上报 NO_HARDWARE。
         if (!options.allow_software_decode) {
+            record_skip(4, "disabled_by_caller");
             return MC_ERR_NO_HARDWARE;
         }
 
@@ -669,14 +790,17 @@ struct Controller::Impl {
         codec_libcodec = std::make_unique<media::CodecLibcodecVideo>(std::move(lcfg));
         if (mc_status_t s = codec_libcodec->start(); s != MC_OK) {
             MCP_LOGF(pal::LogLevel::error,
-                     "Controller: libcodec start failed status=%d", static_cast<int>(s));
+                     "Controller: tier4 libcodec start failed status=%d",
+                     static_cast<int>(s));
             codec_libcodec.reset();
             decoder_kind = MC_DECODER_NONE;
-            pal::metric::Registry::instance().gauge("mc.decoder.kind").set(decoder_kind);
+            reg.gauge("mc.decoder.kind").set(decoder_kind);
+            record_skip(4, "start_failed");
             return s;
         }
-        decoder_kind = MC_DECODER_LIBCODEC;
-        pal::metric::Registry::instance().gauge("mc.decoder.kind").set(decoder_kind);
+        MCP_LOGF(pal::LogLevel::info,
+                 "Controller: tier4 mc-libcodec software decoder active");
+        activate(MC_DECODER_LIBCODEC, 4);
         return MC_OK;
     }
 

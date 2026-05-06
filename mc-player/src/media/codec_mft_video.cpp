@@ -828,6 +828,12 @@ mc_status_t CodecMftVideo::start(std::span<const uint8_t> /*extradata*/) noexcep
         if (all) ::CoTaskMemFree(all);
     }
 
+    // ADR-015 / ADR-002 + plan Phase 1: 本档（ADR-015 档 3 MFT hardware async）仅接受
+     // hw_url=1 && async=1 的 MFT。sync software MFT（如 Microsoft H264/H265 Video Decoder MFT，
+     // hw_url=0 && async=0）在 SPS reorder>0 流上强制缓 ≥3 帧（实测 +100ms vs VLC，本仓库
+     // commit 历史已记录），不当作硬解；codec_mft_video::start 在仅 sync software 可用时
+     // 直接返回 MC_ERR_NO_HARDWARE，由 controller 路由到 ADR-015 档 4 mc-libcodec 软解。
+     // 退路 1（software async）+ 退路 2（sync software）已在 Phase 1 删除（ADR-015 + ADR-002 范围澄清）。
     UINT32      flags = MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_ASYNCMFT |
                         MFT_ENUM_FLAG_SORTANDFILTER;
     IMFActivate** activates = nullptr;
@@ -836,26 +842,11 @@ mc_status_t CodecMftVideo::start(std::span<const uint8_t> /*extradata*/) noexcep
                                    &in_info, nullptr, &activates, &n_activates);
     if (FAILED(hr) || n_activates == 0) {
         if (activates) ::CoTaskMemFree(activates);
-        // 退路 1：软件 async。
-        flags = MFT_ENUM_FLAG_ASYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER;
-        hr = ::MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, flags,
-                         &in_info, nullptr, &activates, &n_activates);
-        if (FAILED(hr) || n_activates == 0) {
-            if (activates) ::CoTaskMemFree(activates);
-            // 退路 2：sync MFT（Microsoft HEVC Video Extension 即此类，hw_url=0 async=0）。
-            // ADR-002 "硬件 MFT 永远 async" 仅约束硬件路径；software wrapper 用 sync 合规。
-            flags = MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_SORTANDFILTER;
-            hr = ::MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER, flags,
-                             &in_info, nullptr, &activates, &n_activates);
-            if (FAILED(hr) || n_activates == 0) {
-                if (activates) ::CoTaskMemFree(activates);
-                MCP_LOGF(pal::LogLevel::error,
-                         "CodecMftVideo: no MFT for %s; HEVC Extension absent?",
-                         codec_name(impl_->cfg.codec));
-                return MC_ERR_NO_HARDWARE;
-            }
-            impl_->is_sync_mft = true;
-        }
+        MCP_LOGF(pal::LogLevel::warn,
+                 "CodecMftVideo: no hardware async MFT for %s "
+                 "(sync software MFT excluded by ADR-015); will fall through to libcodec",
+                 codec_name(impl_->cfg.codec));
+        return MC_ERR_NO_HARDWARE;
     }
 
     hr = activates[0]->ActivateObject(IID_PPV_ARGS(&impl_->transform));

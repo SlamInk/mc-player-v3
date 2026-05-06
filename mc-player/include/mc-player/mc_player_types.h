@@ -71,11 +71,30 @@ typedef enum mc_audio_codec_e {
     MC_AUDIO_CODEC_G711_ULAW    = 4
 } mc_audio_codec_t;
 
+/* ADR-015 四级降级链 + 性能量度规范 §6 一一对应（Phase 1 由 ABI v3 起,旧 v2 三值
+ * 在本仓库内一次性切换;外部调用方按 struct_version 路由）。
+ *
+ *   档 1 Vendor SDK 直驱（按 GPU vendor 选其一，Phase 5/6/7 实装）：
+ *     1 = NVIDIA NVDEC / 2 = Intel oneVPL / 3 = AMD AMF
+ *   档 2 DXVA-direct（D3D11VideoDevice 直驱，跨 vendor 通用，Phase 4 H.264 + 既有 HEVC）：
+ *     4 = DXVA_DIRECT
+ *   档 3 MFT hardware async（OS 标准抽象兼容档，hw_url=1 && async=1）：
+ *     5 = MFT_HARDWARE
+ *   档 4 mc-libcodec 软解（CPU SIMD 兜底）：
+ *     6 = LIBCODEC
+ *
+ * 旧值 MC_DECODER_MFT_SOFTWARE = 2 已删除——sync software MFT 由 ADR-015 直接归
+ * 到档 4 软解，不再当作硬解;codec_mft_video::start 在仅 sync software 可用时
+ * 直接返回 MC_ERR_NO_HARDWARE,由 controller::start_decode_pipeline 路由到档 4。
+ */
 typedef enum mc_decoder_kind_e {
-    MC_DECODER_NONE             = 0,
-    MC_DECODER_MFT_HARDWARE     = 1,    /* DXVA via Windows Media Foundation */
-    MC_DECODER_MFT_SOFTWARE     = 2,    /* OS software MFT 兜底 */
-    MC_DECODER_LIBCODEC         = 3     /* mc-libcodec 自研软解 */
+    MC_DECODER_NONE                 = 0,
+    MC_DECODER_VENDOR_SDK_NVDEC     = 1,    /* 档 1 NVIDIA Video Codec SDK (NVDEC) */
+    MC_DECODER_VENDOR_SDK_ONEVPL    = 2,    /* 档 1 Intel oneVPL */
+    MC_DECODER_VENDOR_SDK_AMF       = 3,    /* 档 1 AMD AMF */
+    MC_DECODER_DXVA_DIRECT          = 4,    /* 档 2 ID3D11VideoDevice 直驱 */
+    MC_DECODER_MFT_HARDWARE         = 5,    /* 档 3 hardware async MFT */
+    MC_DECODER_LIBCODEC             = 6     /* 档 4 mc-libcodec 自研软解 */
 } mc_decoder_kind_t;
 
 /* GPU 类型（用于诊断日志：硬解到底跑在集显还是独显）。

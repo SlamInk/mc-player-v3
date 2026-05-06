@@ -22,7 +22,9 @@
 extern "C" {
 #endif
 
-#define MC_STATS_STRUCT_VERSION 2u
+/* 历史 alias；权威版本号在 mc_player.h::MC_STATS_VERSION（Phase 0 起 = 3，含 v2 字段+
+ * Phase 1 mc_decoder_kind_t enum 数值变更）。新代码统一用 MC_STATS_VERSION。 */
+#define MC_STATS_STRUCT_VERSION 3u
 
 typedef enum mc_present_mode_e {
     MC_PRESENT_MODE_UNKNOWN                     = 0,
