@@ -51,6 +51,20 @@ void emit_placeholder_samples() {
     Registry::instance().gauge("mc.decoder.kind").set(0);  // MC_DECODER_NONE placeholder
     Registry::instance().gauge("mc.preset.active_id").set(2);  // REALTIME_LAN placeholder
 
+    // Phase 3 Present Epoch + Watchdog (plan §3.0 / 性能量度规范 §7.1) placeholder。
+    // 真实值由 T5 渲染线程在 hot path 写入 (PresentEpoch / DcompRoot::commit)。
+    Registry::instance().counter("mc.render.epoch_pair_skew_count").inc(0);   // 必达 = 0 永久
+    Registry::instance().counter("mc.render.dcomp_commit_count").inc(0);
+    Registry::instance().counter("mc.render.watchdog_redraw_count").inc(0);
+    Registry::instance().counter("mc.render.resize_buffers_count").inc(0);
+    Registry::instance().counter("mc.render.resize_clearstate_violation_count").inc(0);
+    Registry::instance().gauge("mc.render.present_epoch_id").set(0);
+    Registry::instance().gauge("mc.render.profile_target").set(0);   // MC_RENDER_PROFILE_AUTO
+    Registry::instance().gauge("mc.render.profile_actual").set(0);
+    Registry::instance().gauge("mc.render.dcomp_on").set(0);
+    Registry::instance().gauge("mc.render.frame_latency_waitable_on").set(0);
+    Registry::instance().gauge("mc.render.allow_tearing_on").set(0);
+
     // ETW emit 一次,验证 Provider 在线 (运维侧 tracelog 抓取可见)。
     using mcp::pal::etw::Keyword;
     using mcp::pal::metric::Phase;

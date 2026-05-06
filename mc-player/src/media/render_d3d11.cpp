@@ -14,6 +14,7 @@
 #include "pal/clock.h"
 #include "pal/error.h"
 #include "pal/log.h"
+#include "pal/metric.h"
 #include "pal/raii.h"
 #include "pal/thread.h"
 
@@ -467,6 +468,27 @@ mc_status_t RenderD3d11::start() noexcept {
 
     impl_->dcomp = std::make_unique<DcompRoot>();
     impl_->dcomp->create(impl_->cfg.hwnd);
+
+    // 性能量度规范 §7.1 渲染管线 label / gauge 初值。
+    //   profile_target = 调用方传入的 hint(自适应前)
+    //   profile_actual = SwapChain auto-resolve 后的实际档(无 PresentMon 时退化为 active_profile)
+    //   dcomp_on / frame_latency_waitable_on = 子系统启用旗标(SwapChain 默认带 waitable)
+    auto& reg = pal::metric::Registry::instance();
+    reg.gauge("mc.render.profile_target")
+        .set(static_cast<int64_t>(impl_->cfg.profile_hint));
+    reg.gauge("mc.render.profile_actual")
+        .set(static_cast<int64_t>(impl_->swap_chain->active_profile()));
+    reg.gauge("mc.render.dcomp_on").set(impl_->dcomp ? 1 : 0);
+    reg.gauge("mc.render.frame_latency_waitable_on").set(1);
+    reg.gauge("mc.render.allow_tearing_on").set(
+        impl_->swap_chain->active_present_mode() == MC_PRESENT_MODE_TEARING ? 1 : 0);
+    {
+        const int64_t period_ns = impl_->frame_period_ns.load(std::memory_order_acquire);
+        if (period_ns > 0) {
+            reg.gauge("mc.render.display_refresh_hz")
+                .set(1'000'000'000LL / period_ns);
+        }
+    }
 
     // UI overlay：D2D + DirectWrite 在同一 D3D11 device 上共享 backbuffer。
     // 失败不致命——视频仍可放（仅缺 UI），打 warn 继续。
