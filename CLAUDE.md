@@ -4,27 +4,57 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 仓库当前阶段
 
-本仓库目前处于**架构设计阶段**，无 C/C++ 源码、无构建脚本、无测试套件。所有"代码"产物只有 `mc-player-ui-ux/` 下的 React UI/UX 原型（浏览器直跑、无构建步骤）。新增主项目源码、子项目 `subprojects/mc-libcodec/`、构建系统时，需要回填本节的命令清单。
+主项目源码 + 子项目 `subprojects/mc-libcodec/` + 构建系统已成型（CMake + Ninja + MSVC，构建入口 `build.bat`）。代码当前进度：
+
+- **已实装**：五层架构 PAL / Transport / Media / Controller / App；codec_mft_video（async hardware MFT + sync software MFT 兜底，sync 路径与 ADR-015 不一致待 Phase 1 修订）；codec_dxva_video（仅 HEVC）；codec_libcodec（mc-libcodec H.264/H.265 软解）；frame_validity_gate（六 bit drop counter + 污染态生命周期）；render_d3d11 / render_present_epoch / render_dcomp（ADD §5.10）。
+- **进行中**：Phase 0 性能量度地基（`pal/metric.h` Counter/Gauge/Histogram + `pal/etw_provider.h` TraceLogging Provider GUID `{F8E1A0C2-7A3B-4C1F-9D2E-6B5A4F8C1234}` + `tools/dump_stats` JSON 工具）— 基础设施 + frame_validity_gate metric 同步 + controller hot-path 部分 timer 已落，9 段 timer 完整精细度待 Phase 1+ 各 codec 内部细化。
+- **未实装**：vendor SDK 档（NVDEC / oneVPL / AMF）、HDCM、Capability Probe Suite + Preset 架构（Phase 9）、Live Reload（Phase 10）。
+
+## 构建
+
+```bash
+# Windows + Visual Studio 18 Enterprise + Ninja（vcvars64 已 build.bat 自动加载）
+build.bat Debug          # Debug 构建
+build.bat RelWithDebInfo  # 默认 RelWithDebInfo
+
+# 产物
+build/ninja-msvc-Debug/demo-host/mc-player.exe
+build/ninja-msvc-Debug/mc-player/tools/dump_stats/mc_player_dump_stats.exe
+build/ninja-msvc-Debug/subprojects/mc-libcodec/mc_libcodec.lib
+
+# 验证 metric Registry + ETW Provider 注册
+mc_player_dump_stats.exe --self_test    # 退出码 0 + JSON 输出含 etw_provider_registered=true
+```
+
+ETW 抓取（运维诊断时）：
+
+```powershell
+# 抓 60 秒 mc-player ETW 事件到 ETL 文件
+tracelog -start mcp -guid #F8E1A0C2-7A3B-4C1F-9D2E-6B5A4F8C1234 -f mcp.etl
+# 跑 mc-player.exe ...
+tracelog -stop mcp
+# 解析（用 perfview / Microsoft Message Analyzer / WPA）
+```
 
 ## 目录拓扑
 
 ```
 doc/                                          架构与运维文档（ADD / ADR / design-detail）
   ├── mc-player_架构设计文档_v3.0.md           ADD — 原理 / 架构 / 可行性
-  ├── mc-player_ADR.md                         ADR-001 ~ ADR-020 决策记录，与 ADD 交叉引用
-  ├── mc-player_capability_probe_设计.md       design-detail — Capability Probe Suite + Preset 的 struct/算法/状态机
-  ├── mc-player_性能量度规范.md                 metric 字段 / 阈值 / 排障(实施性规范)
+  ├── mc-player_ADR.md                         ADR-001 ~ ADR-021 决策记录，与 ADD 交叉引用
+  ├── mc-player_capability_probe_设计.md       design-detail — Capability Probe Suite + Preset
+  ├── mc-player_hdcm_设计.md                   design-detail — HDCM 组件 manifest / 状态机 / helper IPC
+  ├── mc-player_性能量度规范.md                 metric 字段 / 阈值 / 排障（实施性规范）
   └── hardware-decode-dependencies.md          硬件解码依赖与故障排查（IoT LTSC 等场景）
 plan/                                          实施性 roadmap
-  └── mc-player_重构方案.md                     Phase 0 ~ Phase 10 阶段交付计划
-mc-player-ui-ux/                              React UI/UX 设计稿,浏览器渲染
-```
-
-未来按 ADD §3.1 与 ADR-010 落地的目录：
-```
-mc-player/         主项目（五层架构：App / Controller / TS / MediaCore / PAL）
-subprojects/
-  mc-libcodec/     并列子项目：自研 H.264 / H.265 软解兜底，独立 target / API / license（Apache 2.0）
+  └── mc-player_重构方案.md                     Phase 0 ~ Phase 10（含 Phase 8 拆 5 + Phase 9 拆 6 子 phase）
+mc-player/                                    主项目（五层架构：App / Controller / TS / MediaCore / PAL）
+  ├── include/mc-player/                      公开 C ABI 头
+  ├── src/{app,controller,transport,media,pal}/   五层实装
+  └── tools/dump_stats/                       Phase 0 metric Registry JSON dump 工具
+subprojects/mc-libcodec/                      并列子项目：自研 H.264/H.265 软解兜底，Apache 2.0
+demo-host/                                    桌面 demo（mc-player.exe）
+mc-player-ui-ux/                              React UI/UX 设计稿,浏览器渲染（设计参考，不入构建）
 ```
 
 ## UI/UX 原型运行方式

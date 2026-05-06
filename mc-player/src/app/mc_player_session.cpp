@@ -1,8 +1,25 @@
 #include "app/mc_player_session.h"
 
+#include "pal/etw_provider.h"
 #include "pal/log.h"
+#include "pal/metric.h"
 
 namespace mcp::app {
+
+namespace {
+
+// 按 metric 名拉 quantile 填 v2 stats 字段；metric Registry 是单例，懒创建保证调用侧安全。
+inline uint64_t hist_p95_ns(std::string_view name) noexcept {
+    auto& h = mcp::pal::metric::Registry::instance().histogram(name);
+    const auto q = h.quantile(0.95);
+    return q < 0 ? 0u : static_cast<uint64_t>(q);
+}
+
+inline uint64_t counter_value(std::string_view name) noexcept {
+    return mcp::pal::metric::Registry::instance().counter(name).value();
+}
+
+}  // namespace
 
 namespace {
 
@@ -58,8 +75,44 @@ mc_status_t Session::get_stats(mc_stats_t& inout) const noexcept {
     if (inout.struct_size < sizeof(mc_stats_t)) {
         return MC_ERR_INVALID_ARG;
     }
-    std::scoped_lock lk{mu_};
-    return controller_->get_stats(inout);
+    {
+        std::scoped_lock lk{mu_};
+        if (auto s = controller_->get_stats(inout); s != MC_OK) return s;
+    }
+
+    // Phase 0 v2 字段填充（性能量度规范 §11.4）—— 从 metric Registry 拉 9 段 timer p95
+    // + 6 bit gate counter + preset/probe gauge。controller::get_stats 已填 v1 字段
+    // 与部分 v2 字段（如 decoder_kind 通过 stream_info），此处补齐 metric 端。
+    inout.stage_udp_rx_p95_ns           = hist_p95_ns("mc.stage.udp_rx_ns");
+    inout.stage_jitter_dwell_p95_ns     = hist_p95_ns("mc.stage.jitter_dwell_ns");
+    inout.stage_depack_p95_ns           = hist_p95_ns("mc.stage.depack_ns");
+    inout.stage_decode_alloc_p95_ns     = hist_p95_ns("mc.stage.decode_alloc_ns");
+    inout.stage_decode_actual_p95_ns    = hist_p95_ns("mc.stage.decode_actual_ns");
+    inout.stage_decode_output_p95_ns    = hist_p95_ns("mc.stage.decode_output_ns");
+    inout.stage_upload_p95_ns           = hist_p95_ns("mc.stage.upload_ns");
+    inout.stage_yuv2rgb_p95_ns          = hist_p95_ns("mc.stage.yuv2rgb_ns");
+    inout.stage_present_queue_p95_ns    = hist_p95_ns("mc.stage.present_queue_ns");
+
+    inout.e2e_latency_p95_ns            = hist_p95_ns("mc.e2e.latency_ns");
+    inout.e2e_client_internal_p95_ns    = hist_p95_ns("mc.e2e.client_internal_ns");
+
+    // Probe 完成时间 p95（capability_probe §3 ~ §5；Phase 9.0 实装 probe 后真实 record）。
+    inout.probe_hardware_complete_p95_ns = hist_p95_ns("mc.probe.hardware_complete_ms");
+    inout.probe_network_complete_p95_ns  = hist_p95_ns("mc.probe.network_complete_ms");
+    inout.probe_encoder_complete_p95_ns  = hist_p95_ns("mc.probe.encoder_complete_ms");
+    inout.probe_render_complete_p95_ns   = hist_p95_ns("mc.probe.render_complete_ms");
+
+    // Preset 状态（plan Phase 9 实装；Phase 0 默认 NONE，selector 未启动）。
+    inout.preset_active_id              = static_cast<mc_preset_id_t>(
+        mcp::pal::metric::Registry::instance().gauge("mc.preset.active_id").value());
+    inout.preset_reload_count           = counter_value("mc.preset.reload_count");
+    inout.preset_downgrade_count        = counter_value("mc.preset.downgrade_count");
+    inout.preset_upgrade_count          = counter_value("mc.preset.upgrade_count");
+    inout.preset_apply_atomic_violation_count = counter_value("mc.preset.apply_atomic_violation_count");
+    inout.preset_apply_partial_count    = counter_value("mc.preset.apply_partial_count");
+    inout.preset_apply_failure_count    = counter_value("mc.preset.apply_failure_count");
+
+    return MC_OK;
 }
 
 mc_status_t Session::get_stream_info(mc_stream_info_t& inout) const noexcept {

@@ -1,9 +1,10 @@
 /*
  * 性能 metric 原语实现 — 性能量度规范 §9.2 / plan Phase 0。
  *
- * Histogram 桶布局：log-scale，r = 1.05^idx ns，0 ≤ idx < 256。
- *   bucket_upper_ns(idx) = pow(1.05, idx) ns，向下舍到 int64。
- *   覆盖范围：1ns（idx=0）→ ~3.7e5 ns（idx=63，370 µs）→ ~3.7e10 ns（idx=255，37 s）。
+ * Histogram 桶布局：log-scale，r = 1.10^idx ns，0 ≤ idx < 256。
+ *   bucket_upper_ns(idx) = pow(1.10, idx) ns，向下舍到 int64。
+ *   覆盖范围：1ns（idx=0）→ ~10 µs（idx=100）→ ~110 ms（idx=180）→ ~60 s（idx=255）。
+ *   桶宽 1.10×（10% 误差），1.05× 在 256 桶下只能覆盖到 ~250µs 远不够低延时 + 长尾场景。
  *
  * 分位数查询：累加 buckets[0..k-1] 直到累计 count >= q * total，落到 bucket k；
  *   bucket k 内做线性插值返回上界（HDR Histogram 简化做法，误差 ≤ 1.05x）。
@@ -35,7 +36,7 @@ struct BucketTable {
             // 单调性：每个桶上界至少比前一个 +1。
             if (i > 0 && ub <= upper[i - 1]) ub = upper[i - 1] + 1;
             upper[i] = ub;
-            v *= 1.05;
+            v *= 1.10;
         }
     }
 };
@@ -117,12 +118,16 @@ int64_t Histogram::quantile(double q) const noexcept {
     const uint64_t total = total_count_.load(std::memory_order_relaxed);
     if (total == 0) return 0;
 
-    const uint64_t target = static_cast<uint64_t>(static_cast<double>(total) * q);
+    // nearest-rank: target = ceil(q * total); 至少 1。
+    uint64_t target = static_cast<uint64_t>(
+        std::ceil(static_cast<double>(total) * q));
+    if (target == 0) target = 1;
+
     uint64_t accum = 0;
     for (std::size_t i = 0; i < kBucketCount; ++i) {
         accum += buckets_[i].load(std::memory_order_relaxed);
         if (accum >= target) {
-            // 桶 i 的上界即近似 quantile（误差 ≤ 5%，HDR 简化做法）。
+            // 桶 i 的上界即近似 quantile（HDR 简化做法,1.05x 桶宽 → 误差 ≤ 5%）。
             return bucket_upper_ns(i);
         }
     }

@@ -30,8 +30,10 @@
 #include "media/frame_validity_gate.h"
 #include "media/render_d3d11.h"
 #include "media/ui_overlay.h"
+#include "pal/clock.h"
 #include "pal/dxgi_caps_probe.h"
 #include "pal/log.h"
+#include "pal/metric.h"
 #include "transport/sdp_parser.h"
 #include "transport/transport_session.h"
 
@@ -317,6 +319,12 @@ struct Controller::Impl {
     // arrival_qpc_ns 是端到端延时探针起点（AU first-packet RX 戳），由 codec 透传到 VideoFrame。
     void submit_au_to_decoder(std::vector<uint8_t>&& bytes, int64_t pts_us,
                                 int64_t arrival_qpc_ns) noexcept {
+        // 性能量度规范 §2.2 mc.stage.decode_alloc_ns：AU → decoder buffer 就绪。
+        // ScopedTimer 仅记本函数 dispatch 耗时（depack→codec 移交 + codec.submit 入队）；
+        // 真正的 codec 内部 alloc + memcpy 由各 codec 实装（codec_mft_video / codec_dxva /
+        // codec_libcodec）在 hot path 内独立 record。Phase 0 仅暴露字段,phase 1+ 各 codec 补全。
+        pal::metric::ScopedTimer t{
+            pal::metric::Registry::instance().timer("mc.stage.decode_alloc_ns")};
         if (codec_video)         codec_video->submit(std::move(bytes), pts_us, arrival_qpc_ns);
         else if (codec_dxva)     codec_dxva->submit(std::move(bytes), pts_us, arrival_qpc_ns);
         else if (codec_libcodec) codec_libcodec->submit(std::move(bytes), pts_us, arrival_qpc_ns);
@@ -348,10 +356,29 @@ struct Controller::Impl {
     }
 
     void on_decoded_frame(media::VideoFrame&& f) noexcept {
+        // 性能量度规范 §2.1 mc.e2e.client_internal_ns：rx_first_byte → emit。
+        // 此处 emit 时点是 codec 出帧 → gate.admit；arrival_qpc_ns 由 codec 透传（depack 层
+        // RTP 首包到达戳）。仅 arrival_qpc_ns 有效时 record，避免冷启动期 0 戳污染分位数。
+        if (f.arrival_qpc_ns > 0) {
+            const int64_t now_ns = pal::Clock::now_ns();
+            const int64_t delta  = now_ns - f.arrival_qpc_ns;
+            if (delta > 0) {
+                pal::metric::Registry::instance()
+                    .timer("mc.e2e.client_internal_ns").record(delta);
+            }
+        }
+        // 性能量度规范 §3.3 mc.decode.fps_emit_to_gate counter 等价（fps 是 1Hz 聚合）。
+        pal::metric::Registry::instance()
+            .counter("mc.decode.frame_emit_to_gate_count").inc();
+
         if (gate) gate->admit(f);
     }
 
     void on_admitted(const media::VideoFrame& f) noexcept {
+        // 性能量度规范 §2.2 mc.stage.yuv2rgb_ns：dual-bind / CopySub + YUV→RGB shader。
+        // 实际 shader dispatch 在 render->on_admitted 内部；此处粗记函数耗时。
+        pal::metric::ScopedTimer t{
+            pal::metric::Registry::instance().timer("mc.stage.yuv2rgb_ns")};
         if (render) render->on_admitted(f);
     }
 
@@ -604,6 +631,7 @@ struct Controller::Impl {
         codec_video = std::make_unique<media::CodecMftVideo>(std::move(ccfg));
         if (mc_status_t s = codec_video->start({}); s == MC_OK) {
             decoder_kind = MC_DECODER_MFT_HARDWARE;
+            pal::metric::Registry::instance().gauge("mc.decoder.kind").set(decoder_kind);
             return MC_OK;
         } else {
             MCP_LOGF(pal::LogLevel::warn,
@@ -644,9 +672,11 @@ struct Controller::Impl {
                      "Controller: libcodec start failed status=%d", static_cast<int>(s));
             codec_libcodec.reset();
             decoder_kind = MC_DECODER_NONE;
+            pal::metric::Registry::instance().gauge("mc.decoder.kind").set(decoder_kind);
             return s;
         }
         decoder_kind = MC_DECODER_LIBCODEC;
+        pal::metric::Registry::instance().gauge("mc.decoder.kind").set(decoder_kind);
         return MC_OK;
     }
 
