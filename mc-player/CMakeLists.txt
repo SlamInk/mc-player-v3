@@ -88,6 +88,8 @@ set(MCP_MEDIA_SOURCES
     src/hdcm/detector.cpp
     src/hdcm/installer_a_vendor_sdk.h
     src/hdcm/installer_a_vendor_sdk.cpp
+    src/hdcm/installer_b_store.h
+    src/hdcm/installer_b_store.cpp
     src/media/codec_amf.h
     src/media/codec_amf.cpp
     src/media/codec_nvdec.h
