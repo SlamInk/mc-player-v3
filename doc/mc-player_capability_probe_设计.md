@@ -88,7 +88,7 @@ T0 boot
  │                          ↓
  │                  PresetApply::apply()  ─→ 6 个子系统 idempotent apply
  │
- └ sync (主线) ─── BOOTSTRAP preset (REALTIME_LAN 保守版) → 首帧
+ └ sync (主线) ─── BOOTSTRAP 阶段沿用 REALTIME_LAN preset (保守版) → 首帧
                               ↓
                           首 GOP 完成
                               ↓
@@ -187,7 +187,7 @@ struct RenderSnapshot {
 
     // ADR-008 + 子目标 1:DCOMP NV12 直显与 MPO 多面合成
     bool                supports_dcomp_nv12_direct;        // composition swapchain DXGI_FORMAT_NV12 可用
-    uint32_t            mpo_max_planes;                    // OS 报告的 MPO planes 数(DCOMP_INDEPENDENT_FLIP 前提)
+    uint32_t            mpo_max_planes;                    // OS 报告的 MPO planes 数(PresentMon `Hardware_Composed_Independent_Flip` 实测前提)
     bool                supports_independent_flip;         // PresentMon 实测当前 OS + driver 能进 IndependentFlip
 };
 ```
@@ -328,7 +328,7 @@ struct EncoderSnapshot {
 |---|---|---|---|---|---|
 | `decoder_low_latency_hint` | full（各 vendor 配置参数权威源:ADD §5.6.2.1 + §5.6.3） | full | partial（允许 1 reorder,B-Frame Policy 见 ADD §5.6.4） | off | off |
 | `jitter_mode` | ZeroJitter（target 0~1ms） | Kalman aggressive（target 5ms） | Kalman normal（target 15ms） | Kalman safe（target 80ms） | Kalman safe |
-| `render_profile` | DCOMP_INDEPENDENT_FLIP + NV12 直显 + ALLOW_TEARING | 同左 | DCOMP_BEST_EFFORT 或 SWAPCHAIN_FLIP | SWAPCHAIN_FLIP | SWAPCHAIN_FLIP |
+| `render_profile` | ULTIMATE_DCOMP + NV12 直显 + ALLOW_TEARING | ULTIMATE_DCOMP（dual-bind shader）| EXTREME 或 BALANCED | BALANCED | COMPAT |
 | `present_scheduling` | race_to_display | race_to_display | vsync-aligned | vsync-aligned | vsync-aligned |
 | `rtcp_mode` | RFC 5506 Reduced-Size + AVPF Immediate trr-int=0 | 同左 | AVPF Immediate | AVPF Regular | AVPF Regular |
 | `frame_validity_gate` | 详见 §6.3(权威)+ ADR-014 / ADD §5.13;6 bit 严格度按 preset 派生 | 同左 | 同左 | 同左 | 同左 |
@@ -349,8 +349,8 @@ def match(snapshot: CapabilitySnapshot) -> PresetId:
         and net.loss_rate_short < 0.0001
         and enc.reorder_depth == 0
         and enc.is_zerolatency_hint
-        and render.profile == DCOMP_INDEPENDENT_FLIP
-        and render.refresh_rate_hz >= 240
+        and render.profile == ULTIMATE_DCOMP
+        and render.primary_monitor_refresh_rate_hz >= 240
         and render.vrr_enabled):
         return SDI_REPLACEMENT
 
@@ -359,7 +359,7 @@ def match(snapshot: CapabilitySnapshot) -> PresetId:
         and net.link_kind in {LAN_SWITCHED, LAN_WIFI}
         and net.rtt_p95_ns < 5_000_000
         and enc.reorder_depth == 0
-        and render.profile in {DCOMP_INDEPENDENT_FLIP, DCOMP_BEST_EFFORT}):
+        and render.profile in {ULTIMATE_DCOMP, EXTREME}):
         return REALTIME_LAN
 
     # STREAMING_WIFI — 中等链路 + 任硬解档 + 允许 1+ reorder
@@ -368,9 +368,11 @@ def match(snapshot: CapabilitySnapshot) -> PresetId:
         and net.rtt_p95_ns < 20_000_000):
         return STREAMING_WIFI
 
-    # WAN_FALLBACK — 公网或较高 loss
+    # WAN_FALLBACK — 公网链路 或 高 loss 兜底
+    # 注:loss_rate_short >= 0.03 (即 loss >= 3%) 即使 link_kind 为 LAN/未识别也兜底进 WAN_FALLBACK,
+    # 避免 STREAMING_WIFI / REALTIME_LAN 在高丢包链路上误命中导致 jitter target 不足以吸收。
     if (net.link_kind in {WAN_WIRED, WAN_WIRELESS}
-        or net.loss_rate_short < 0.03):
+        or net.loss_rate_short >= 0.03):
         return WAN_FALLBACK
 
     # SAFE_MODE — 任何探测失败或 hw.tier == LIBCODEC + 公网
@@ -404,18 +406,33 @@ def match(snapshot: CapabilitySnapshot) -> PresetId:
 | NVDEC + WAN（出差远程播放）| 不命中 SDI_REPLACEMENT / REALTIME_LAN，命中 STREAMING_WIFI 或 WAN_FALLBACK |
 | Intel UHD 730（命中 oneVPL）+ 60Hz 显示器 + LAN | 命中 REALTIME_LAN（不要求 240Hz；那是 SDI_REPLACEMENT 专属） |
 | MFT_HARDWARE 档 + LAN_SWITCHED | 命中 STREAMING_WIFI（MFT 协议 host 开销在 LAN 也无法逼到 SDI 档延时） |
+| LAN_SWITCHED + 高 loss（10%，如 Wi-Fi 同频干扰）| 命中 WAN_FALLBACK（§6.2 高 loss 兜底分支，jitter buffer 抬到 80ms）|
 | 任何 probe timeout / fail | 命中 SAFE_MODE（fail-open） |
 
 ---
 
 ## 7. PresetApply（一次性原子配置 6 个子系统）
 
-### 7.1 idempotent 契约
+### 7.1 idempotent 契约 + graceful degrade
 
-`apply(preset)` 必须满足：
+`apply(preset)` 必须满足三层保证：
 
-- 同一 `preset` 多次 apply 等价单次（实施时每个子系统按"目标态 vs 当前态"diff，无变化即跳过）；
-- apply 失败任一子系统 → **回滚** 已成功子系统到 BOOTSTRAP 默认；写 `mc.preset.apply_failure_count` 并降到 SAFE_MODE。
+1. **idempotent**：同一 `preset` 多次 apply 等价单次（实施时每个子系统按"目标态 vs 当前态"diff，无变化即跳过）。
+
+2. **graceful degrade（子系统级）**：apply 时每个子系统按"目标 → 次档 → BOOTSTRAP 默认"分级回退；即任一子系统 apply 失败时**不整体回滚**，而是退到该子系统的次档配置：
+   - **Decoder**：`vendor SDK ulMaxDisplayDelay=0` apply 失败 → 退到 driver 默认 reorder window
+   - **Jitter Buffer**：`ZeroJitter` 子系统未实装 / apply 失败 → 退到 `Kalman aggressive`（target 5ms）
+   - **Render Profile**：`ULTIMATE_DCOMP + NV12 直显` 试探失败（如 supports_dcomp_nv12_direct probe 时为 true 但 swapchain 创建时 driver 拒绝）→ 退到 `ULTIMATE_DCOMP + dual-bind shader`
+   - **Present 调度**：`race_to_display` 子系统未实装 → 退到 `vsync-aligned`
+   - **RTCP**：`Reduced-Size + AVPF Immediate` 协商失败 → 退到 `AVPF Immediate`（不带 Reduced-Size）
+   - **Frame Validity Gate**：永远不让步（ADR-014），无次档
+   每次子系统级回退上报 `mc.preset.apply_partial_count{subsystem, target_tier, actual_tier}` counter。
+
+3. **整体回滚（兜底）**：仅当**所有 6 个子系统都用 BOOTSTRAP 默认**仍 apply 失败（如 Frame Validity Gate 自身失败）才整体回滚到 SAFE_MODE，写 `mc.preset.apply_failure_count`。这是兜底路径，warm_steady 期间应永远 0。
+
+> **设计理由**：plan Phase 9.x 渐进 unlock 子系统能力（9.1 NV12 直显 / 9.2 Reduced-Size RTCP / 9.3 ZeroJitter / 9.4 race_to_display），中间阶段 SDI selector 已命中但子系统部分未实装。子系统级 graceful degrade 让"SDI 命中 + 部分子系统次档"路径合法存在；端到端延时介于 REALTIME_LAN 与完整 SDI 之间，符合 phase 渐进交付。整体回滚到 SAFE_MODE 仅作 ADR-014 正确性闸的最终兜底。
+
+> **对比 ADR-017 / ADR-020**：ADR-017 决策 capability-driven preset；ADR-020 决策运行期 reload。本节 graceful degrade 是 PresetApply 子系统的工程实施约束，不引入新决策——子系统次档配置仍是 §6.1 已有 preset 的子集，且回退方向只走"更保守"。
 
 ### 7.2 6 个子系统的 apply 方式
 
@@ -440,7 +457,7 @@ def match(snapshot: CapabilitySnapshot) -> PresetId:
 ### 8.1 状态机
 
 ```
-                         BOOTSTRAP
+                  BOOTSTRAP (REALTIME_LAN 实例,非独立第 6 档)
                               ↓ (probe complete)
                        ┌─→ ACTIVE ←─────────────┐
                        │     ↓                   │
@@ -516,6 +533,8 @@ Preset 升档**不会跨越 ADR-015 解码档位**：
 
 ## 9. 性能 metric（与性能量度规范对齐）
 
+> 字段定义权威源是 `mc-player_性能量度规范.md` §11（Preset 与 Probe 字段块）；本节作 design-detail 摘要,新增字段必须先回标性能规范再使用。
+
 按 `mc.<domain>.<metric>_<unit>` 命名约定：
 
 ```
@@ -527,11 +546,13 @@ mc.preset.downgrade_count                    counter
 mc.preset.upgrade_count                      counter
 mc.preset.oscillation_count                  gauge
 mc.preset.apply_atomic_violation_count       counter, 阈值 0
-mc.preset.apply_failure_count                counter, 阈值 0
+mc.preset.apply_partial_count                counter by {subsystem, target_tier, actual_tier}  // §7.1 graceful degrade
+mc.preset.apply_failure_count                counter, 阈值 0(整体回滚到 SAFE_MODE 兜底次数)
 
 mc.probe.hardware_complete_ms                histogram, p95 阈值 200
 mc.probe.network_complete_ms                 histogram, p95 阈值 1000
 mc.probe.encoder_complete_ms                 histogram, p95 阈值 1000
+mc.probe.render_complete_ms                  histogram, p95 阈值 50
 mc.probe.tier_skip_reason{tier}              counter by reason
 mc.probe.network_link_kind                   gauge enum
 mc.probe.encoder_source                      gauge enum  // {SDP_PROFILE_LEVEL_ID, SPS_VUI, FIRST_GOP_MEASURED}
@@ -556,12 +577,13 @@ mc.decoder.cuda_graph_active                 gauge bool (NVDEC only)
 
 | 用例 | 输入 snapshot | 预期 active_preset_id |
 |---|---|---|
-| best-case | NVDEC + LAN_SWITCHED RTT 0.3ms + 0 reorder + 240Hz VRR + DCOMP_INDEPENDENT_FLIP + render.supports_dcomp_nv12_direct=true | SDI_REPLACEMENT |
-| LAN-1080p | UHD 730 oneVPL + LAN_SWITCHED RTT 0.5ms + 0 reorder + 144Hz VRR | REALTIME_LAN |
-| LAN-with-B | NVDEC + LAN_SWITCHED + reorder=1 + 240Hz VRR | REALTIME_LAN（不命中 SDI 因有 B）|
-| Wi-Fi | NVDEC + LAN_WIFI RTT 4ms + 0 reorder + 144Hz | REALTIME_LAN（命中 LAN_WIFI 上限） |
+| best-case | NVDEC + LAN_SWITCHED RTT 0.3ms + 0 reorder + zerolatency_hint=true + render.profile=ULTIMATE_DCOMP + supports_dcomp_nv12_direct=true + primary_monitor_refresh_rate_hz=240 + vrr_enabled=true | SDI_REPLACEMENT |
+| LAN-1080p | UHD 730 oneVPL + LAN_SWITCHED RTT 0.5ms + 0 reorder + 144Hz VRR + render.profile=EXTREME | REALTIME_LAN |
+| LAN-with-B | NVDEC + LAN_SWITCHED + reorder=1 + 240Hz VRR + render.profile=ULTIMATE_DCOMP | REALTIME_LAN（不命中 SDI 因有 B）|
+| Wi-Fi | NVDEC + LAN_WIFI RTT 4ms + 0 reorder + 144Hz + render.profile=EXTREME | REALTIME_LAN（命中 LAN_WIFI 上限） |
 | WAN | NVDEC + WAN_WIRED RTT 30ms + 0 reorder | STREAMING_WIFI |
-| 公网高 loss | DXVA + WAN_WIRELESS RTT 80ms + loss 2% | WAN_FALLBACK |
+| 公网高 loss | DXVA + WAN_WIRELESS RTT 80ms + loss 5% | WAN_FALLBACK |
+| LAN 高 loss 兜底 | NVDEC + LAN_SWITCHED RTT 0.3ms + loss 10% | WAN_FALLBACK（§6.2 loss>=3% 兜底分支）|
 | probe timeout | 任 snapshot 字段 = invalid | SAFE_MODE |
 
 ### 10.2 集成测试（probe + selector + apply 全链路）
@@ -581,9 +603,9 @@ mc.decoder.cuda_graph_active                 gauge bool (NVDEC only)
 
 | 风险 | 对策 |
 |---|---|
-| Probe 期间首帧延时偏高（用户感知"刚启动卡 1 秒"）| BOOTSTRAP preset 用 REALTIME_LAN 保守版先播；probe 完成后 reload；用户视角"先有画再渐入低延时" |
+| Probe 期间首帧延时偏高（用户感知"刚启动卡 1 秒"）| BOOTSTRAP 阶段沿用 REALTIME_LAN preset 保守版先播（不是独立第 6 档,只是 §6.1 5 档之一的实例）；probe 完成后 reload；用户视角"先有画再渐入低延时" |
 | Encoder reorder 实测窗口太短误判 0 reorder | 实测 reorder_depth 在前 N 帧滑窗，N=20；之后改 reorder>0 时立即从 SDI_REPLACEMENT 降到 REALTIME_LAN |
-| 用户跨屏拖窗 → render profile 突变 | 跨屏属"假设破坏"事件，触发立即 reload；DCOMP_BEST_EFFORT 优雅切换 |
+| 用户跨屏拖窗 → render profile 突变 | 跨屏属"假设破坏"事件，触发立即 reload；PresetApply graceful degrade 退到 EXTREME 或 BALANCED 优雅切换 |
 | 升档振荡导致用户视觉抖动 | oscillation_guard 锁定机制；运维可在 stats 看到 lockout 状态 |
 | 三维 probe 之间数据竞态 | 每个 probe 独立线程；CapabilitySnapshot 聚合时用 atomic snapshot pattern（任一未到先用 BOOTSTRAP 默认） |
 | Preset 配置表与子系统能力 drift | `apply_failure_count` metric + 集成测试覆盖；任何 apply 失败回滚到 SAFE_MODE 不放过 |

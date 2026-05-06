@@ -4,7 +4,7 @@
 |---|---|
 | 文档类型 | 实施性 roadmap（不属于 ADD / ADR / 性能量度规范）|
 | 上游依据 | `doc/mc-player_架构设计文档_v3.0.md` / `doc/mc-player_ADR.md` / `doc/mc-player_性能量度规范.md` / `doc/mc-player_capability_probe_设计.md` / `doc/hardware-decode-dependencies.md` / `CLAUDE.md` |
-| 落地节奏 | 16 个阶段（Phase 0 ~ Phase 8 + Phase 9.0 ~ 9.5 + Phase 10），每阶段 = 一次 `git commit + push` |
+| 落地节奏 | 20 commit / 14 个 phase（Phase 0 ~ 7 单 commit；Phase 8 拆 8-A/B/C/D/E 共 5 commit；Phase 9 拆 9.0/9.1/9.2/9.3/9.4/9.5 共 6 commit；Phase 10 单 commit），每 commit = 一次 `git commit + push` |
 | 验收门槛 | 每阶段必须达到对应**性能量度规范字段阈值**才进入下一阶段；未达不 commit |
 | 不在范围 | 具体 API 头文件签名、cmake target 名、UI 面板视觉稿——这些在阶段实施时按需细化 |
 
@@ -42,7 +42,7 @@
 
 ### 0.4 测试基线
 
-- **回归基线流**：本仓库 `mc-player-dump.h265` + 一路 720p H.264 RTSP（参考 `hardware-decode-dependencies.md` §5）+ 一路 **4K H.265 RTSP（必测，Phase 4 / 5 / 6 / 7 强制 4K 验收）**。仓库应在 CI 工件区或测试目录提供 4K H.265 测试流（推荐使用 ITU-T HM 参考流或自录 4K 样本），缺失时阶段不予 commit。
+- **回归基线流**：本仓库 `mc-player-dump.h265` + 一路 720p H.264 RTSP（自行准备，可用 ffmpeg `-re -stream_loop -1` 推流到 mediamtx）+ 一路 **4K H.265 RTSP（必测，Phase 4 / 5 / 6 / 7 强制 4K 验收）**。仓库应在 CI 工件区或测试目录提供 4K H.265 测试流（推荐使用 ITU-T HM 参考流或自录 4K 样本），缺失时阶段不予 commit。**vs VLC 时钟差对照基线见 `hardware-decode-dependencies.md` §5**。
 - **VLC 对照**：每阶段实测时同一台机器同一路 RTSP 流并行播 mc-player 与 VLC，比时钟差。VLC 是事实基线（应用层管 DPB + D3D11VA），mc-player 偏差应稳定收敛到 ±2ms 以内（档 1 / 档 2 命中时）。
 - **平台覆盖**：开发机（Win11 IoT LTSC + Intel UHD 730）必测；CI 上 Win11 / Win10 22H2 / Win11 IoT LTSC 三档。
 
@@ -85,8 +85,8 @@
 | `mc.gate.drop_<bit>_count` | 六 bit 各自 counter 上报（即使值为 0） |
 | `mc.decoder.kind` | 上报为 enum 实际值（非 NONE）|
 | `mc.res.cpu_thread_t{2,4,5,6,7}_ratio` + `mc.res.cpu_process_ratio` | 全部 gauge 实时更新 |
-| ETW Provider GUID | 已申请；`logman query providers` 看得见 |
-| stats JSON dump 工具 | 跑 60 秒回归基线流后输出符合 schema 的 JSON |
+| ETW Provider GUID | 已申请；`tracelog -start mcp -guid #F8E1A0C2-7A3B-4C1F-9D2E-6B5A4F8C1234` 可抓取（self-describing TraceLogging provider 对 `logman query providers` 默认不可见，是 Windows ETW 已知行为；`mcp::pal::etw::is_registered()` 是源头自检） |
+| stats JSON dump 工具 | 跑 60 秒回归基线流后输出符合 schema 的 JSON；`mc_player_dump_stats --self_test` 退出码 0（含 9 段 timer + 6 bit gate counter + `etw_provider_registered=true` 三项 sanity check） |
 
 ### 0.4 commit 模板
 
@@ -124,8 +124,8 @@ before/after 对比（基线流 720p H.264 60 秒）：
 | 文件 | 动作 |
 |---|---|
 | `mc-player/include/mc-player/mc_player_types.h` | `mc_decoder_kind_t` 改 7 值（NONE / VENDOR_SDK_NVDEC / _ONEVPL / _AMF / DXVA_DIRECT / MFT_HARDWARE / LIBCODEC）；ABI version bump |
-| `mc-player/src/media/codec_mft_video.cpp` | `start()` 增加 `is_sync_software_mft_only()` 检测；只有 sync software 可用时返 `MC_ERR_NO_HARDWARE`；删除整段 sync_worker_loop（不再支持 sync 路径） |
-| `mc-player/src/media/codec_mft_video.h` | 删除 `is_sync_mft` 字段语义、`sync_worker_loop` 声明 |
+| `mc-player/src/media/codec_mft_video.cpp` | `start()` 增加 `is_sync_software_mft_only()` 检测；只有 sync software 可用时返 `MC_ERR_NO_HARDWARE`；删除"退路 2：sync MFT"分支（当前 .cpp:845 注释处）；删除 Impl 字段 `is_sync_mft`（当前 .cpp:124）|
+| `mc-player/src/media/codec_mft_video.h` | 公开 API 不变（Impl pimpl，sync 处理细节不暴露）；通过 ABI 不变保留接口稳定 |
 | `mc-player/src/controller/controller.cpp` | `start_decode_pipeline()` 改为按 ADR-015 顺序逐档尝试；每档失败上报 `mc.probe.tier_skip_reason`；选档结果上报 `mc.decoder.kind` |
 | `mc-player/src/media/codec_bridge.cpp` | `active_kind` 同步使用新枚举；删除 `MC_DECODER_MFT_SOFTWARE` 处理分支 |
 
@@ -139,15 +139,18 @@ before/after 对比（基线流 720p H.264 60 秒）：
 
 ### 1.3 验收 metric
 
+> **延时阈值松绑说明**：Phase 1 主要修复"sync software MFT 误当硬解"的正确性问题（`mc.decoder.kind` 不再误报）；档 4 mc-libcodec 软解延时性能取决于 §5.7.5 SIMD 实装进度,Phase 1 只**记录基线**不卡硬阈值。完整 ≤25ms (1080p H.264 档 4) 阈值由 mc-libcodec SIMD 完备后单独验收（不在 Phase 1 范围；可单列 Phase 1.5 或并入 Phase 4 验收）。
+
 | metric | 阈值（warm_steady） | 对比基线 |
 |---|---|---|
 | `mc.decoder.kind` | 720p H.264 IoT LTSC：`LIBCODEC`（不是 `MFT_SOFTWARE`） | 旧：错误的 `MFT_HARDWARE` 标签|
 | `mc.probe.tier_skip_reason{tier=3}` | 同环境出现 `sync_software_only` reason | 新增 |
-| `mc.e2e.client_internal_ns` p95 | ≤25ms（ADD §1.2，前提是 mc-libcodec SIMD 已达标） | 旧：~125ms（含 +100ms 误用 sync MFT 的延时）|
-| `mc.stage.decode_actual_ns` p95 | 档 4 软解：≤25ms | 新基线 |
-| 性能量度规范 `MFT_SOFTWARE` 字段 | 不再出现（已删除） | 旧：存在 |
+| `mc.e2e.client_internal_ns` p95 | **记录实测基线**（不卡阈值）；预期 ≤30ms（档 4 软解 + SIMD 已达标）/ 30~80ms（SIMD 未达标，作 Phase 5/6/7 vendor SDK 实装的对照线） | 旧：~125ms（含 +100ms 误用 sync MFT）|
+| `mc.stage.decode_actual_ns` p95 | 同上,**记录基线** | 新基线 |
+| `mc_decoder_kind_t` 中 `MC_DECODER_MFT_SOFTWARE` enum 值 | 已删除（ABI version bump）| 旧：存在 |
+| `mc.gate.drop_*_count` warm_steady | = 0（正确性闸不让步，§0.1 不变量第 1 条） | — |
 
-vs VLC 时钟差：从 +101ms → 取决于 mc-libcodec SIMD 实装，预期 +5~30ms（档 4 软解延时 baseline）。**不再有"被误用 sync MFT 的 +100ms"**。
+vs VLC 时钟差：从 +101ms → 取决于 mc-libcodec SIMD 实装。**核心达成**：不再有"被误用 sync MFT 的 +100ms"；`mc.decoder.kind` 真实反映档位。
 
 ### 1.4 已知风险
 
@@ -669,8 +672,8 @@ feat(phase-8-E): pal/log silent 默认 + HDCM 集成到 controller
 
 - 启动期完成四维 capability probe（hardware ∩ network ∩ encoder ∩ render）；输出 `CapabilitySnapshot`（ADD §7.5.1 时序;render 维度详见 capability_probe §3.5）。
 - Preset Selector 落地 5 档：SDI_REPLACEMENT / REALTIME_LAN / STREAMING_WIFI / WAN_FALLBACK / SAFE_MODE（capability_probe §6.2 匹配规则）。
-- 一次性 apply preset 到 6 个子系统（decoder / jitter / render / present / RTCP / gate），首帧前确定 active_preset。
-- **SDI_REPLACEMENT preset 主线降级行为**:Phase 9.0 内 SDI_REPLACEMENT 命中条件中"子目标 1-4 命中"以默认 false 返回（hardware/render probe 检出 supports_dcomp_nv12_direct=false / present 调度无 race_to_display 路径 / rtcp 无 reduced-size 协商 / jitter 无 ZeroJitter mode）;实际命中 SDI_REPLACEMENT 需 Phase 9.1-9.4 各自完成。Phase 9.0 实测稳态命中 REALTIME_LAN 为期望。
+- 一次性 apply preset 到 6 个子系统（decoder / jitter / render / present / RTCP / gate），首帧前确定 active_preset。Apply 走 capability_probe §7.1 "graceful degrade"——任一子系统未实装即退到该子系统次档配置 + 上报 `mc.preset.apply_partial_count`，不整体回滚。
+- **SDI_REPLACEMENT preset 主线行为**:Phase 9.0 内 `render_probe` **不试探** NV12 composition swapchain（`supports_dcomp_nv12_direct=false` 默认返回），SDI selector 不命中（capability_probe §6.2 SDI 触发条件硬性缺失）→ Phase 9.0 实测稳态命中 REALTIME_LAN。Phase 9.1 实装 NV12 试探后 SDI selector 可命中,但 PresetApply 在 9.2/9.3/9.4 未完成时按 §7.1 graceful degrade 把 rtcp / jitter / present 子系统退到次档配置（rtcp 退到 AVPF Immediate 不带 Reduced-Size / jitter 退到 Kalman aggressive / present 退到 vsync-aligned），上报 `mc.preset.apply_partial_count{subsystem=...}` 而不阻塞 SDI 命中。Phase 9.4 全部完成后 SDI apply 完整命中,端到端 ≤8ms 兑现（ADD §8.4）。
 
 #### 9.0.1 改动范围
 
@@ -698,15 +701,17 @@ feat(phase-8-E): pal/log silent 默认 + HDCM 集成到 controller
 
 | metric | 阈值 |
 |---|---|
-| `mc.preset.active_id` | 在 LAN + NVDEC + 240Hz VRR 测试机：稳定 = `REALTIME_LAN`（不到 SDI_REPLACEMENT,因 9.1-9.4 未做） |
-| `mc.preset.bootstrap_to_active_ms` | < 1500ms（首帧后第一次 reload 完成时间） |
-| `mc.probe.hardware_complete_ms` | < 200ms |
-| `mc.probe.network_complete_ms` | < 1000ms（首 GOP 到齐） |
-| `mc.probe.encoder_complete_ms` | < 1000ms（首 GOP 到齐） |
-| `mc.probe.render_complete_ms` | < 50ms（本地 DXGI / DCOMP 探测） |
+| `mc.preset.active_id` | LAN + NVDEC + 240Hz VRR 测试机：稳定 = `REALTIME_LAN`（9.1 前 SDI 触发条件 supports_dcomp_nv12_direct=false 不可达） |
+| `mc.preset.bootstrap_to_active_ms` | p95 < 1500ms（首帧后第一次 reload 完成时间） |
+| `mc.probe.hardware_complete_ms` | p95 < 200ms |
+| `mc.probe.network_complete_ms` | p95 < 1000ms（首 GOP 到齐） |
+| `mc.probe.encoder_complete_ms` | p95 < 1000ms（首 GOP 到齐） |
+| `mc.probe.render_complete_ms` | p95 < 50ms（本地 DXGI / DCOMP 探测） |
 | `mc.gate.drop_*_count` warm_steady | 0（preset 切换不能引发花屏；ADR-014 不让步） |
-| `mc.preset.apply_atomic_violation_count` | 0（apply 全程帧间缝隙完成，不丢帧） |
-| `mc.e2e.client_internal_p95` | LAN + NVDEC + 144Hz VRR REALTIME_LAN 命中 → ≤20ms |
+| `mc.preset.apply_atomic_violation_count` | 0 永久（apply 全程帧间缝隙完成，不丢帧） |
+| `mc.preset.apply_failure_count` | 0 永久（capability_probe §7.1 整体回滚到 SAFE_MODE 仅作兜底，warm_steady 期间 = 0）|
+| `mc.preset.apply_partial_count{subsystem=*}` | Phase 9.0 实测稳态 = 0（REALTIME_LAN preset 各子系统都有完整实装） |
+| `mc.e2e.client_internal_ns` p95 | LAN + NVDEC + 144Hz VRR REALTIME_LAN 命中 → ≤20ms |
 
 #### 9.0.4 commit 模板
 
@@ -736,34 +741,45 @@ before/after（NVIDIA + 240Hz VRR + LAN）：
 
 #### 9.1.0 目标
 
-composition swapchain `DXGI_FORMAT_NV12` + MPO 多面合成,绕过 shader RGB 转换。命中后让 SDI_REPLACEMENT preset 在 render 维度的硬性条件 `render.supports_dcomp_nv12_direct == true` 满足。
+composition swapchain `DXGI_FORMAT_NV12` + MPO 多面合成,绕过 shader RGB 转换。命中后让 SDI_REPLACEMENT preset 的 render 维度 capability `render.supports_dcomp_nv12_direct == true` 可达——SDI selector 在本 phase 完成后可命中（PresetApply 因 9.2/9.3/9.4 未完成时按 capability_probe §7.1 graceful degrade 退到次档子系统配置）。
 
 #### 9.1.1 改动范围
 
 | 文件 | 动作 |
 |---|---|
-| `mc-player/src/render/dcomp_swapchain.cpp` | swapchain DESC 的 Format 在 SDI_REPLACEMENT preset 下设 `DXGI_FORMAT_NV12`；探测 MPO planes 数 |
-| `mc-player/src/probe/render_probe.cpp` | 在 9.0 基础上补 supports_dcomp_nv12_direct 试探(尝试创建 NV12 composition swapchain) |
+| `mc-player/src/media/render_dcomp.cpp`（既有，扩展） | swapchain DESC 的 Format 在 SDI_REPLACEMENT preset 下设 `DXGI_FORMAT_NV12`；探测 MPO planes 数；新增 `mc.render.dcomp_nv12_direct_active` 上报 |
+| `mc-player/src/probe/render_probe.cpp`（9.0 新增） | 在 9.0 基础上补 supports_dcomp_nv12_direct 试探(尝试创建 NV12 composition swapchain) |
+| `mc-player/src/media/frame_validity_gate.{h,cpp}`（既有，扩展） | 按 active_preset 派生 6 bit strict 集合：SDI_REPLACEMENT preset 下 NV12 直显路径无 SRV 消费方 / 无 RGB shader → strict 集合**不含** color_meta_known / gpu_fence_signaled（capability_probe §6.3 + ADR-014 文末注解）；其他 preset 仍 6 bit 全 strict |
 
 #### 9.1.2 验收 metric
 
 | metric | 阈值 |
 |---|---|
-| `mc.render.dcomp_nv12_direct_active` | NVDEC + 240Hz VRR 路径下 = 1 |
-| `mc.preset.active_id` | 配合 9.2-9.4 完成后才能命中 SDI_REPLACEMENT;单 9.1 完成不影响命中 |
+| `mc.render.dcomp_nv12_direct_active` | NVDEC + 240Hz VRR + ULTIMATE_DCOMP 路径下 = 1 |
+| `mc.preset.active_id` | NVDEC + 240Hz VRR + LAN-switched 测试机：可命中 SDI_REPLACEMENT；但实际子系统配置部分降级（见 `apply_partial_count`），端到端延时介于 REALTIME_LAN 与 SDI 完整目标之间 |
+| `mc.preset.apply_partial_count{subsystem=rtcp,target_tier=reduced_size,actual_tier=avpf_immediate}` | 9.2 未完成期 ≥1（rtcp 子系统降级是 9.2 前的预期行为） |
+| `mc.preset.apply_partial_count{subsystem=jitter,target_tier=zerojitter,actual_tier=kalman_aggressive}` | 9.3 未完成期 ≥1 |
+| `mc.preset.apply_partial_count{subsystem=present,target_tier=race_to_display,actual_tier=vsync_aligned}` | 9.4 未完成期 ≥1 |
+| `mc.gate.drop_color_meta_known_count` | SDI_REPLACEMENT preset 下 = 0 永久（不参与决策）|
+| `mc.gate.drop_gpu_fence_signaled_count` | 同上 |
 
 #### 9.1.3 commit 模板
 
 ```
-feat(phase-9.1): DCOMP NV12 直显 + MPO 多面合成（子目标 1）
+feat(phase-9.1): DCOMP NV12 直显 + MPO 多面合成 + Gate 按 preset 派生 strict 集合（子目标 1）
 
-- render/dcomp_swapchain: SDI_REPLACEMENT preset 下 swapchain Format = DXGI_FORMAT_NV12
+- media/render_dcomp: SDI_REPLACEMENT preset 下 swapchain Format = DXGI_FORMAT_NV12
 - probe/render_probe: 试探创建 NV12 composition swapchain 输出 supports_dcomp_nv12_direct
-- 命中后 SDI_REPLACEMENT preset 在 render 维度的 supports_dcomp_nv12_direct 条件满足
+- media/frame_validity_gate: 按 active_preset 派生 6 bit strict 集合
+  · SDI_REPLACEMENT preset (NV12 直显路径) → strict ∋ {refs/params/recovery/reorder} \ {color/fence}
+  · 其他 preset → strict = 6 bit 全 strict（不变）
+- 命中后 SDI_REPLACEMENT selector 可触发；apply 因 9.2/9.3/9.4 未完成 graceful degrade 到 partial
 
-before/after（NVIDIA + 240Hz VRR + DCOMP_INDEPENDENT_FLIP）：
-- mc.render.dcomp_nv12_direct_active:    0 → 1
-- mc.gate.drop_*_count warm_steady:      0 → 0（不退化）
+before/after（NVIDIA RTX 3050 + 240Hz VRR + ULTIMATE_DCOMP）：
+- mc.render.dcomp_nv12_direct_active:                                0 → 1
+- mc.preset.active_id:                                  REALTIME_LAN → SDI_REPLACEMENT (partial)
+- mc.preset.apply_partial_count{subsystem=*}:                        0 → ≥3（rtcp/jitter/present 各 1）
+- mc.gate.drop_*_count warm_steady:                                  0 → 0（不退化；color/fence 在 SDI 路径下不参与判定）
 ```
 
 ---
@@ -772,32 +788,37 @@ before/after（NVIDIA + 240Hz VRR + DCOMP_INDEPENDENT_FLIP）：
 
 #### 9.2.0 目标
 
-RFC 5506 Reduced-Size RTCP 与 AVPF Immediate `trr-int=0` 协同减少反馈链路开销;协商位与对端确认。
+RFC 5506 Reduced-Size RTCP 与 AVPF Immediate `trr-int=0` 协同减少反馈链路开销;协商位与对端确认。命中后让 SDI_REPLACEMENT preset 的 rtcp 子系统 apply 路径可达 `Reduced-Size + AVPF Immediate`（PresetApply 不再 graceful degrade 该子系统）。
 
 #### 9.2.1 改动范围
 
 | 文件 | 动作 |
 |---|---|
-| `mc-player/src/transport/rtcp_*.cpp` | Reduced-Size RTCP 报文构造 + 接收方协商位 + SDP `a=rtcp-rsize` 协商 |
+| `mc-player/src/transport/rtcp.cpp`（既有，扩展） | Reduced-Size RTCP 报文构造 + 接收方协商位；新增 `mc.rtcp.reduced_size_active` 上报 |
+| `mc-player/src/transport/sdp_parser.cpp` / `rtsp_client.cpp`（既有，扩展） | SDP answer 增 `a=rtcp-rsize`；按对端能力降级到完整 RTCP |
+| `mc-player/src/preset/preset_apply.cpp`（9.0 新增，扩展） | rtcp 子系统 apply 接口尝试 Reduced-Size，失败时按 §7.1 graceful degrade 退到 AVPF Immediate（不带 Reduced-Size）|
 
 #### 9.2.2 验收 metric
 
 | metric | 阈值 |
 |---|---|
 | `mc.rtcp.reduced_size_active` | 与对端协商成功后 = 1 |
+| `mc.preset.apply_partial_count{subsystem=rtcp,target_tier=reduced_size,actual_tier=avpf_immediate}` | 对端支持 RFC 5506 时不再上报 |
+| `mc.gate.drop_*_count` warm_steady | 0（不退化） |
 
 #### 9.2.3 commit 模板
 
 ```
 feat(phase-9.2): RFC 5506 Reduced-Size RTCP（子目标 2）
 
-- transport/rtcp_*: Reduced-Size RTCP 报文构造 + 接收方协商位
-- 信令 SDP answer 增 a=rtcp-rsize；按对端能力降级到完整 RTCP
-- 命中后 SDI_REPLACEMENT preset 的 rtcp 维度满足 reduced_size + AVPF Immediate
+- transport/rtcp: Reduced-Size RTCP 报文构造 + 接收方协商位
+- transport/sdp_parser + rtsp_client: SDP answer 增 a=rtcp-rsize；按对端能力降级到完整 RTCP
+- preset/preset_apply: rtcp 子系统 apply 路径可达 Reduced-Size + AVPF Immediate；对端不支持时 graceful degrade 到 AVPF Immediate（不带 Reduced-Size）
 
 before/after（对端支持 RFC 5506）：
-- mc.rtcp.reduced_size_active:           0 → 1
-- mc.gate.drop_*_count warm_steady:      0 → 0（不退化）
+- mc.rtcp.reduced_size_active:                                          0 → 1
+- mc.preset.apply_partial_count{subsystem=rtcp}:                        ≥1 → 0（rtcp 子系统不再 partial）
+- mc.gate.drop_*_count warm_steady:                                     0 → 0（不退化）
 ```
 
 ---
@@ -806,13 +827,14 @@ before/after（对端支持 RFC 5506）：
 
 #### 9.3.0 目标
 
-LAN-switched 链路替代 Kalman aggressive。命中后让 SDI_REPLACEMENT preset 的 jitter buffer 子系统配置可达 `target_delay = 0~1ms`。
+LAN-switched 链路替代 Kalman aggressive。命中后让 SDI_REPLACEMENT preset 的 jitter buffer 子系统 apply 路径可达 `target_delay = 0~1ms`（PresetApply 不再 graceful degrade 该子系统）。
 
 #### 9.3.1 改动范围
 
 | 文件 | 动作 |
 |---|---|
-| `mc-player/src/media/jitter_buffer.cpp` | 增 ZeroJitter mode 分支；与 Kalman 共用接口;切换不丢帧（双缓冲交替读） |
+| `mc-player/src/media/jitter_buffer_video.cpp`（既有，扩展） | 增 ZeroJitter mode 分支；与 Kalman 共用接口;切换不丢帧（双缓冲交替读） |
+| `mc-player/src/preset/preset_apply.cpp`（9.0 新增，扩展） | jitter 子系统 apply 接口尝试 ZeroJitter，失败时按 §7.1 graceful degrade 退到 Kalman aggressive |
 
 #### 9.3.2 验收 metric
 
@@ -820,21 +842,23 @@ LAN-switched 链路替代 Kalman aggressive。命中后让 SDI_REPLACEMENT prese
 |---|---|
 | `mc.jitter.mode` | LAN-switched 链路 + SDI_REPLACEMENT preset 下 = `ZeroJitter` |
 | `mc.jitter.target_delay_ms` | LAN-switched 链路下 ≤ 1ms |
+| `mc.preset.apply_partial_count{subsystem=jitter,...}` | LAN-switched + SDI_REPLACEMENT 下不再上报 |
 
 #### 9.3.3 commit 模板
 
 ```
 feat(phase-9.3): ZeroJitter mode（子目标 3）
 
-- media/jitter_buffer: ZeroJitter mode 分支，与 Kalman 共用接口
+- media/jitter_buffer_video: ZeroJitter mode 分支，与 Kalman 共用接口
 - 双缓冲实现：reload 时新 mode 后台加热 → swap 指针 → 旧 buffer 排空 GC，不丢帧
-- LAN-switched 链路下 target_delay 0~1ms；SDI_REPLACEMENT preset 激活
-- 命中后 SDI_REPLACEMENT preset 的 jitter 维度满足
+- preset/preset_apply: jitter 子系统 apply 路径可达 ZeroJitter；非 LAN-switched 链路 graceful degrade 到 Kalman aggressive
+- LAN-switched 链路下 target_delay 0~1ms
 
 before/after（LAN-switched + 240Hz VRR + zerolatency 编码）：
-- mc.jitter.mode:                        Kalman → ZeroJitter
-- mc.jitter.target_delay_ms:             5ms    → 1ms
-- mc.gate.drop_*_count warm_steady:      0      → 0（不退化）
+- mc.jitter.mode:                                                       Kalman → ZeroJitter
+- mc.jitter.target_delay_ms:                                            5ms    → 1ms
+- mc.preset.apply_partial_count{subsystem=jitter}:                      ≥1 → 0
+- mc.gate.drop_*_count warm_steady:                                     0      → 0（不退化）
 ```
 
 ---
@@ -843,34 +867,37 @@ before/after（LAN-switched + 240Hz VRR + zerolatency 编码）：
 
 #### 9.4.0 目标
 
-Reflex 风格——一帧解码就绪即 Present,依赖 ALLOW_TEARING + VRR。命中后让 SDI_REPLACEMENT preset 的 present 子系统配置可达"零等待"。
+Reflex 风格——一帧解码就绪即 Present,依赖 ALLOW_TEARING + VRR。命中后让 SDI_REPLACEMENT preset 的 present 子系统 apply 路径可达"零等待"（PresetApply 不再 graceful degrade 该子系统）。
 
 #### 9.4.1 改动范围
 
 | 文件 | 动作 |
 |---|---|
-| `mc-player/src/render/present_scheduler.cpp` | race_to_display 模式 + ALLOW_TEARING flag 协同;SDI_REPLACEMENT 下激活 |
+| `mc-player/src/media/render_present_epoch.cpp`（既有，扩展） | race_to_display 模式 + ALLOW_TEARING flag 协同;SDI_REPLACEMENT 下激活；与 epoch + watchdog 协同 |
+| `mc-player/src/preset/preset_apply.cpp`（9.0 新增，扩展） | present 子系统 apply 接口尝试 race_to_display，失败时按 §7.1 graceful degrade 退到 vsync-aligned |
 
 #### 9.4.2 验收 metric
 
 | metric | 阈值 |
 |---|---|
 | `mc.present.race_to_display_active` | SDI_REPLACEMENT preset 下 = 1 |
+| `mc.preset.apply_partial_count{subsystem=present,...}` | VRR + ALLOW_TEARING 命中下不再上报 |
 
 #### 9.4.3 commit 模板
 
 ```
 feat(phase-9.4): Race-to-display Present（子目标 4）
 
-- render/present_scheduler: race_to_display 模式 + ALLOW_TEARING flag 协同
-- 一帧解码就绪即 Present；依赖 VRR + DCOMP_INDEPENDENT_FLIP；非 VRR 路径不激活
-- SDI_REPLACEMENT preset 下激活；其他 preset 走 vsync-aligned 调度
-- 命中后 SDI_REPLACEMENT preset 的 present 维度满足
+- media/render_present_epoch: race_to_display 模式 + ALLOW_TEARING flag 协同
+- 一帧解码就绪即 Present；依赖 VRR + render_profile == ULTIMATE_DCOMP；非 VRR 路径不激活
+- preset/preset_apply: present 子系统 apply 路径可达 race_to_display；非 VRR + ALLOW_TEARING 命中下 graceful degrade 到 vsync-aligned
+- 与 §5.10.5 Present Epoch 严格配对（race_to_display 与 epoch 同源升 + watchdog 不变量）
 
-before/after（240Hz VRR + ALLOW_TEARING）：
-- mc.present.race_to_display_active:     0 → 1
-- mc.gate.drop_*_count warm_steady:      0 → 0（不退化）
-- mc.render.epoch_pair_skew_count:       0 → 0（race_to_display 与 epoch 严格配对）
+before/after（240Hz VRR + ALLOW_TEARING + ULTIMATE_DCOMP）：
+- mc.present.race_to_display_active:                                    0 → 1
+- mc.preset.apply_partial_count{subsystem=present}:                     ≥1 → 0
+- mc.gate.drop_*_count warm_steady:                                     0 → 0（不退化）
+- mc.render.epoch_pair_skew_count:                                      0 → 0（不变量）
 ```
 
 ---
@@ -911,17 +938,30 @@ before/after（NVDEC + CUDA 12+）：
 
 ---
 
-### Phase 9.x SDI_REPLACEMENT 命中前提
+### Phase 9.x SDI_REPLACEMENT 命中 + apply 完整阶段图
 
-完成 9.0 + 9.1 + 9.2 + 9.3 + 9.4(子目标 5 可选) 后,在 NVDEC + 240Hz VRR + LAN-switched + zerolatency 编码 + DCOMP_INDEPENDENT_FLIP 测试机上,`mc.preset.active_id` 应稳定命中 `SDI_REPLACEMENT`,`mc.e2e.client_internal_p95` ≤ 8ms(ADD §8.4 SDI_REPLACEMENT 行,前提:子目标 1-4 全命中)。
+按 capability_probe §7.1 graceful degrade 设计，SDI_REPLACEMENT preset 的"selector 命中"与"apply 完整"分两阶段渐进 unlock：
+
+| 时点 | render.supports_dcomp_nv12_direct | rtcp/jitter/present 子系统能力 | SDI selector | SDI apply | active_preset_id 实测 | 端到端 p95 |
+|---|---|---|---|---|---|---|
+| 9.0 完成 | false（render_probe 默认）| 部分实装 | 不命中 | — | REALTIME_LAN | ≤20ms |
+| 9.1 完成 | true | rtcp/jitter/present 仍未实装 | 命中 | partial（3 子系统 graceful degrade）| SDI_REPLACEMENT (partial) | 介于 8~20ms |
+| 9.2 完成 | true | rtcp 实装；jitter/present 未实装 | 命中 | partial（2 子系统 graceful degrade）| SDI_REPLACEMENT (partial) | 介于 8~20ms |
+| 9.3 完成 | true | rtcp/jitter 实装；present 未实装 | 命中 | partial（1 子系统 graceful degrade）| SDI_REPLACEMENT (partial) | 介于 8~20ms |
+| 9.4 完成 | true | rtcp/jitter/present 全实装 | 命中 | full | SDI_REPLACEMENT | ≤8ms |
+| 9.5（NVDEC 可选） | true | 全实装 + CUDA Graphs | 命中 | full + CUDA Graphs | SDI_REPLACEMENT | ~6~7ms |
+
+> **核心识别**：SDI_REPLACEMENT selector 命中条件由 capability_probe §6.2 定义，仅看四维 capability（hardware/network/encoder/render）；不看子系统实装。子系统实装由 PresetApply graceful degrade 渐进 unlock，每个 phase 完成后 `mc.preset.apply_partial_count` 下降一项 → 端到端延时下降一档。这与 ADR-014 "正确性先于延时"完全相容——graceful degrade 始终保留正确性闸（refs/params/recovery/reorder bit 全 strict）。
 
 端到端验收：
 
 | metric | 阈值（按 ADD §8.4 SDI_REPLACEMENT 行） |
 |---|---|
-| `mc.e2e.client_internal_p95`（LAN + NVDEC + 240Hz VRR + zerolatency 编码 + 子目标 1-4 全命中） | ≤ 8ms |
-| `mc.e2e.client_internal_p95`（LAN + 任 vendor SDK / DXVA + 144Hz VRR） | ≤ 20ms |
-| `mc.e2e.client_internal_p95`（公网回退） | 不退化于 Phase 0 ~ 8 baseline |
+| `mc.e2e.client_internal_ns` p95（LAN + NVDEC + 240Hz VRR + zerolatency 编码 + 子目标 1-4 全命中） | ≤ 8ms |
+| `mc.e2e.client_internal_ns` p95（LAN + 任 vendor SDK / DXVA + 144Hz VRR） | ≤ 20ms |
+| `mc.e2e.client_internal_ns` p95（公网回退） | 不退化于 Phase 0 ~ 8 baseline |
+| `mc.preset.apply_partial_count` 总和 | 9.4 完成后 = 0 永久（warm_steady） |
+| `mc.preset.apply_failure_count` | = 0 永久（capability_probe §7.1 整体回滚仅作兜底） |
 
 > commit 模板按子 phase 分散到 §9.0.4 / §9.1.3 / §9.2.3 / §9.3.3 / §9.4.3 / §9.5.3 各自小节。本 §9.x 不再单独给 commit 模板（拆分前的旧合并模板已废弃）。
 
@@ -945,8 +985,8 @@ before/after（NVDEC + CUDA 12+）：
 | `mc-player/src/preset/live_reload.{h,cpp}`（新增）| 5 类降级信号订阅 + 降级动作派发；升级试探主循环（60s 窗口 telemetry 滑窗） |
 | `mc-player/src/preset/oscillation_guard.{h,cpp}`（新增）| `oscillation_count` 状态机：升档 → 30s 内再降 → count++；count >=2 锁定 5min 禁升 |
 | `mc-player/src/probe/network_probe.cpp` | 增 5s 滑窗版 `loss_rate_window_5s` / `rtt_p95_window_5s`，给 live_reload 订阅 |
-| `mc-player/src/render/present_epoch.cpp` | preset reload 视作 epoch 切换，commit 时升 epoch；旧 epoch frame 兜底丢弃 |
-| `mc-player/src/media/jitter_buffer.cpp` | 双缓冲实现（reload 时新 mode 后台加热，切换时 swap 指针，旧 buffer 排空后 GC） |
+| `mc-player/src/media/render_present_epoch.cpp`（既有，扩展） | preset reload 视作 epoch 切换，commit 时升 epoch；旧 epoch frame 兜底丢弃 |
+| `mc-player/src/media/jitter_buffer_video.cpp`（既有，扩展） | 双缓冲实现（reload 时新 mode 后台加热，切换时 swap 指针，旧 buffer 排空后 GC） |
 | `mc-player/src/media/codec_bridge.cpp` | decoder hint reload（NVDEC ulMaxDisplayDelay / oneVPL AsyncDepth / AMF REORDER_MODE）的 GOP-aligned 切换闸 |
 | `mc-player/src/transport/rtcp_sender.cpp` | RTCP mode reload（Reduced-Size on/off + AVPF Immediate / Regular 切换） |
 
@@ -999,7 +1039,7 @@ before/after（注入 loss 突增 → 恢复稳定 → 注入 rtt 突增）：
 | 项 | 状态 |
 |---|---|
 | ADR-015 四级降级链 | 全部实装；vendor SDK + DXVA-direct + MFT hardware + libcodec 全档可用 |
-| ADR-016 下载面板 | 实装；用户首次启动可选下载 vendor SDK |
+| ADR-016 + ADR-021 HDCM | 实装；7 类组件自动 detect + 三种 in-app 安装模式（A 下载 / B Store / C DISM helper / D 跳浏览器）|
 | ADR-017 Capability-Driven Preset 架构 | 四维 probe（hardware/network/encoder/render）+ 5 档 preset selector + 一次性 apply 到 6 子系统 |
 | ADR-018 Network Probe | rtt p50/p95/p99 + iat jitter + loss + link_kind 推断稳定 |
 | ADR-019 Encoder Probe | SDP profile-level-id + SPS VUI + 首 GOP 实测三档可信度 |
@@ -1035,7 +1075,8 @@ before/after（注入 loss 突增 → 恢复稳定 → 注入 rtt 突增）：
 | `frame_validity_gate.cpp::six_bits` | ADD §5.13 / ADR-014 |
 | `render_present_epoch.cpp::commit_authority` | ADD §5.10.5 / ADR-014 |
 | `pal/metric.cpp::Histogram` | 性能规范 §9.2 |
-| `sdk_panel/*` | ADR-016 / 性能规范 §6 sdk_cache_hit |
+| `hdcm/manifest_table.cpp` / `installer_a_vendor_sdk.cpp` / `installer_b_store.cpp` / `installer_c_feature.cpp` / `installer_d_driver.cpp` / `ui_panel.cpp` | ADR-016 + ADR-021 / hdcm 设计 §2 / 性能规范 §6.1 / §11.4 |
+| `tools/mc_hdcm_helper/` | ADR-021 类别 C / hdcm 设计 §4 helper IPC 协议 |
 | `probe/hardware_probe.cpp::HardwareSnapshot` | ADD §3.5 / ADR-017 / capability_probe 设计 §3 |
 | `probe/network_probe.cpp::NetworkSnapshot` | ADD §7.5.2 / ADR-018 / capability_probe 设计 §4 |
 | `probe/encoder_probe.cpp::EncoderSnapshot` | ADD §7.5.3 / ADR-019 / capability_probe 设计 §5 |

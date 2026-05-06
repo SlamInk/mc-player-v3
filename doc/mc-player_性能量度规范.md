@@ -525,6 +525,56 @@ ADD §5.13 末段已规定"每个 bit 累计 drop 计数 + 最近一次 drop 帧
 - `mc.hdcm.component{*}.state`：用户可选择不安装任何 HDCM 组件（ADR-021），不 fail；运维可定义"X 天 INSTALLABLE 状态长期未安装"提醒
 - `mc.hdcm.restart_pending{feature}`：类别 C 安装成功但用户未重启时长期为 1，不 fail；提示而非阻断
 
+### 11.4 Preset 与 Probe 字段（ADR-017 / ADR-018 / ADR-019 / ADR-020）
+
+> 本组字段定义对位 `mc-player_capability_probe_设计.md` §9 与 ADD §3.5 / §7.5；落地阶段对应 plan Phase 9.0 ~ 9.5 + Phase 10。design-detail 文档（capability_probe）与 plan 引用本节字段定义；新增字段需先在本节定义再用于其他文档。
+
+#### Preset 状态与切换
+
+| 字段 | 类型 | 含义 | 阈值（warm_steady） |
+|---|---|---|---|
+| `mc.preset.active_id` | gauge enum | 当前激活的 preset ∈ {`SDI_REPLACEMENT`, `REALTIME_LAN`, `STREAMING_WIFI`, `WAN_FALLBACK`, `SAFE_MODE`} | 与 capability 匹配（capability_probe §6.2） |
+| `mc.preset.bootstrap_to_active_ms` | histogram | mc_open → 第一次完整 preset apply 完成 | p95 ≤ 1500ms |
+| `mc.preset.reload_event{from,to,reason}` | counter | 每次 preset 切换事件 log（ADR-020） | — |
+| `mc.preset.reload_latency_ns` | histogram | reload 触发 → apply 完成 | p95 ≤ 5ms（ADD §7.5.5） |
+| `mc.preset.downgrade_count` | counter | 假设破坏触发的降档次数 | — |
+| `mc.preset.upgrade_count` | counter | 长期稳定试探触发的升档次数 | — |
+| `mc.preset.oscillation_count` | gauge | 升降振荡计数（≥2 锁定 5min；ADR-020 / capability_probe §8.3） | warm_steady ≤ 1 |
+| `mc.preset.apply_atomic_violation_count` | counter | reload 期间引发帧丢失（违反 capability_probe §8.4 原子性闸） | = 0 永久 |
+| `mc.preset.apply_partial_count{subsystem, target_tier, actual_tier}` | counter | 子系统 apply graceful degrade（capability_probe §7.1）；按 6 子系统 + 目标档位 + 实际档位拆 label | warm_steady 期 0；plan Phase 9.x 渐进 unlock 阶段允许非 0 |
+| `mc.preset.apply_failure_count` | counter | 整体回滚到 SAFE_MODE 兜底次数（仅当所有子系统都 BOOTSTRAP 默认仍失败） | = 0 永久 |
+
+#### 四维 Probe 完成时间
+
+| 字段 | 类型 | 含义 | 阈值 |
+|---|---|---|---|
+| `mc.probe.hardware_complete_ms` | histogram | DXGI 枚举 + CheckVideoDecoderProfile + vendor SDK 探测 | p95 ≤ 200ms |
+| `mc.probe.network_complete_ms` | histogram | RTT + iat jitter + loss + link_kind 推断（依赖首 GOP） | p95 ≤ 1000ms |
+| `mc.probe.encoder_complete_ms` | histogram | SDP profile-level-id + SPS VUI + 首 GOP 实测 | p95 ≤ 1000ms |
+| `mc.probe.render_complete_ms` | histogram | DXGI Output6 / DCOMP / EDID 本地查询 | p95 ≤ 50ms |
+| `mc.probe.network_link_kind` | gauge enum | 推断的链路类型 ∈ {LAN_SWITCHED, LAN_WIFI, WAN_WIRED, WAN_WIRELESS, UNKNOWN} | — |
+| `mc.probe.encoder_source` | gauge enum | 编码器特征采集源 ∈ {SDP_PROFILE_LEVEL_ID, SPS_VUI, FIRST_GOP_MEASURED} | 生产环境 SPS_VUI 占比应 > 60% |
+| `mc.probe.encoder_reorder_depth` | gauge | 实测 reorder depth | 0 / 1 / 2+ |
+
+#### 子系统能力实装位（plan Phase 9.x 渐进 unlock）
+
+| 字段 | 类型 | 含义 | 期望 |
+|---|---|---|---|
+| `mc.render.dcomp_nv12_direct_active` | gauge bool | composition swapchain `DXGI_FORMAT_NV12` + MPO 多面合成生效（plan Phase 9.1） | NVDEC + 240Hz VRR + ULTIMATE_DCOMP 路径 = 1 |
+| `mc.rtcp.reduced_size_active` | gauge bool | RFC 5506 Reduced-Size RTCP 与对端协商成功（plan Phase 9.2） | 对端支持时 = 1 |
+| `mc.jitter.mode` | gauge enum | jitter buffer 当前模式 ∈ {ZeroJitter, KalmanAggressive, KalmanNormal, KalmanSafe} | LAN-switched + SDI_REPLACEMENT = ZeroJitter（plan Phase 9.3） |
+| `mc.jitter.target_delay_ms` | gauge | jitter target | LAN-switched + ZeroJitter ≤ 1ms |
+| `mc.present.race_to_display_active` | gauge bool | race_to_display 调度激活（plan Phase 9.4，依赖 ALLOW_TEARING + VRR） | SDI_REPLACEMENT preset = 1 |
+| `mc.decoder.cuda_graph_active` | gauge bool | NVDEC CUDA Graphs 提交路径（plan Phase 9.5，仅 NVDEC 路径） | 实装成功 = 1；其他档位字段不上报 |
+
+#### 滑窗 telemetry（ADR-020 LiveReload 用）
+
+| 字段 | 类型 | 含义 | 阈值 |
+|---|---|---|---|
+| `mc.net.rtt_p95_window_5s_ns` | gauge | 5s 滑窗 RTT p95 | 由 `mc.preset.active_id` 上限决定 |
+| `mc.net.loss_rate_window_5s` | gauge | 5s 滑窗 loss rate | 同上 |
+| `mc.net.iat_jitter_ms` | gauge | 包间到达间隔标准差（即时） | 由 link_kind 决定 |
+
 ### 11.3 告警阈值（运维监控）
 
 | metric | warn | crit |
@@ -538,6 +588,9 @@ ADD §5.13 末段已规定"每个 bit 累计 drop 计数 + 最近一次 drop 帧
 | `mc.queue.{depack_to_codec, codec_to_render}.drop_oldest_count` rate | >0（极低深度队列，drop 即异常） | >0.5 Hz |
 | `mc.sync.av_offset_ns` `|x|` | >50ms 持续 | >100ms 持续 |
 | `mc.res.cpu_process_ratio` | 硬解 >12% / 软解 >25% | 硬解 >20% / 软解 >40% |
+| `mc.preset.oscillation_count` | ≥1 持续 >5min | ≥2（已锁定 5min 禁升） |
+| `mc.preset.apply_partial_count` rate | >0（单子系统降级；plan Phase 9.x 期允许）| 所有 6 子系统都降级 |
+| `mc.hdcm.install_attempt_count{result=helper_crashed}` rate | ≥1 / 天 | ≥1 / 小时 |
 
 ---
 
@@ -559,6 +612,8 @@ ADD §5.13 末段已规定"每个 bit 累计 drop 计数 + 最近一次 drop 帧
 | §7 渲染管线 | ADD §5.10 / ADR-008 / ADR-012 |
 | §8 错误恢复 | ADD §7.2 / ADR-013 |
 | §11.1 必达指标 | CLAUDE.md "v1 验收三条" + ADD §1.2 |
+| §11.4 Preset 与 Probe 字段 | ADR-017 ~ ADR-020 / ADD §3.5 / §7.5 / capability_probe §9 |
+| §6.1 HDCM | ADR-016 / ADR-021 / hdcm 设计 §6 |
 
 ---
 
@@ -662,6 +717,47 @@ mc.err.{device_lost_count,
   audio_device_change_count,
   codec_unrecoverable_count{tier},
   factory_recreate_count}            counter/hist   §8     ADD §7.2
+
+mc.hdcm.component{type,id}.state     gauge label    §6.1   ADR-021 / hdcm §6
+mc.hdcm.install_attempt_count
+  {type,id,result}                   counter        §6.1   ADR-021 / hdcm §6
+mc.hdcm.last_install_duration_ms
+  {type,id}                          gauge          §6.1   ADR-021 / hdcm §6
+mc.hdcm.restart_pending{feature}     gauge          §6.1   ADR-021 / hdcm §6
+mc.hdcm.driver_below_threshold
+  {vendor}                           gauge          §6.1   ADR-021 / hdcm §6
+
+mc.preset.active_id                  gauge enum     §11.4  ADR-017 / capability_probe §6
+mc.preset.bootstrap_to_active_ms     histogram      §11.4  capability_probe §9
+mc.preset.reload_event{from,to,
+  reason}                            counter        §11.4  ADR-020 / capability_probe §8
+mc.preset.reload_latency_ns          histogram      §11.4  ADD §7.5.5
+mc.preset.{downgrade_count,
+  upgrade_count,
+  oscillation_count}                 counter/gauge  §11.4  ADR-020 / capability_probe §8.3
+mc.preset.apply_atomic_violation_count counter      §11.4  capability_probe §8.4
+mc.preset.apply_partial_count
+  {subsystem,target_tier,
+   actual_tier}                      counter        §11.4  capability_probe §7.1
+mc.preset.apply_failure_count        counter        §11.4  capability_probe §7.1
+
+mc.probe.hardware_complete_ms        histogram      §11.4  capability_probe §3 / §9
+mc.probe.network_complete_ms         histogram      §11.4  capability_probe §4 / §9
+mc.probe.encoder_complete_ms         histogram      §11.4  capability_probe §5 / §9
+mc.probe.render_complete_ms          histogram      §11.4  capability_probe §3.5 / §9
+mc.probe.network_link_kind           gauge enum     §11.4  ADR-018 / ADD §7.5.2
+mc.probe.encoder_source              gauge enum     §11.4  ADR-019 / ADD §7.5.3
+mc.probe.encoder_reorder_depth       gauge          §11.4  ADD §7.5.3
+
+mc.net.rtt_p95_window_5s_ns          gauge          §11.4  ADR-018 / capability_probe §4.3
+mc.net.loss_rate_window_5s           gauge          §11.4  同上
+mc.net.iat_jitter_ms                 gauge          §11.4  同上
+
+mc.jitter.mode                       gauge enum     §11.4  capability_probe §6.1 jitter_mode 行
+mc.render.dcomp_nv12_direct_active   gauge bool     §11.4  plan Phase 9.1 / 子目标 1
+mc.rtcp.reduced_size_active          gauge bool     §11.4  plan Phase 9.2 / 子目标 2
+mc.present.race_to_display_active    gauge bool     §11.4  plan Phase 9.4 / 子目标 4
+mc.decoder.cuda_graph_active         gauge bool     §11.4  plan Phase 9.5 / 子目标 5
 ```
 
 ---
