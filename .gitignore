@@ -3,10 +3,14 @@ build/
 out/
 .vs/
 .vscode/
+.claude/
 CMakeUserPresets.json
 CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
+build.combined.log
+build.stderr.log
+build.stdout.log
 *.exp
 *.lib
 *.pdb

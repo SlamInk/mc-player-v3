@@ -78,6 +78,33 @@ public:
 
     [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
 
+    /// 本会话最高水位（性能量度规范 §3.4 `mc.queue.<name>.high_water_frames`）。
+    /// 由生产者侧在 try_push 后手动 record；不在 hot path 自动更新（避免每次推都一次 RMW）。
+    /// 调用方典型用法：
+    ///   if (q.try_push(x)) q.record_water_mark();
+    void record_water_mark() noexcept {
+        const std::size_t cur = approx_size();
+        std::size_t prev = high_water_.load(std::memory_order_relaxed);
+        while (cur > prev &&
+               !high_water_.compare_exchange_weak(prev, cur, std::memory_order_relaxed)) {
+            // retry
+        }
+    }
+
+    [[nodiscard]] std::size_t high_water() const noexcept {
+        return high_water_.load(std::memory_order_relaxed);
+    }
+
+    /// 累计"丢最老"次数（性能量度规范 §3.4 `mc.queue.<name>.drop_oldest_count`）。
+    /// 调用方应在执行 try_drop_oldest 后调 inc_drop_oldest（满时丢弃由调用方决定，本类只暴露计数器）。
+    void inc_drop_oldest() noexcept {
+        drop_oldest_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] uint64_t drop_oldest_count() const noexcept {
+        return drop_oldest_count_.load(std::memory_order_relaxed);
+    }
+
 private:
     const std::size_t capacity_;
     const std::size_t mask_;
@@ -85,8 +112,12 @@ private:
 
     alignas(kCacheLineSize) std::atomic<std::size_t> head_{0};
     alignas(kCacheLineSize) std::atomic<std::size_t> tail_{0};
+    // metric counter（独立 cache line，避免与 hot path head/tail false-sharing）。
+    alignas(kCacheLineSize) std::atomic<std::size_t> high_water_{0};
+    std::atomic<uint64_t>                            drop_oldest_count_{0};
     // 用末尾 padding 占据剩余 cache line，确保下一个 SpscQueue / 邻接结构独立。
-    char pad_tail_[kCacheLineSize - sizeof(std::atomic<std::size_t>)]{};
+    char pad_tail_[kCacheLineSize - sizeof(std::atomic<std::size_t>) -
+                   sizeof(std::atomic<uint64_t>)]{};
 };
 
 }  // namespace mcp::pal

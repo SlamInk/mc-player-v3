@@ -16,7 +16,9 @@
 #include "pal/clock.h"
 #include "pal/com_apartment.h"
 #include "pal/error.h"
+#include "pal/etw_provider.h"
 #include "pal/log.h"
+#include "pal/metric.h"
 #include "pal/mf_runtime.h"
 #include "pal/socket_iocp.h"
 
@@ -60,6 +62,8 @@ MC_API mc_status_t mc_global_init(const mc_init_options_t* options) {
         auto& g = global_state();
         if (g.refcount.fetch_add(1, std::memory_order_acq_rel) == 0) {
             mcp::pal::Clock::init();
+            // Phase 0：性能量度规范 §9.3 ETW Provider 注册（logman query providers mc-player 可见）。
+            mcp::pal::etw::register_provider();
 
             mcp::pal::LogConfig log_cfg;
             const char* log_file_path = nullptr;
@@ -110,6 +114,7 @@ MC_API mc_status_t mc_global_shutdown(void) {
             g.mf.reset();
             g.wsa.reset();
             g.com_main.reset();
+            mcp::pal::etw::unregister_provider();
             mcp::pal::log_attach_file(nullptr);
             if (g.log_file) {
                 std::fclose(g.log_file);

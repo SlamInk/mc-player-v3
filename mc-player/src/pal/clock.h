@@ -27,6 +27,10 @@ public:
     /// 当前时间戳，单位 ns。
     static int64_t now_ns() noexcept;
 
+    /// `now_ns()` 的别名（性能量度规范 §9.5 / plan Phase 0 §0.1）。
+    /// 命名对位 ETW + metric 调用习惯；与 `now_ns` 完全等价。
+    static int64_t qpc_now_ns() noexcept { return now_ns(); }
+
     /// 当前时间戳，单位 us。
     static int64_t now_us() noexcept;
 

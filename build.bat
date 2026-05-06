@@ -39,4 +39,6 @@ set "PATH=%VSROOT%\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%PATH%"
 if errorlevel 1 exit /b 1
 
 "%CMAKE_EXE%" --build "%BUILD_DIR%" --target mc_player_demo
+if errorlevel 1 exit /b 1
+"%CMAKE_EXE%" --build "%BUILD_DIR%" --target mc_player_dump_stats
 exit /b %errorlevel%

@@ -33,6 +33,11 @@ set(MCP_PAL_SOURCES
     src/pal/dxgi_caps_probe.h
     src/pal/dxgi_caps_probe.cpp
     src/pal/raii.h
+    # Phase 0 — 性能量度地基（性能量度规范 §9 / plan Phase 0）
+    src/pal/metric.h
+    src/pal/metric.cpp
+    src/pal/etw_provider.h
+    src/pal/etw_provider.cpp
 )
 
 set(MCP_TRANSPORT_SOURCES
@@ -178,3 +183,6 @@ if(MCP_ENABLE_LIBCODEC)
     target_compile_definitions(mc_player PRIVATE MCP_HAVE_LIBCODEC=1)
     target_link_libraries(mc_player PRIVATE mc_libcodec::mc_libcodec)
 endif()
+
+# Phase 0 — stats JSON dump 工具（plan §0.1 验收）。
+add_subdirectory(tools/dump_stats)
