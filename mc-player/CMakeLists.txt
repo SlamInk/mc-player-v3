@@ -109,6 +109,10 @@ set(MCP_MEDIA_SOURCES
     src/preset/preset_selector.cpp
     src/preset/preset_apply.h
     src/preset/preset_apply.cpp
+    src/preset/oscillation_guard.h
+    src/preset/oscillation_guard.cpp
+    src/preset/live_reload.h
+    src/preset/live_reload.cpp
     src/media/codec_amf.h
     src/media/codec_amf.cpp
     src/media/codec_nvdec.h
