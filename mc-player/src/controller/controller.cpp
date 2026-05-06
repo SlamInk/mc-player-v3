@@ -20,6 +20,7 @@
 
 #include "controller/adapter_picker.h"
 #include "media/audio_render_wasapi.h"
+#include "hdcm/detector.h"
 #include "media/codec_amf.h"
 #include "media/codec_dxva_video.h"
 #include "media/codec_nvdec.h"
@@ -1236,6 +1237,13 @@ void Controller::set_event_sink(EventSink sink) noexcept {
 }
 
 mc_status_t Controller::open(const mc_open_options_t& options) noexcept {
+    // Phase 8-E: HDCM batch detect 异步触发,不阻塞 mc_open 首帧路径(性能规范 §3)。
+    // adapter_vendor_id=0 让 detector 把所有类别 A 都标 unavailable_on_this_sku;
+    // 待 set_render_target 后 d3d_device 可用时再补做一次精确 detect。
+    std::thread([this] {
+        (void)hdcm::detect_all_components(/*adapter_vendor_id=*/0);
+    }).detach();
+
     std::scoped_lock lk{impl_->mu};
     return impl_->open_unlocked(options);
 }

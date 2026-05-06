@@ -48,12 +48,13 @@ const char* basename_of(const char* path) noexcept {
 
 const char* level_to_string(LogLevel level) noexcept {
     switch (level) {
-        case LogLevel::trace: return "TRACE";
-        case LogLevel::debug: return "DEBUG";
-        case LogLevel::info:  return "INFO";
-        case LogLevel::warn:  return "WARN";
-        case LogLevel::error: return "ERROR";
-        case LogLevel::fatal: return "FATAL";
+        case LogLevel::silent: return "SILENT";
+        case LogLevel::trace:  return "TRACE";
+        case LogLevel::debug:  return "DEBUG";
+        case LogLevel::info:   return "INFO";
+        case LogLevel::warn:   return "WARN";
+        case LogLevel::error:  return "ERROR";
+        case LogLevel::fatal:  return "FATAL";
     }
     return "?";
 }
@@ -108,6 +109,18 @@ void log_attach_file(FILE* fp) noexcept {
     auto& st = state();
     std::scoped_lock lk{st.mu};
     st.file_sink = fp;
+}
+
+void log_set_level(LogLevel new_level) noexcept {
+    auto& st = state();
+    std::scoped_lock lk{st.mu};
+    st.cfg.min_level = new_level;
+}
+
+LogLevel log_current_level() noexcept {
+    auto& st = state();
+    std::scoped_lock lk{st.mu};
+    return st.cfg.min_level;
 }
 
 void log_write(LogLevel level,

@@ -20,21 +20,28 @@
 namespace mcp::pal {
 
 enum class LogLevel : int {
-    trace = 0,
-    debug = 1,
-    info  = 2,
-    warn  = 3,
-    error = 4,
-    fatal = 5,
+    silent = -1,    // 默认(plan §8.E):仅 ETW;无 stderr / debugger / file 输出
+    trace  = 0,
+    debug  = 1,
+    info   = 2,
+    warn   = 3,
+    error  = 4,
+    fatal  = 5,
 };
 
 struct LogConfig {
+    // plan §8.E 默认 silent — 诊断时由 ui_panel 调高级别。
+    // 现状 (Phase 8-E 之前默认 info) 暂保留兼容性,实际部署可按需改 silent。
     LogLevel    min_level         = LogLevel::info;
     bool        enable_etw        = true;
     bool        log_to_debugger   = true;     // OutputDebugString 镜像
     bool        log_to_stderr     = true;     // 控制台镜像（便于联调）
     const char* ringbuf_dir       = nullptr;  // 非空时落盘
 };
+
+/// 运行期调级(ui_panel "诊断模式"按钮)。
+void log_set_level(LogLevel new_level) noexcept;
+[[nodiscard]] LogLevel log_current_level() noexcept;
 
 /// 进程级初始化。可重复调用，后续调用更新配置。
 void log_init(const LogConfig& cfg) noexcept;

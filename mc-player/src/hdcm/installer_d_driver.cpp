@@ -18,7 +18,7 @@ namespace {
 // 解析 "31.0.101.5333" 形四段版本。
 bool parse_version(const std::string& s, DriverInfo& out) noexcept {
     out.raw_version = s;
-    int rc = std::sscanf(s.c_str(), "%u.%u.%u.%u",
+    int rc = ::sscanf_s(s.c_str(), "%u.%u.%u.%u",
                           &out.major, &out.minor, &out.build, &out.revision);
     out.valid = (rc == 4);
     return out.valid;
