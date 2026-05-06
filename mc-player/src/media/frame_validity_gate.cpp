@@ -104,7 +104,12 @@ bool FrameValidityGate::admit(const VideoFrame& frame) noexcept {
         }
 
         // 2) 检查 frame 级 bit。任一缺失既计入对应 drop 桶，也使 gate 进入污染态。
-        const uint32_t missing = kValidityAll & ~frame.validity_mask;
+        // Phase 9.1: 按 active preset 派生 strict 集合;SDI_REPLACEMENT NV12 直显
+        // 路径下 color/fence bit 不参与判定(无 SRV 消费方 + 无 RGB shader)。
+        uint32_t strict_mask = kValidityAll;
+        if (!strict_color_.load(std::memory_order_acquire)) strict_mask &= ~kValidityColor;
+        if (!strict_fence_.load(std::memory_order_acquire)) strict_mask &= ~kValidityFence;
+        const uint32_t missing = strict_mask & ~frame.validity_mask;
         if (missing != 0) {
             if (!poisoned_) {
                 poisoned_      = true;
@@ -167,6 +172,14 @@ void FrameValidityGate::mark_poisoned(mc_gate_poison_source_t source) noexcept {
 bool FrameValidityGate::is_poisoned() const noexcept {
     std::lock_guard<std::mutex> lk{mu_};
     return poisoned_;
+}
+
+void FrameValidityGate::set_strict_color_fence(bool color_strict, bool fence_strict) noexcept {
+    strict_color_.store(color_strict, std::memory_order_release);
+    strict_fence_.store(fence_strict, std::memory_order_release);
+    MCP_LOGF(pal::LogLevel::info,
+             "FrameValidityGate: strict_color=%d strict_fence=%d (per active preset)",
+             color_strict, fence_strict);
 }
 
 void FrameValidityGate::record_drop_locked(uint32_t missing_mask, int64_t pts_us) noexcept {

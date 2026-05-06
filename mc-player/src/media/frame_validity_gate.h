@@ -63,6 +63,12 @@ public:
     /// 当前是否处于污染态（仅诊断；状态机内部读由 admit 持锁完成）。
     [[nodiscard]] bool is_poisoned() const noexcept;
 
+    /// 按 active preset 派生 6 bit strict 集合(plan §9.1 / capability_probe §6.3 +
+    /// ADR-014 文末注解)。SDI_REPLACEMENT preset 的 NV12 直显路径无 SRV 消费方 +
+    /// 无 RGB shader → strict 集合不含 color_meta_known / gpu_fence_signaled。
+    /// 其他 preset 仍 6 bit 全 strict(默认)。
+    void set_strict_color_fence(bool color_strict, bool fence_strict) noexcept;
+
 private:
     void record_drop_locked(uint32_t missing_mask, int64_t pts_us) noexcept;
     static mc_gate_poison_source_t pick_source_from_mask(uint32_t missing_mask) noexcept;
@@ -85,6 +91,11 @@ private:
 
     std::atomic<uint64_t>       poison_enter_count_{0};
     std::atomic<uint64_t>       poison_drops_{0};
+
+    // Phase 9.1: SDI_REPLACEMENT NV12 直显路径下 color/fence bit 不参与 strict 判定。
+    // 默认 true 保持 ADR-014 严格 6 bit;SDI preset 命中后 set_strict_color_fence(false, false)。
+    std::atomic<bool>           strict_color_{true};
+    std::atomic<bool>           strict_fence_{true};
 };
 
 }  // namespace mcp::media
