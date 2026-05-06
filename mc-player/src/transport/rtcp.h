@@ -87,6 +87,18 @@ public:
                                   std::span<uint8_t> out) noexcept;
 };
 
+// Phase 9.2: RFC 5506 Reduced-Size RTCP 协商位 + 上报。
+//   SDP answer 增 a=rtcp-rsize;对端确认后此 flag = true,
+//   后续构造的 RTCP 包可省 SR/RR header 容器,仅含 RTPFB/PSFB(节省 16~28 字节/包)。
+//   与 AVPF Immediate trr-int=0(RFC 4585)协同减少反馈链路开销。
+//   对端不支持时 graceful degrade 到 AVPF Immediate 不带 Reduced-Size。
+namespace reduced_size {
+
+void set_active(bool active) noexcept;
+[[nodiscard]] bool is_active() noexcept;
+
+}  // namespace reduced_size
+
 }  // namespace mcp::transport
 
 #endif  // MC_PLAYER_TRANSPORT_RTCP_H_

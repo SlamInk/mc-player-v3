@@ -1,6 +1,9 @@
 #include "transport/rtcp.h"
 
+#include <atomic>
 #include <cstring>
+
+#include "pal/metric.h"
 
 namespace mcp::transport {
 
@@ -209,5 +212,24 @@ std::size_t RtcpWriter::write_pli(uint32_t sender_ssrc, uint32_t media_ssrc,
     write_be32(p + 8, media_ssrc);
     return kPliBytes;
 }
+
+// Phase 9.2: RFC 5506 Reduced-Size RTCP 协商位。
+namespace reduced_size {
+
+namespace {
+std::atomic<bool> g_active{false};
+}
+
+void set_active(bool active) noexcept {
+    g_active.store(active, std::memory_order_release);
+    mcp::pal::metric::Registry::instance().gauge("mc.rtcp.reduced_size_active")
+        .set(active ? 1 : 0);
+}
+
+bool is_active() noexcept {
+    return g_active.load(std::memory_order_acquire);
+}
+
+}  // namespace reduced_size
 
 }  // namespace mcp::transport
