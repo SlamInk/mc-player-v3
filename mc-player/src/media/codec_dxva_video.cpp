@@ -12,11 +12,13 @@
 #include <climits>
 #include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <vector>
 
+#include "media/dxva_h264.h"
 #include "pal/cache_line.h"
 #include "pal/error.h"
 #include "pal/log.h"
@@ -32,6 +34,11 @@ namespace {
 // HEVC Main profile decoder GUID（与 dxgi_caps_probe 中一致）。
 DEFINE_GUID(MCP_DXVA_HEVC_MAIN,
     0x5b11d51b, 0x2f4c, 0x4452, 0xbc, 0xc3, 0x09, 0xf2, 0xa1, 0x16, 0x0c, 0xc0);
+
+// H.264 VLD NoFGT (Microsoft DXVA2 H.264 模式 E)。所有 H.264 4:2:0 8-bit 流通行
+// 的硬件解码 profile,IPC 摄像机均覆盖（Baseline / Main / High 适用）。
+DEFINE_GUID(MCP_DXVA_H264_VLD_NoFGT,
+    0x1b81bea3, 0xa0c7, 0x11d3, 0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5);
 
 constexpr uint8_t kNalTrailN     = 0;
 constexpr uint8_t kNalIdrWRadl   = 19;
@@ -544,6 +551,21 @@ struct CodecDxvaVideo::Impl {
 
     std::vector<uint8_t>                 scratch_rbsp;
 
+    // ─── H.264 路径状态（与 HEVC 并列，仅 cfg.codec==H264 路径访问）────
+    bool                                       is_h264 = false;
+    std::unordered_map<uint8_t, h264::Sps>    h264_sps;
+    std::unordered_map<uint8_t, h264::Pps>    h264_pps;
+    h264::PocState                             h264_poc{};
+    h264::Sps*                                 cur_h264_sps  = nullptr;
+    h264::Pps*                                 cur_h264_pps  = nullptr;
+    std::vector<DXVA_Slice_H264_Short>         h264_slice_ctrl;
+    // ref list（newest first）；进入 flush 时按 IPC 单/多 ref 推导 RefFrameList 输入。
+    // 维护规则：解码完一张 nal_ref_idc!=0 帧后 push_front,size > num_ref_frames 弹尾。
+    std::deque<h264::RefPic>                   h264_ref_list;
+    uint32_t                                   cur_h264_frame_num   = 0;
+    uint8_t                                    cur_h264_nal_ref_idc = 0;
+    uint16_t                                   h264_status_report_id = 0;
+
     // ─── T4-DXVA worker（ADD §3.3）─────────────────────────────────
     // 原版 submit 同步在 RX (T2) 线程跑 NAL 解析 + DPB 管理 + DXVA EndFrame，
     // 占用 TIME_CRITICAL + P-core 的 socket 线程几 ms，期间 socket 内核缓冲堆积。
@@ -574,11 +596,11 @@ struct CodecDxvaVideo::Impl {
         return ctx.As(&video_ctx);
     }
 
-    HRESULT pick_decoder_config(const Sps& s) noexcept {
+    HRESULT pick_decoder_config(UINT w, UINT h) noexcept {
         D3D11_VIDEO_DECODER_DESC desc{};
         desc.Guid         = profile;
-        desc.SampleWidth  = s.pic_width_in_luma_samples;
-        desc.SampleHeight = s.pic_height_in_luma_samples;
+        desc.SampleWidth  = w;
+        desc.SampleHeight = h;
         desc.OutputFormat = DXGI_FORMAT_NV12;
         UINT n = 0;
         HRESULT hr = video_device->GetVideoDecoderConfigCount(&desc, &n);
@@ -599,7 +621,8 @@ struct CodecDxvaVideo::Impl {
 
     HRESULT init_decoder(const Sps& s) noexcept {
         if (decoder_inited) return S_OK;
-        HRESULT hr = pick_decoder_config(s);
+        HRESULT hr = pick_decoder_config(s.pic_width_in_luma_samples,
+                                          s.pic_height_in_luma_samples);
         if (FAILED(hr)) {
             MCP_LOGF(pal::LogLevel::error,
                      "CodecDxvaVideo: GetVideoDecoderConfig failed hr=0x%08lX", hr);
@@ -1114,6 +1137,379 @@ struct CodecDxvaVideo::Impl {
         prev_poc_lsb     = 0;
         last_ref_dpb_idx = UINT_MAX;
         last_ref_poc     = 0;
+
+        // H.264 路径状态同步重置（idr 出现时也会被显式 reset，但 flush() 走这条路径）。
+        h264_poc          = h264::PocState{};
+        h264_ref_list.clear();
+        cur_h264_sps      = nullptr;
+        cur_h264_pps      = nullptr;
+    }
+
+    // ─── H.264 路径 ───────────────────────────────────────────────
+    // 与 HEVC 路径并列，结构对齐：init_decoder_h264 → on_au_h264 →
+    //   per-slice 解析与 bitstream 累积 → AU 末 flush_pending_pic_h264。
+
+    HRESULT init_decoder_h264(const h264::Sps& s) noexcept {
+        if (decoder_inited) return S_OK;
+        HRESULT hr = pick_decoder_config(s.pic_width_in_samples_l,
+                                          s.pic_height_in_samples_l);
+        if (FAILED(hr)) {
+            MCP_LOGF(pal::LogLevel::error,
+                     "CodecDxvaVideo: H.264 GetVideoDecoderConfig failed hr=0x%08lX", hr);
+            return hr;
+        }
+        D3D11_VIDEO_DECODER_DESC desc{};
+        desc.Guid         = profile;
+        desc.SampleWidth  = s.pic_width_in_samples_l;
+        desc.SampleHeight = s.pic_height_in_samples_l;
+        desc.OutputFormat = DXGI_FORMAT_NV12;
+        hr = video_device->CreateVideoDecoder(&desc, &cfg_used, &decoder);
+        if (FAILED(hr)) {
+            MCP_LOGF(pal::LogLevel::error,
+                     "CodecDxvaVideo: H.264 CreateVideoDecoder failed hr=0x%08lX", hr);
+            return hr;
+        }
+        dec_w = s.pic_width_in_samples_l;
+        dec_h = s.pic_height_in_samples_l;
+        // DPB 大小：num_ref_frames + 1 (current) + 余量；下界 4，上界 20，匹配 driver 需求。
+        dpb_size = std::max<UINT>(static_cast<UINT>(s.num_ref_frames) + 2u, 4u);
+        if (cfg_used.ConfigMinRenderTargetBuffCount > dpb_size) {
+            dpb_size = cfg_used.ConfigMinRenderTargetBuffCount;
+        }
+        if (dpb_size > 20) dpb_size = 20;
+
+        const UINT tex_w = (dec_w + 1u) & ~1u;
+        const UINT tex_h = (dec_h + 1u) & ~1u;
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = tex_w; td.Height = tex_h;
+        td.MipLevels = 1; td.ArraySize = dpb_size;
+        td.Format = DXGI_FORMAT_NV12;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_DECODER;
+        hr = cfg.device->CreateTexture2D(&td, nullptr, &dpb_tex);
+        if (FAILED(hr)) {
+            MCP_LOGF(pal::LogLevel::error,
+                     "CodecDxvaVideo: H.264 DPB CreateTexture2D failed hr=0x%08lX %ux%u arr=%u",
+                     hr, tex_w, tex_h, dpb_size);
+            return hr;
+        }
+        dpb_views.resize(dpb_size);
+        for (UINT i = 0; i < dpb_size; ++i) {
+            D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC vd{};
+            vd.DecodeProfile        = profile;
+            vd.ViewDimension        = D3D11_VDOV_DIMENSION_TEXTURE2D;
+            vd.Texture2D.ArraySlice = i;
+            hr = video_device->CreateVideoDecoderOutputView(
+                    dpb_tex.Get(), &vd, &dpb_views[i]);
+            if (FAILED(hr)) {
+                MCP_LOGF(pal::LogLevel::error,
+                         "CodecDxvaVideo: H.264 CreateVideoDecoderOutputView slice=%u hr=0x%08lX",
+                         i, hr);
+                return hr;
+            }
+        }
+        dpb.assign(dpb_size, DpbEntry{});
+
+        // out_pool — 与 HEVC 路径同样三档兜底。
+        out_pool_array_capable = true;
+        D3D11_TEXTURE2D_DESC ot = td;
+        ot.ArraySize = out_pool_size;
+        ot.BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
+        bool ok = try_create_out_pool(ot);
+        if (!ok) {
+            ot = td; ot.ArraySize = out_pool_size; ot.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            ok = try_create_out_pool(ot);
+        }
+        if (!ok) {
+            out_pool_size = 1; out_pool_array_capable = false;
+            ot = td; ot.ArraySize = 1; ot.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            ok = try_create_out_pool(ot);
+        }
+        if (!ok) {
+            MCP_LOGF(pal::LogLevel::error,
+                     "CodecDxvaVideo: H.264 out_pool 全部 fallback 失败 %ux%u", tex_w, tex_h);
+            return E_FAIL;
+        }
+
+        decoder_inited = true;
+        MCP_LOGF(pal::LogLevel::info,
+                 "CodecDxvaVideo: H.264 decoder ready %ux%u dpb=%u (Annex-B raw=%u, profile=%u)",
+                 dec_w, dec_h, dpb_size, cfg_bitstream_raw, cur_h264_sps ? cur_h264_sps->profile_idc : 0);
+        return S_OK;
+    }
+
+    bool flush_pending_pic_h264() noexcept {
+        if (!has_pic || !decoder || !cur_h264_sps || !cur_h264_pps) {
+            has_pic = false;
+            return false;
+        }
+        ++pic_count;
+        const bool trace_first = pic_count <= 3;
+        if (trace_first) {
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecDxvaVideo: H.264 flush#%u nal=%u poc=%d dpb=%u slices=%zu bs_bytes=%zu fnum=%u refs=%zu",
+                     pic_count, cur_nal_type, cur_poc, cur_dpb_idx,
+                     h264_slice_ctrl.size(), bitstream_buf.size(),
+                     cur_h264_frame_num, h264_ref_list.size());
+        }
+
+        // 把 deque 转 contiguous span 给 fill_pic_params（最多 16 ref）。
+        std::array<h264::RefPic, 16> refs_arr{};
+        std::size_t                    n_refs = 0;
+        for (const auto& r : h264_ref_list) {
+            if (n_refs >= refs_arr.size()) break;
+            refs_arr[n_refs++] = r;
+        }
+        ++h264_status_report_id;
+        if (h264_status_report_id == 0) h264_status_report_id = 1;
+        DXVA_PicParams_H264 pp{};
+        h264::fill_pic_params(pp, *cur_h264_sps, *cur_h264_pps,
+                                /*sh=*/h264::SliceHdr{ /*first_mb_in_slice=*/0,
+                                                        /*slice_type=*/0,
+                                                        /*pps_id=*/cur_h264_pps->id,
+                                                        /*colour_plane_id=*/0,
+                                                        /*frame_num=*/cur_h264_frame_num,
+                                                        /*field_pic_flag=*/0,
+                                                        /*bottom_field_flag=*/0,
+                                                        /*idr_pic_id=*/0,
+                                                        /*pic_order_cnt_lsb=*/0,
+                                                        /*delta_pic_order_cnt_bottom=*/0,
+                                                        {},
+                                                        true},
+                                cur_nal_type, cur_h264_nal_ref_idc,
+                                cur_dpb_idx, cur_poc, cur_h264_frame_num,
+                                std::span<const h264::RefPic>{refs_arr.data(), n_refs},
+                                h264_status_report_id);
+
+        HRESULT hr = video_ctx->DecoderBeginFrame(decoder.Get(),
+                                                    dpb_views[cur_dpb_idx].Get(),
+                                                    0, nullptr);
+        if (FAILED(hr)) {
+            MCP_LOGF(pal::LogLevel::warn,
+                     "CodecDxvaVideo: H.264 DecoderBeginFrame hr=0x%08lX", hr);
+            has_pic = false;
+            return false;
+        }
+
+        auto submit_buffer = [&](D3D11_VIDEO_DECODER_BUFFER_TYPE type,
+                                  const void* src, std::size_t bytes) noexcept -> bool {
+            UINT  buf_size = 0;
+            void* buf_ptr  = nullptr;
+            if (FAILED(video_ctx->GetDecoderBuffer(decoder.Get(), type, &buf_size, &buf_ptr))) return false;
+            if (bytes > buf_size) {
+                video_ctx->ReleaseDecoderBuffer(decoder.Get(), type);
+                return false;
+            }
+            std::memcpy(buf_ptr, src, bytes);
+            return SUCCEEDED(video_ctx->ReleaseDecoderBuffer(decoder.Get(), type));
+        };
+
+        const bool ok_pp = submit_buffer(D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS,
+                                          &pp, sizeof(pp));
+        const bool ok_sc = submit_buffer(D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL,
+                                          h264_slice_ctrl.data(),
+                                          h264_slice_ctrl.size() * sizeof(DXVA_Slice_H264_Short));
+        const bool ok_bs = submit_buffer(D3D11_VIDEO_DECODER_BUFFER_BITSTREAM,
+                                          bitstream_buf.data(), bitstream_buf.size());
+
+        if (ok_pp && ok_sc && ok_bs) {
+            D3D11_VIDEO_DECODER_BUFFER_DESC bd[3]{};
+            bd[0].BufferType = D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS;
+            bd[0].DataSize   = sizeof(pp);
+            bd[1].BufferType = D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL;
+            bd[1].DataSize   = static_cast<UINT>(h264_slice_ctrl.size() * sizeof(DXVA_Slice_H264_Short));
+            bd[2].BufferType = D3D11_VIDEO_DECODER_BUFFER_BITSTREAM;
+            bd[2].DataSize   = static_cast<UINT>(bitstream_buf.size());
+            hr = video_ctx->SubmitDecoderBuffers(decoder.Get(), 3, bd);
+            if (FAILED(hr)) {
+                MCP_LOGF(pal::LogLevel::warn,
+                         "CodecDxvaVideo: H.264 SubmitDecoderBuffers hr=0x%08lX", hr);
+            }
+        } else {
+            MCP_LOGF(pal::LogLevel::warn,
+                     "CodecDxvaVideo: H.264 GetDecoderBuffer/Release failed (pp=%d sc=%d bs=%d)",
+                     ok_pp, ok_sc, ok_bs);
+        }
+
+        hr = video_ctx->DecoderEndFrame(decoder.Get());
+        if (FAILED(hr)) {
+            MCP_LOGF(pal::LogLevel::warn,
+                     "CodecDxvaVideo: H.264 DecoderEndFrame hr=0x%08lX", hr);
+        }
+
+        // 标记 DPB 槽
+        dpb[cur_dpb_idx].used = true;
+        dpb[cur_dpb_idx].poc  = cur_poc;
+        dpb[cur_dpb_idx].output_pending = true;
+
+        const UINT out_slice = out_pool_array_capable ? out_next : 0;
+        if (out_pool_array_capable) {
+            out_next = (out_next + 1) % out_pool_size;
+        }
+        ctx->CopySubresourceRegion(out_pool.Get(), out_slice, 0, 0, 0,
+                                    dpb_tex.Get(), cur_dpb_idx, nullptr);
+
+        // emit
+        VideoFrame f;
+        f.pts_us           = cur_pts_us;
+        f.arrival_qpc_ns   = cur_arrival_qpc_ns;
+        f.width            = dec_w;
+        f.height           = dec_h;
+        f.source           = FrameSource::mft_dxva;
+        f.dxva_texture     = out_pool;
+        f.dxva_array_slice = out_slice;
+        f.is_keyframe      = h264::is_idr(cur_nal_type);
+        f.color_primaries  = cur_h264_sps->colour_description_present_flag ?
+                              static_cast<mc_color_primaries_t>(cur_h264_sps->colour_primaries) :
+                              MC_COLOR_PRIMARIES_BT709;
+        f.color_matrix     = cur_h264_sps->colour_description_present_flag ?
+                              static_cast<mc_color_matrix_t>(cur_h264_sps->matrix_coefficients) :
+                              MC_COLOR_MATRIX_BT709;
+        f.color_range      = cur_h264_sps->video_full_range_flag ? MC_COLOR_RANGE_FULL : MC_COLOR_RANGE_LIMITED;
+        const bool idr_now    = h264::is_idr(cur_nal_type);
+        const bool refs_armed = idr_now || !h264_ref_list.empty();
+        uint32_t mask = kValidityParams | kValidityColor | kValidityReorder | kValidityFence;
+        if (refs_armed) mask |= kValidityRefs | kValidityRecovery;
+        f.validity_mask = mask;
+        if (emit_count == 0) {
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecDxvaVideo: H.264 first frame emit pts=%lld slice=%u poc=%d fnum=%u",
+                     static_cast<long long>(cur_pts_us), out_slice, cur_poc, cur_h264_frame_num);
+        }
+        if (cfg.emit) cfg.emit(std::move(f));
+        ++emit_count;
+
+        // 更新 ref list：当前为 reference frame (nal_ref_idc!=0) 才入栈，IDR 时清空整条链。
+        if (idr_now) h264_ref_list.clear();
+        if (cur_h264_nal_ref_idc != 0) {
+            h264::RefPic r{};
+            r.dpb_index           = static_cast<uint8_t>(cur_dpb_idx);
+            r.frame_num           = cur_h264_frame_num;
+            r.field_order_cnt[0]  = cur_poc;
+            r.field_order_cnt[1]  = cur_poc;
+            r.long_term           = 0;
+            r.used                = true;
+            h264_ref_list.push_front(r);
+            const std::size_t cap = std::max<std::size_t>(cur_h264_sps->num_ref_frames, 1);
+            while (h264_ref_list.size() > cap) h264_ref_list.pop_back();
+        }
+
+        has_pic = false;
+        bitstream_buf.clear();
+        h264_slice_ctrl.clear();
+        return true;
+    }
+
+    void on_au_h264(std::span<const uint8_t> au, int64_t pts_us, int64_t arrival_qpc_ns = 0) noexcept {
+        std::size_t i = find_start_code(au, 0);
+        while (i < au.size()) {
+            const bool        leading_zero = (i > 0 && au[i - 1] == 0);
+            const std::size_t sc_start     = leading_zero ? i - 1 : i;
+            const std::size_t nal_start    = i + 3;
+            const std::size_t next         = find_start_code(au, nal_start);
+            std::size_t       end          = next;
+            if (next < au.size() && next > 0 && au[next - 1] == 0) --end;
+            if (end <= nal_start + 1) { i = next; continue; }
+
+            std::span<const uint8_t> nal_full = au.subspan(sc_start, end - sc_start);
+            // H.264 NAL header 1 字节：forbidden(1) + nal_ref_idc(2) + nal_type(5)
+            const uint8_t b0          = au[nal_start];
+            const uint8_t nal_type    = b0 & 0x1F;
+            const uint8_t nal_ref_idc = (b0 >> 5) & 0x3;
+            // 跳过 NAL header 字节进入 RBSP。
+            std::span<const uint8_t> ebsp = au.subspan(nal_start + 1, end - nal_start - 1);
+
+            switch (nal_type) {
+                case h264::kNalSps: {
+                    extract_rbsp(ebsp.data(), ebsp.size(), scratch_rbsp);
+                    h264::Sps s{};
+                    if (h264::parse_sps(scratch_rbsp, s)) {
+                        h264_sps[s.id] = s;
+                    } else {
+                        MCP_LOGF(pal::LogLevel::warn,
+                                 "CodecDxvaVideo: H.264 SPS reject (profile=%u chroma=%u poc_type=%u "
+                                 "frame_mbs_only=%u) — 实装边界外",
+                                 s.profile_idc, s.chroma_format_idc, s.pic_order_cnt_type,
+                                 s.frame_mbs_only_flag);
+                    }
+                    break;
+                }
+                case h264::kNalPps: {
+                    extract_rbsp(ebsp.data(), ebsp.size(), scratch_rbsp);
+                    if (h264_sps.empty()) break;
+                    h264::Pps p{};
+                    // 取首个有效 SPS 解析 PPS（IPC 流通常只有 1 套 SPS/PPS）。
+                    if (h264::parse_pps(scratch_rbsp, h264_sps.begin()->second, p)) {
+                        h264_pps[p.id] = p;
+                    }
+                    break;
+                }
+                case h264::kNalSei:
+                case h264::kNalAud:
+                case h264::kNalEoSeq:
+                case h264::kNalEoStream:
+                case h264::kNalFiller:
+                    break;
+                default: {
+                    if (!h264::is_slice(nal_type)) break;
+                    if (h264_sps.empty() || h264_pps.empty()) break;
+
+                    extract_rbsp(ebsp.data(), ebsp.size(), scratch_rbsp);
+                    h264::Pps& p = h264_pps.begin()->second;
+                    auto sit = h264_sps.find(p.sps_id);
+                    if (sit == h264_sps.end()) break;
+                    h264::Sps& s = sit->second;
+                    h264::SliceHdr sh{};
+                    if (!h264::parse_slice_header_min(scratch_rbsp, nal_type, s, p, sh)) break;
+
+                    if (!decoder_inited) {
+                        if (FAILED(init_decoder_h264(s))) break;
+                    }
+
+                    // first slice → 启动新 picture（H.264：first_mb_in_slice == 0 即首切片）
+                    if (sh.first_mb_in_slice == 0) {
+                        if (has_pic) flush_pending_pic_h264();
+                        cur_h264_sps         = &s;
+                        cur_h264_pps         = &p;
+                        cur_nal_type         = nal_type;
+                        cur_h264_nal_ref_idc = nal_ref_idc;
+                        cur_pts_us           = pts_us;
+                        cur_arrival_qpc_ns   = arrival_qpc_ns;
+                        cur_h264_frame_num   = sh.frame_num;
+                        // IDR 时按 spec §8.2.4.3 标记所有 ref unused for ref。
+                        if (h264::is_idr(nal_type)) {
+                            for (auto& e : dpb) e.used = false;
+                            h264_ref_list.clear();
+                            h264_poc = h264::PocState{};
+                        }
+                        cur_poc     = h264::compute_poc(h264_poc, s, sh, nal_type, nal_ref_idc);
+                        cur_dpb_idx = alloc_dpb_slot();
+                        bitstream_buf.clear();
+                        h264_slice_ctrl.clear();
+                        has_pic = true;
+                    }
+
+                    if (!has_pic) break;
+
+                    DXVA_Slice_H264_Short sc{};
+                    sc.BSNALunitDataLocation = static_cast<UINT>(bitstream_buf.size());
+                    sc.SliceBytesInBuffer    = static_cast<UINT>(nal_full.size());
+                    sc.wBadSliceChopping     = 0;
+                    bitstream_buf.insert(bitstream_buf.end(), nal_full.begin(), nal_full.end());
+                    h264_slice_ctrl.push_back(sc);
+                    break;
+                }
+            }
+            i = next;
+        }
+
+        if (has_pic) {
+            const std::size_t align = 128;
+            const std::size_t pad   = (align - (bitstream_buf.size() % align)) % align;
+            bitstream_buf.insert(bitstream_buf.end(), pad, 0);
+            flush_pending_pic_h264();
+        }
     }
 
     void release_all() noexcept {
@@ -1135,7 +1531,12 @@ CodecDxvaVideo::~CodecDxvaVideo() { stop(); }
 
 mc_status_t CodecDxvaVideo::start() noexcept {
     if (!impl_->cfg.device) return MC_ERR_INVALID_ARG;
-    if (impl_->cfg.codec != MC_VIDEO_CODEC_H265) return MC_ERR_UNSUPPORTED;
+    if (impl_->cfg.codec != MC_VIDEO_CODEC_H265 &&
+        impl_->cfg.codec != MC_VIDEO_CODEC_H264) {
+        return MC_ERR_UNSUPPORTED;
+    }
+    impl_->is_h264 = (impl_->cfg.codec == MC_VIDEO_CODEC_H264);
+    impl_->profile = impl_->is_h264 ? MCP_DXVA_H264_VLD_NoFGT : MCP_DXVA_HEVC_MAIN;
 
     // multi-thread protect — 解码器跨线程
     ComPtr<ID3D10Multithread> mt;
@@ -1143,17 +1544,19 @@ mc_status_t CodecDxvaVideo::start() noexcept {
 
     if (FAILED(impl_->init_video_device())) return MC_ERR_INTERNAL;
 
-    // 探测 HEVC profile 是否被驱动支持。
+    // 探测 profile 是否被驱动支持（H.264: VLD NoFGT；H.265: Main）。
     BOOL supported = FALSE;
     HRESULT hr = impl_->video_device->CheckVideoDecoderFormat(
         &impl_->profile, DXGI_FORMAT_NV12, &supported);
     if (FAILED(hr) || !supported) {
         MCP_LOGF(pal::LogLevel::error,
-                 "CodecDxvaVideo: HEVC Main not supported by GPU driver hr=0x%08lX", hr);
+                 "CodecDxvaVideo: %s profile not supported by GPU driver hr=0x%08lX",
+                 impl_->is_h264 ? "H.264 VLD NoFGT" : "HEVC Main", hr);
         return MC_ERR_NO_HARDWARE;
     }
     MCP_LOGF(pal::LogLevel::info,
-             "CodecDxvaVideo: GPU supports HEVC Main, awaiting SPS to size decoder");
+             "CodecDxvaVideo: GPU supports %s, awaiting SPS to size decoder",
+             impl_->is_h264 ? "H.264 VLD NoFGT" : "HEVC Main");
 
     // 启动 T4-DXVA worker：submit 不再同步阻塞 RX 线程。
     impl_->worker_stop.store(false, std::memory_order_release);
@@ -1194,7 +1597,10 @@ void CodecDxvaVideo::flush() noexcept {
         std::scoped_lock lk{impl_->au_mu};
         while (impl_->au_queue.try_drop_oldest()) { /* drain */ }
     }
-    if (impl_->has_pic) impl_->flush_pending_pic();
+    if (impl_->has_pic) {
+        if (impl_->is_h264) impl_->flush_pending_pic_h264();
+        else                 impl_->flush_pending_pic();
+    }
     impl_->reset_dpb();
 }
 
@@ -1232,8 +1638,12 @@ void CodecDxvaVideo::Impl::worker_loop() noexcept {
             got = au_queue.try_pop(au);
         }
         if (!got) continue;     // race / spurious wake，回 wait
-        on_au(std::span<const uint8_t>(au.bytes.data(), au.bytes.size()),
-              au.pts_us, au.arrival_qpc_ns);
+        const std::span<const uint8_t> au_span{au.bytes.data(), au.bytes.size()};
+        if (is_h264) {
+            on_au_h264(au_span, au.pts_us, au.arrival_qpc_ns);
+        } else {
+            on_au(au_span, au.pts_us, au.arrival_qpc_ns);
+        }
     }
 }
 

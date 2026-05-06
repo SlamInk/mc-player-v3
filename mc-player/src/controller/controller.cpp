@@ -745,8 +745,27 @@ struct Controller::Impl {
                     record_skip(2, "profile_unsupported");
                 }
             } else if (video_codec == MC_VIDEO_CODEC_H264) {
-                // 档 2 H.264 实装在 Phase 4 路线（codec_dxva_video.cpp 补 H.264 picparams + DPB）。
-                record_skip(2, "h264_not_implemented_phase4");
+                // Phase 4：codec_dxva_video.cpp 补 H.264 实装(profile=VLD NoFGT,
+                // chroma_format_idc=1, 8-bit, frame_mbs_only=1, pic_order_cnt_type∈{0,2})。
+                // SPS 实装边界外的流(High10/4:2:2、interlace、自定义 scaling list)
+                // 仍由 init_decoder_h264 失败兜底降至档 3。
+                media::CodecDxvaVideo::Config dcfg;
+                dcfg.codec  = video_codec;
+                dcfg.device = d3d_device;
+                dcfg.emit   = [this](media::VideoFrame&& f) { on_decoded_frame(std::move(f)); };
+                codec_dxva  = std::make_unique<media::CodecDxvaVideo>(std::move(dcfg));
+                if (mc_status_t s = codec_dxva->start(); s == MC_OK) {
+                    MCP_LOGF(pal::LogLevel::info,
+                             "Controller: tier2 DXVA-direct H.264 active");
+                    activate(MC_DECODER_DXVA_DIRECT, 2);
+                    return MC_OK;
+                } else {
+                    MCP_LOGF(pal::LogLevel::warn,
+                             "Controller: tier2 DXVA-direct H.264 start failed status=%d",
+                             static_cast<int>(s));
+                    codec_dxva.reset();
+                    record_skip(2, "profile_unsupported");
+                }
             } else {
                 record_skip(2, "codec_unsupported");
             }

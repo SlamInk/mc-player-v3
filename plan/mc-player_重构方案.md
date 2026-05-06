@@ -303,23 +303,24 @@ before/after:
 
 ### 4.1 改动范围
 
+> 实装期 reality：原 plan 假设 `subprojects/mc-libcodec/src/decoder_h264.cpp` 已有 SPS/PPS/SliceHeader parser 可抽出公开复用，但实际 mc-libcodec H.264 仅 24 行骨架（仅 `DecoderH264::submit` 返 `MCLC_ERR_UNSUPPORTED`）—— Phase 7 才会落地软解。因此 H.264 parser 沿 HEVC 路径同样**内联**到 `codec_dxva_video.cpp` 不变量，新增的 `dxva_h264.{h,cpp}` 是 codec_dxva_video 内联实现的拆分,**不**对 mc-libcodec 暴露公开 API。
+
 | 文件 | 动作 |
 |---|---|
-| `mc-player/src/media/codec_dxva_video.cpp` | 新增 ~600 行 H.264 实装（PicParams / SliceShort / DPB 表 / RefPicList 管理 / POC 计算） |
-| `mc-player/src/media/codec_dxva_video.h` | 工厂 / 参数支持 H.264 codec |
-| `mc-player/src/media/dxva_h264_picparams.{h,cpp}`（新增）| DXVA_PicParams_H264 填表逻辑 |
-| `mc-player/src/media/dxva_h264_slice.{h,cpp}`（新增）| Slice_H264_Short 填表 |
-| `subprojects/mc-libcodec/include/mc-libcodec/parser_h264.h`（新增公开 API） | SPS/PPS/SliceHeader parser 抽出供 dxva 复用 |
-| `mc-player/src/controller/controller.cpp` | start_decode_pipeline 档 2 stub 替换为真实 codec_dxva_video for H.264 |
+| `mc-player/src/media/dxva_h264.{h,cpp}`（新增） | H.264 SPS/PPS/SliceHeader parser + POC 计算 + DXVA_PicParams_H264 / DXVA_Slice_H264_Short 填表（仅供 codec_dxva_video.cpp 内部复用，不对外暴露）|
+| `mc-player/src/media/codec_dxva_video.cpp` | 新增 H.264 dispatch（init_decoder_h264 / on_au_h264 / flush_pending_pic_h264）共 ~360 行，并列于 HEVC 路径，`is_h264_` 标志切换 |
+| `mc-player/src/media/codec_dxva_video.h` | profile_hint 接受 `MC_VIDEO_CODEC_H264`；公开 API 不变 |
+| `mc-player/src/controller/controller.cpp` | tier 2 H.264 分支 `record_skip("h264_not_implemented_phase4")` 替换为真实 `CodecDxvaVideo` 路径 |
+| `mc-player/CMakeLists.txt` | 加入 `dxva_h264.{h,cpp}` 源文件 |
 
 ### 4.2 实施步骤
 
-1. **mc-libcodec 公开 SPS/PPS/SliceHeader parser**：把 `subprojects/mc-libcodec/src/decoder_h264.cpp` 内的 SPS/PPS/slice header 解析逻辑抽到独立 `parser_h264.h`，加到公开 API（演进式 ABI）；`decoder_h264.cpp` 反向引用自己的公开头。
-2. **DXVA picparams 填表**：参考 ITU-T H.264 spec + Microsoft DXVA 2.0 H.264 Annex（位字段语义对照）；填 `wFrameNum`, `field_pic_flag`, `RefFrameList[16]`, `FieldOrderCntList[16][2]`, ...
-3. **DPB**：在应用层维护 `{frame_num, poc, refs_used_by, mark}` 表；按 §5.6.2.2 行 4 复用 mc-libcodec DPB 设计。
-4. **每帧 submit 流程**：`DecoderBeginFrame(view)` → 4 个 `D3D11VideoDecoderBuffer`（PicParams / Bitstream / SliceControl）→ `SubmitDecoderBuffer × N` → `DecoderEndFrame` → fence wait。
-5. 接通 controller → 验证 `mc.decoder.kind=DXVA_DIRECT` for H.264。
-6. **回归**：HEVC 流不要变到档 4——必须保持 `DXVA_DIRECT`。
+1. **写 dxva_h264 parser**：参考 ITU-T H.264 (08/2021) §7.3.2 SPS/PPS/SliceHeader 与 Microsoft DXVA H.264 spec v1.1 字段语义；实装边界明确写入 header 注释（chroma_format_idc=1 + 8-bit + frame_mbs_only=1 + pic_order_cnt_type∈{0,2} + 无 FMO/scaling matrix），边界外的 SPS/PPS 直接 reject 让 driver 路径降到 tier 3。
+2. **DXVA picparams 填表**：`wFrameWidthInMbsMinus1`, `wFrameHeightInMbsMinus1`, `CurrPic.Index7Bits`, `RefFrameList[16]`（按 ref_list 写入有效 entry，剩余 0xFF）, `FieldOrderCntList[16][2]`, `FrameNumList[16]`, `UsedForReferenceFlags`（每 ref 占 2 bit top+bottom）, 协议字段（log2_max_frame_num_minus4 / pic_order_cnt_type / direct_8x8_inference / entropy_coding_mode 等）。
+3. **DPB ref list**：用 `std::deque<h264::RefPic>` 维护 newest-first；解码完一张 `nal_ref_idc != 0` 帧后 push_front，`size > num_ref_frames` 即 pop_back；IDR 时清空整链 + reset PocState。
+4. **每帧 submit 流程**：`DecoderBeginFrame(view)` → 3 个 `D3D11VideoDecoderBuffer`（`PICTURE_PARAMETERS` / `SLICE_CONTROL` / `BITSTREAM`）→ `SubmitDecoderBuffers(3)` → `DecoderEndFrame`。bitstream 需 128 字节对齐补 0。
+5. 接通 controller tier 2 H.264 → 验证 `mc.decoder.kind=DXVA_DIRECT` for H.264；HEVC 路径不回归。
+6. **回归**：dump_stats --self_test 通过；HEVC 流仍走 tier 2 不掉档；`mc.gate.drop_*_count` warm_steady 期间 = 0。
 
 ### 4.3 验收 metric
 
