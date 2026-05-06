@@ -22,6 +22,7 @@
 #include "media/audio_render_wasapi.h"
 #include "media/codec_dxva_video.h"
 #include "media/codec_nvdec.h"
+#include "media/codec_onevpl.h"
 #include "media/codec_g711.h"
 #include "media/codec_libcodec.h"
 #include "media/codec_mft_audio.h"
@@ -193,6 +194,7 @@ struct Controller::Impl {
     std::unique_ptr<media::CodecMftVideo>         codec_video;
     std::unique_ptr<media::CodecDxvaVideo>        codec_dxva;
     std::unique_ptr<media::CodecNvdec>            codec_nvdec;
+    std::unique_ptr<media::CodecOneVPL>           codec_onevpl;
     std::unique_ptr<media::CodecLibcodecVideo>    codec_libcodec;
     std::unique_ptr<media::FrameValidityGate>     gate;
     std::unique_ptr<media::RenderD3d11>           render;
@@ -715,31 +717,76 @@ struct Controller::Impl {
             reg.gauge("mc.probe.tier_selected").set(tier);
         };
 
-        // 档 1: Vendor SDK 直驱（NVDEC / oneVPL / AMF）— ADR-015 §5.6.2.1。
-        // Phase 5: NVDEC 结构性骨架（vendor 探测 + SDK 加载 + entry-point probing
-        //          落地;实际 cuvid* 解码循环留 Phase 5b 等 NV 硬件可达时实装）。
-        // Phase 6/7: oneVPL / AMF 留 stub（同结构,本档暂时按 sdk_missing skip）。
+        // 档 1: Vendor SDK 直驱(NVDEC / oneVPL / AMF) — ADR-015 §5.6.2.1。
+        // 多档 vendor 互斥(VendorId 路由),按本机 adapter 选择适配档:
+        //   - NVIDIA 0x10DE → NVDEC (Phase 5a 骨架,5b 待补 cuvid 解码循环)
+        //   - Intel  0x8086 → oneVPL (Phase 6a 骨架,6b 待补 MFX 解码循环)
+        //   - AMD    0x1002 → AMF   (Phase 7 留)
+        //   - 其它           → vendor_mismatch
+        //
+        // 每档 codec impl 自己探测 VendorId 不命中即返 MC_ERR_UNSUPPORTED + 设
+        // last_start_reason=vendor_mismatch;controller 按 reason_label 填 metric。
+        // 失败兜底降到 tier 2 DXVA-direct(Phase 4 已 H.264/H.265 全覆盖)。
         {
             pal::metric::ScopedTimer t{reg.timer("mc.probe.tier1_ns")};
-            media::CodecNvdec::Config ncfg;
-            ncfg.codec  = video_codec;
-            ncfg.device = d3d_device;
-            ncfg.emit   = [this](media::VideoFrame&& f) { on_decoded_frame(std::move(f)); };
-            codec_nvdec = std::make_unique<media::CodecNvdec>(std::move(ncfg));
-            const mc_status_t s = codec_nvdec->start();
-            if (s == MC_OK) {
-                MCP_LOGF(pal::LogLevel::info, "Controller: tier1 NVDEC active");
-                activate(MC_DECODER_VENDOR_SDK_NVDEC, 1);
-                return MC_OK;
+            // 子档轮询 vendor_mismatch 不计数(它是路由不命中,不是 SDK 故障)。
+            // 仅适配档(VendorId 命中)的失败 reason 才入 skip metric。
+            // 全档都 vendor_mismatch 时 fallback 记一条 vendor_mismatch。
+            bool tier1_recorded = false;
+
+            // NVDEC(NV 0x10DE 命中)
+            {
+                media::CodecNvdec::Config ncfg;
+                ncfg.codec  = video_codec;
+                ncfg.device = d3d_device;
+                ncfg.emit   = [this](media::VideoFrame&& f) { on_decoded_frame(std::move(f)); };
+                codec_nvdec = std::make_unique<media::CodecNvdec>(std::move(ncfg));
+                const mc_status_t s = codec_nvdec->start();
+                if (s == MC_OK) {
+                    MCP_LOGF(pal::LogLevel::info, "Controller: tier1 NVDEC active");
+                    activate(MC_DECODER_VENDOR_SDK_NVDEC, 1);
+                    return MC_OK;
+                }
+                const auto reason = codec_nvdec->last_start_reason();
+                if (reason != media::CodecNvdec::StartReason::vendor_mismatch) {
+                    record_skip(1, media::CodecNvdec::reason_label(reason));
+                    tier1_recorded = true;
+                    MCP_LOGF(pal::LogLevel::info,
+                             "Controller: tier1 NVDEC skip reason=%s (status=%d)",
+                             media::CodecNvdec::reason_label(reason), static_cast<int>(s));
+                }
+                codec_nvdec.reset();
             }
-            // 失败按 NVDEC 实装的 last_start_reason 分类填 mc.probe.tier_skip_reason.tier1.*。
-            const char* reason =
-                media::CodecNvdec::reason_label(codec_nvdec->last_start_reason());
-            record_skip(1, reason);
-            codec_nvdec.reset();
-            MCP_LOGF(pal::LogLevel::info,
-                     "Controller: tier1 NVDEC skip reason=%s (status=%d)",
-                     reason, static_cast<int>(s));
+
+            // oneVPL(Intel 0x8086 命中)
+            if (!tier1_recorded) {
+                media::CodecOneVPL::Config ocfg;
+                ocfg.codec  = video_codec;
+                ocfg.device = d3d_device;
+                ocfg.emit   = [this](media::VideoFrame&& f) { on_decoded_frame(std::move(f)); };
+                codec_onevpl = std::make_unique<media::CodecOneVPL>(std::move(ocfg));
+                const mc_status_t s = codec_onevpl->start();
+                if (s == MC_OK) {
+                    MCP_LOGF(pal::LogLevel::info, "Controller: tier1 oneVPL active");
+                    activate(MC_DECODER_VENDOR_SDK_ONEVPL, 1);
+                    return MC_OK;
+                }
+                const auto reason = codec_onevpl->last_start_reason();
+                if (reason != media::CodecOneVPL::StartReason::vendor_mismatch) {
+                    record_skip(1, media::CodecOneVPL::reason_label(reason));
+                    tier1_recorded = true;
+                    MCP_LOGF(pal::LogLevel::info,
+                             "Controller: tier1 oneVPL skip reason=%s (status=%d)",
+                             media::CodecOneVPL::reason_label(reason), static_cast<int>(s));
+                }
+                codec_onevpl.reset();
+            }
+
+            // AMD AMF 留 Phase 7 stub。当前若 adapter 是 AMD,vendor_mismatch
+            // 同时命中 NVDEC + oneVPL → tier1_recorded 仍为 false → 走 fallback。
+            if (!tier1_recorded) {
+                record_skip(1, "vendor_mismatch");
+            }
         }
 
         // 档 2: DXVA-direct（D3D11VideoDevice）— HEVC 已实装；H.264 留 Phase 4 stub。

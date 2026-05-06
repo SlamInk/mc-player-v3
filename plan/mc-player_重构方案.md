@@ -438,13 +438,19 @@ before/after（NVIDIA RTX 3050 dGPU，720p H.264）：
 - 严格按 ADR-015 + 性能量度规范修订后的正确配置：`mfxVideoParam.AsyncDepth = 1` + `mfxBitstream.DataFlag |= MFX_BITSTREAM_COMPLETE_FRAME`（**不是** LowDelayBRC / LookAheadDepth，那俩是 encoder 参数）。
 - runtime LoadLibrary 优先 `vpl.dll`，回退 `libmfx.dll`（Media SDK 后继关系）。
 
+> 实装期 reality：开发机 Intel UHD 730（VendorId 0x8086）虽可达 oneVPL，但 oneVPL ABI（mfxBitstream / mfxFrameSurface1 / mfxIMPL / MFXLoad / SetHandle / DecodeFrameAsync 等约 30 个结构体）若不引官方头则需手写函数指针 typedef ~200 行；与 Phase 5 NVDEC 风格统一,本 Phase 同样拆 6a/6b。
+>
+>   - **6a**（本 commit）：结构性骨架 — codec_onevpl.{h,cpp} 加载 vpl.dll/libmfx.dll + entry-point probing + start() 失败分类。controller tier 1 改为多 vendor 轮询（NVDEC → oneVPL → AMD/AMF stub）按 VendorId 路由。
+>   - **6b**（实装解码循环）：MFXLoad + MFXCreateSession(MFX_IMPL_HARDWARE) + MFXVideoCORE_SetHandle(D3D11) + DecodeHeader + DecodeFrameAsync 主循环 + mfxFrameSurface1::Data.MemId 直拿 D3D11 NV12 texture。落到 Intel 测试机后验 `mc.decoder.kind=VENDOR_SDK_ONEVPL` + decode_actual_p95 ≤5ms。
+
 ### 6.1 改动范围
 
-| 文件 | 动作 |
-|---|---|
-| `mc-player/src/media/codec_onevpl.{h,cpp}`（新增 ~600 行）| oneVPL 实装；动态加载 + D3D11 device 共享 |
-| `mc-player/src/controller/controller.cpp` | 档 1 oneVPL：`VendorId == 0x8086` 才尝试 |
-| `mc-player/src/pal/dxgi_caps_probe.cpp` | 加 `vpl.dll` / `libmfx.dll` 存在性 probe |
+| 文件 | 动作 | Phase |
+|---|---|---|
+| `mc-player/src/media/codec_onevpl.{h,cpp}`（新增 ~250 行）| oneVPL 类骨架：动态加载 vpl.dll 优先 / libmfx.dll 兜底 + 关键 MFX 入口 GetProcAddress + start() 按 vendor/SDK/entry-point 失败分类返 `last_start_reason` | 6a |
+| `mc-player/src/media/codec_onevpl.cpp`（追加 ~350 行）| MFXLoad + MFXCreateSession + MFXVideoCORE_SetHandle(D3D11) + DecodeHeader + DecodeFrameAsync 主循环 + mfxFrameSurface1 → D3D11 NV12 texture 共享 | 6b |
+| `mc-player/src/controller/controller.cpp` | 档 1 多 vendor 轮询：NVDEC → oneVPL → AMD/AMF stub 按 VendorId 路由；vendor_mismatch 不计入 skip metric（仅适配档失败原因入 metric）| 6a |
+| `mc-player/src/pal/dxgi_caps_probe.cpp` | 已在 Phase 5a 加入 `onevpl_dll_present` 探测，本 phase 复用 | 5a |
 
 ### 6.2 实施步骤
 
@@ -458,7 +464,17 @@ before/after（NVIDIA RTX 3050 dGPU，720p H.264）：
 
 ### 6.3 验收 metric
 
-| metric | 阈值（Intel UHD 730 测试机）|
+6a 验收（开发机即可）：
+| metric | 阈值 |
+|---|---|
+| build / dump_stats --self_test | pass（无回归）|
+| `mc.probe.tier_skip_reason.tier1.vendor_mismatch`（非 Intel/NV/AMD adapter） | ≥1 |
+| `mc.probe.tier_skip_reason.tier1.sdk_decode_pending`（Intel + vpl.dll 已装） | ≥1（6b 完成前期望值）|
+| `mc.gate.drop_*_count` warm_steady | 0（不变量保持）|
+| `mc.render.epoch_pair_skew_count` | 0（不变量保持）|
+
+6b 验收（Intel UHD 730 测试机，完整解码路径）：
+| metric | 阈值 |
 |---|---|
 | `mc.decoder.kind` | `VENDOR_SDK_ONEVPL` |
 | `mc.stage.decode_actual_ns` p95 | ≤5ms |
