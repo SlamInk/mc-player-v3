@@ -35,10 +35,11 @@ namespace {
 DEFINE_GUID(MCP_DXVA_HEVC_MAIN,
     0x5b11d51b, 0x2f4c, 0x4452, 0xbc, 0xc3, 0x09, 0xf2, 0xa1, 0x16, 0x0c, 0xc0);
 
-// H.264 VLD NoFGT (Microsoft DXVA2 H.264 模式 E)。所有 H.264 4:2:0 8-bit 流通行
-// 的硬件解码 profile,IPC 摄像机均覆盖（Baseline / Main / High 适用）。
+// H.264 VLD NoFGT (Microsoft DXVA2 H.264 模式 E,GUID 1B81BE68)。
+// 所有 H.264 4:2:0 8-bit 流通行的硬件解码 profile,IPC 摄像机均覆盖
+// (Baseline / Main / High 适用)。与 dxgi_caps_probe.cpp 探测用的 GUID 同源。
 DEFINE_GUID(MCP_DXVA_H264_VLD_NoFGT,
-    0x1b81bea3, 0xa0c7, 0x11d3, 0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5);
+    0x1b81be68, 0xa0c7, 0x11d3, 0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5);
 
 constexpr uint8_t kNalTrailN     = 0;
 constexpr uint8_t kNalIdrWRadl   = 19;
@@ -575,10 +576,19 @@ struct CodecDxvaVideo::Impl {
         int64_t              pts_us         = 0;
         int64_t              arrival_qpc_ns = 0;
     };
-    // SPSC ring（power-of-2，CLAUDE.md / ADD §6.1 硬约束）。容量 4 = anchor + 2-3 P
-    // ~130 ms@30fps；producer 满时丢自己（drop-newest），consumer 在 try_pop 前
-    // try_drop_oldest 到只剩 1 维持"最新优先"语义。与 codec_mft_video.cpp 对齐。
-    static constexpr std::size_t kAuQueueCap = 4;
+    // SPSC ring(power-of-2,CLAUDE.md / ADD §6.1 硬约束)。
+    //
+    // 视频流的 AU 队列原则(与音频不同 — 音频帧独立,视频帧链式参考):
+    //   1. 队列只缓冲 jitter,不做 rate matching(rate matching 由上游 jitter buffer
+    //      + 下游 RTCP-PLI 反馈完成,见 ADD §5.4 Immediate Feedback)
+    //   2. worker 永远不主动丢 AU(丢 AU = 破坏 ref 链 = 后续 P/B 帧 driver 找
+    //      不到 ref → 静默输出黑色 NV12 → 黑屏直到下一 IDR)
+    //   3. producer overflow 时丢 newest;后续 decode_error 自然 poison gate,
+    //      等下一 IDR 自然恢复(或上报 PLI 主动催 IDR)
+    //
+    // cap=16 = 0.5s @ 30fps,足够覆盖 IPC 流的 GOP 边界 SPS/PPS/IDR 突发 +
+    //   起始期 driver init 滞后(典型 200-400ms)。
+    static constexpr std::size_t kAuQueueCap = 16;
 
     std::thread                          worker_thread;
     std::atomic<bool>                    worker_stop{false};
@@ -1372,10 +1382,12 @@ struct CodecDxvaVideo::Impl {
         uint32_t mask = kValidityParams | kValidityColor | kValidityReorder | kValidityFence;
         if (refs_armed) mask |= kValidityRefs | kValidityRecovery;
         f.validity_mask = mask;
-        if (emit_count == 0) {
+        if (emit_count == 0 || (emit_count + 1) % 30 == 0) {
             MCP_LOGF(pal::LogLevel::info,
-                     "CodecDxvaVideo: H.264 first frame emit pts=%lld slice=%u poc=%d fnum=%u",
-                     static_cast<long long>(cur_pts_us), out_slice, cur_poc, cur_h264_frame_num);
+                     "CodecDxvaVideo: H.264 emit #%u pts=%lld slice=%u poc=%d fnum=%u "
+                     "validity_mask=0x%02X is_keyframe=%d refs_armed=%d",
+                     emit_count + 1, static_cast<long long>(cur_pts_us), out_slice, cur_poc,
+                     cur_h264_frame_num, f.validity_mask, f.is_keyframe, refs_armed);
         }
         if (cfg.emit) cfg.emit(std::move(f));
         ++emit_count;
@@ -1632,12 +1644,13 @@ void CodecDxvaVideo::Impl::worker_loop() noexcept {
                         au_queue.approx_size() > 0;
             });
             if (worker_stop.load(std::memory_order_acquire)) break;
-            // SPSC consumer 操作必须持 mu（与 flush() 互斥）；producer try_push 仍 lock-free。
-            // "最新优先"：drop 到只剩 1 再 pop（兑现 CLAUDE.md "满时丢最老" 语义）。
-            while (au_queue.approx_size() > 1) (void)au_queue.try_drop_oldest();
+            // SPSC consumer 操作必须持 mu(与 flush() 互斥);producer try_push 仍 lock-free。
+            // 视频路径不主动 drop_oldest — 见 kAuQueueCap 注释:
+            //   主动丢 AU = 破坏 ref 链 = 后续 P/B 帧 driver 找不到 ref → 黑屏。
+            // 真正 overflow 由 producer 端 try_push 失败 + 上报实现。
             got = au_queue.try_pop(au);
         }
-        if (!got) continue;     // race / spurious wake，回 wait
+        if (!got) continue;     // race / spurious wake,回 wait
         const std::span<const uint8_t> au_span{au.bytes.data(), au.bytes.size()};
         if (is_h264) {
             on_au_h264(au_span, au.pts_us, au.arrival_qpc_ns);
@@ -1646,5 +1659,9 @@ void CodecDxvaVideo::Impl::worker_loop() noexcept {
         }
     }
 }
+
+// 视频路径不在 worker_loop 主动 drop_oldest — 见 kAuQueueCap 注释。
+// (旧代码:while (au_queue.approx_size() > 1) try_drop_oldest();
+//  导致 ref 链每帧都断,driver 静默输出黑 NV12,Phase 4 实测黑屏根因)
 
 }  // namespace mcp::media

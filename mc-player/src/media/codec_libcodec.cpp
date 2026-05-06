@@ -212,9 +212,8 @@ void CodecLibcodecVideo::Impl::worker_loop() noexcept {
                         au_queue.approx_size() > 0;
             });
             if (worker_stop.load(std::memory_order_acquire)) break;
-            // SPSC consumer 操作必须持 mu（与 flush() 互斥）；producer try_push 仍 lock-free。
-            // "最新优先"：drop 到只剩 1 再 pop（兑现 CLAUDE.md "满时丢最老" 语义）。
-            while (au_queue.approx_size() > 1) (void)au_queue.try_drop_oldest();
+            // 视频路径不主动 drop_oldest — 与 codec_dxva_video / codec_mft_video 对齐:
+            // 丢 AU 破坏 ref 链 → 后续 P/B 帧解码失败 → 静默输出黑屏。
             got = au_queue.try_pop(au);
         }
         if (!got) continue;

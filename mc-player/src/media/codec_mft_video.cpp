@@ -57,13 +57,16 @@ struct PendingAu {
 };
 
 // AU 队列容量（pal::SpscQueue 要求 power-of-two）。低延时模式下 host 端 AU 缓存只是
-// 「让 codec 立刻拉到下一个」的接力槽。MFT 自身有内部 input buffering（async event
-// 驱动），host 多缓 ≠ 多吞吐，反而把网络拥塞转成解码侧滞后。
-// 4 = 一个 anchor + 2-3 P，对应 ~130 ms@30fps 上限（≈ P0-3 的 3 +1，satisfy 2^n）。
-// SPSC 不变量约束 producer 不能动 tail，"丢最老"由 consumer 在 try_pop 前调
-// try_drop_oldest 到只剩 1 个实现（"最新优先"等价于 producer 端"丢最老"）。
-// producer 满时直接丢自己（drop newest，极少触发，4 远大于 MFT 内部 buffering 需求）。
-constexpr std::size_t kAuQueueCap = 4;
+// 视频路径 AU 队列原则(与音频不同 — 音频帧独立,视频帧链式参考):
+//   1. 队列只缓冲 jitter,不做 rate matching(rate matching 由上游 jitter buffer
+//      + 下游 RTCP-PLI 反馈完成,见 ADD §5.4 Immediate Feedback)
+//   2. worker 永远不主动 drop_oldest(丢 AU = 破坏 ref 链 = 后续 P/B 帧 driver
+//      找不到 ref → 静默输出黑色 NV12 → 黑屏直到下一 IDR)
+//   3. producer overflow 时丢 newest;后续 decode_error 自然 poison gate,
+//      等下一 IDR 自然恢复
+// cap=16 = 0.5s @ 30fps,足够覆盖 IPC 流的 GOP 边界 SPS/PPS/IDR 突发 +
+//   起始期 driver init 滞后(典型 200-400ms)。
+constexpr std::size_t kAuQueueCap = 16;
 
 // 自定义 IMFSample attribute — 透传 arrival_qpc_ns。MFT 文档未明示
 // input→output 自定义 attribute 透传，实测 driver 行为不一；失败时回退
@@ -382,13 +385,11 @@ void CodecMftVideo::Impl::sync_worker_loop() noexcept {
                         au_queue.approx_size() > 0;
             });
             if (stop_requested.load(std::memory_order_acquire)) break;
-            // SPSC 不变量：consumer 端的 try_drop_oldest / try_pop 必须串行；与
-            // flush()（也是 consumer 角色）持同一把 mu 互斥。producer try_push 仍 lock-free。
-            // "最新优先"：drop 到只剩 1 再 pop（兑现 CLAUDE.md "满时丢最老" 语义）。
-            while (au_queue.approx_size() > 1) (void)au_queue.try_drop_oldest();
+            // 视频路径不主动 drop_oldest — 见 kAuQueueCap 注释:破坏 ref 链。
+            // 真正 overflow 由 producer 端 try_push 失败 + 上报实现。
             got = au_queue.try_pop(au);
         }
-        if (!got) continue;     // race / spurious wake，回 wait
+        if (!got) continue;     // race / spurious wake,回 wait
         HRESULT hr = submit_sync(au);
         if (FAILED(hr)) {
             MCP_LOGF(pal::LogLevel::warn,
@@ -407,12 +408,10 @@ HRESULT CodecMftVideo::Impl::on_need_input() noexcept {
                     au_queue.approx_size() > 0;
         });
         if (stop_requested.load(std::memory_order_acquire)) return S_OK;
-        // SPSC consumer 操作必须持 mu（与 flush() 互斥）；producer try_push 仍 lock-free。
-        // "最新优先"：drop 到只剩 1 再 pop（兑现 CLAUDE.md "满时丢最老" 语义）。
-        while (au_queue.approx_size() > 1) (void)au_queue.try_drop_oldest();
+        // 视频路径不主动 drop_oldest — 见 kAuQueueCap 注释:破坏 ref 链。
         got = au_queue.try_pop(au);
     }
-    if (!got) return S_OK;     // race / spurious wake，回事件循环再等
+    if (!got) return S_OK;     // race / spurious wake,回事件循环再等
 
     ComPtr<IMFMediaBuffer> buf;
     HRESULT hr = input_buf_pool.acquire(static_cast<DWORD>(au.bytes.size()), &buf);
