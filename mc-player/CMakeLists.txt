@@ -82,6 +82,12 @@ set(MCP_MEDIA_SOURCES
     src/media/codec_libcodec.cpp
     src/media/codec_dxva_video.h
     src/media/codec_dxva_video.cpp
+    src/hdcm/manifest_table.h
+    src/hdcm/manifest_table.cpp
+    src/hdcm/detector.h
+    src/hdcm/detector.cpp
+    src/hdcm/installer_a_vendor_sdk.h
+    src/hdcm/installer_a_vendor_sdk.cpp
     src/media/codec_amf.h
     src/media/codec_amf.cpp
     src/media/codec_nvdec.h
