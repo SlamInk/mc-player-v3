@@ -31,6 +31,35 @@ mcp::pal::metric::Gauge& gate_tainted_state_gauge() {
     return mcp::pal::metric::Registry::instance().gauge("mc.gate.tainted_state");
 }
 
+// 性能量度规范 §4.2 / Phase 2 plan §2.0：6 类细分 + 旧 7 类共 14 种污染源。
+// 每次 mark_poisoned / decode_error / missing-bit 进入污染态时上报对应 label 的 counter。
+const char* poison_source_label(mc_gate_poison_source_t s) noexcept {
+    switch (s) {
+        case MC_GATE_POISON_NONE:             return "none";
+        case MC_GATE_POISON_DECODE_ERROR:     return "decode_error";
+        case MC_GATE_POISON_REFS_MISSING:     return "refs_missing";
+        case MC_GATE_POISON_PARAMS_MISSING:   return "params_missing";
+        case MC_GATE_POISON_COLOR_MISSING:    return "color_missing";
+        case MC_GATE_POISON_REORDER_MISSING:  return "reorder_missing";
+        case MC_GATE_POISON_FENCE_MISSING:    return "fence_missing";
+        case MC_GATE_POISON_EXTERNAL:         return "external";
+        case MC_GATE_POISON_SEQ_GAP:          return "seq_gap";
+        case MC_GATE_POISON_FNUM_GAP:         return "fnum_gap";
+        case MC_GATE_POISON_MFT_DECODE_ERR:   return "mft_decode_err";
+        case MC_GATE_POISON_DEVICE_LOST:      return "device_lost";
+        case MC_GATE_POISON_ADAPTER_SWITCH:   return "adapter_switch";
+        case MC_GATE_POISON_RESIZE_INFLIGHT:  return "resize_inflight";
+    }
+    return "unknown";
+}
+
+void emit_tainted_source_counter(mc_gate_poison_source_t s) noexcept {
+    char name[80];
+    std::snprintf(name, sizeof(name),
+                  "mc.gate.tainted_source.%s", poison_source_label(s));
+    gate_counter(name).inc();
+}
+
 }  // namespace
 
 FrameValidityGate::FrameValidityGate(EmitFn emit) noexcept : emit_{std::move(emit)} {}
@@ -64,6 +93,7 @@ bool FrameValidityGate::admit(const VideoFrame& frame) noexcept {
                 poison_enter_count_.fetch_add(1, std::memory_order_relaxed);
                 gate_tainted_enter_counter().inc();
                 gate_tainted_state_gauge().set(1);
+                emit_tainted_source_counter(poison_source_);
                 MCP_LOGF(pal::LogLevel::warn,
                          "FrameValidityGate: enter poisoned (decode_error) pts=%lld",
                          static_cast<long long>(frame.pts_us));
@@ -82,6 +112,7 @@ bool FrameValidityGate::admit(const VideoFrame& frame) noexcept {
                 poison_enter_count_.fetch_add(1, std::memory_order_relaxed);
                 gate_tainted_enter_counter().inc();
                 gate_tainted_state_gauge().set(1);
+                emit_tainted_source_counter(poison_source_);
                 MCP_LOGF(pal::LogLevel::warn,
                          "FrameValidityGate: enter poisoned (missing=0x%02X) pts=%lld",
                          missing, static_cast<long long>(frame.pts_us));
@@ -127,9 +158,10 @@ void FrameValidityGate::mark_poisoned(mc_gate_poison_source_t source) noexcept {
     poison_enter_count_.fetch_add(1, std::memory_order_relaxed);
     gate_tainted_enter_counter().inc();
     gate_tainted_state_gauge().set(1);
+    emit_tainted_source_counter(source);
     MCP_LOGF(pal::LogLevel::warn,
-             "FrameValidityGate: enter poisoned (external source=%d)",
-             static_cast<int>(source));
+             "FrameValidityGate: enter poisoned (source=%s)",
+             poison_source_label(source));
 }
 
 bool FrameValidityGate::is_poisoned() const noexcept {

@@ -5,6 +5,7 @@
 
 #include "pal/error.h"
 #include "pal/log.h"
+#include "pal/metric.h"
 
 #pragma comment(lib, "dxgi.lib")
 
@@ -99,6 +100,8 @@ mc_status_t SwapChain::create() noexcept {
 mc_status_t SwapChain::resize(uint32_t width, uint32_t height,
                                ClearViewsFn clear_cb, void* clear_user) noexcept {
     if (!swap_chain_) return MC_ERR_INVALID_STATE;
+    // 性能量度规范 §7.4 mc.render.resize_buffers_count。
+    pal::metric::Registry::instance().counter("mc.render.resize_buffers_count").inc();
     if (clear_cb) clear_cb(clear_user);
 
     ComPtr<ID3D11DeviceContext> ctx;
@@ -111,6 +114,14 @@ mc_status_t SwapChain::resize(uint32_t width, uint32_t height,
     HRESULT hr = swap_chain_->ResizeBuffers(kBufferCount, width, height,
                                              desc.Format, desc.Flags);
     if (FAILED(hr)) {
+        // ADD §5.10.3：ResizeBuffers 前未 ClearState + 未释放 back buffer 引用的 SRV/RTV/UAV
+        // 即返 DXGI_ERROR_INVALID_CALL。本路径已先 ClearState + clear_cb,正常应不命中此分支;
+        // 命中即架构不变量违反 → mc.render.resize_clearstate_violation_count（性能量度规范
+        // §7.4 / §11.1 必达指标 = 0 永久）。
+        if (hr == DXGI_ERROR_INVALID_CALL) {
+            pal::metric::Registry::instance()
+                .counter("mc.render.resize_clearstate_violation_count").inc();
+        }
         MCP_LOGF(pal::LogLevel::warn,
                  "SwapChain: ResizeBuffers failed hr=0x%08lX", hr);
         return pal::status_from_hresult(hr);

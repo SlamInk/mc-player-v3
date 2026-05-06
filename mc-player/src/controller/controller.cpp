@@ -217,6 +217,12 @@ struct Controller::Impl {
     uint32_t                                   local_sender_ssrc = 0;
     std::atomic_flag                           pli_sent = ATOMIC_FLAG_INIT;
 
+    // Phase 2：RTP 视频 seq 跟踪 + 16-bit wrap-aware gap 检测。gap>0 时调
+    // depack->mark_reference_lost + gate->mark_poisoned(SEQ_GAP)，让 §5.13 Frame
+    // Validity Gate 显式上报 mc.gate.tainted_source.seq_gap counter（plan §2.0 6 类细分）。
+    bool                                       video_seq_inited  = false;
+    uint16_t                                   video_seq_last    = 0;
+
     mc_video_codec_t                           video_codec   = MC_VIDEO_CODEC_UNKNOWN;
     mc_decoder_kind_t                          decoder_kind  = MC_DECODER_NONE;
     AdapterPick                                adapter_pick{};
@@ -549,6 +555,8 @@ struct Controller::Impl {
         const mc_status_t s = transport->send_rtcp(
             transport::MediaKind::video,
             std::span<const uint8_t>{buf.data(), off});
+        // 性能量度规范 §4.3 mc.fb.pli_sent_count: PLI 发送（含 send_rtcp 失败的尝试）。
+        pal::metric::Registry::instance().counter("mc.fb.pli_sent_count").inc();
         MCP_LOGF(pal::LogLevel::info,
                  "Controller: sent video PLI media_ssrc=0x%08X status=%d",
                  media_ssrc, static_cast<int>(s));
@@ -947,6 +955,37 @@ struct Controller::Impl {
                                                static_cast<uint32_t>(p[11]);
                 send_video_pli(media_ssrc);
             }
+            // Phase 2：RTP seq gap 检测（性能量度规范 §4.2 SEQ_GAP 触发源）。
+            // RTP header 第 2-3 字节是 16-bit sequence number（big endian）。
+            const uint16_t rtp_seq = static_cast<uint16_t>(
+                (static_cast<uint16_t>(p[2]) << 8) | p[3]);
+            if (!video_seq_inited) {
+                video_seq_inited = true;
+                video_seq_last   = rtp_seq;
+            } else {
+                const uint16_t expected = static_cast<uint16_t>(video_seq_last + 1);
+                const int16_t  diff     = static_cast<int16_t>(rtp_seq - expected);
+                if (diff > 0) {
+                    // gap > 0：丢了 diff 个包；标参考链断裂 + 上报 metric。
+                    pal::metric::Registry::instance()
+                        .counter("mc.tput.rtp_loss_count").inc(static_cast<uint64_t>(diff));
+                    if (gate) gate->mark_poisoned(MC_GATE_POISON_SEQ_GAP);
+                    if (depack_h264) depack_h264->mark_reference_lost();
+                    if (depack_h265) depack_h265->mark_reference_lost();
+                    MCP_LOGF(pal::LogLevel::warn,
+                             "Controller: RTP video seq gap = %d (expected=%u got=%u)",
+                             static_cast<int>(diff), expected, rtp_seq);
+                } else if (diff < 0) {
+                    // 乱序（jitter buffer 实装后由它处理；当前仅 inc oo counter）
+                    pal::metric::Registry::instance()
+                        .counter("mc.tput.rtp_oo_count").inc();
+                }
+                // 即使 diff < 0（乱序），video_seq_last 不回退（与 RFC 3550 标准一致）
+                if (diff > 0) video_seq_last = rtp_seq;
+                else if (diff == 0) video_seq_last = rtp_seq;  // 正常顺序
+                // diff < 0 不更新 last
+            }
+
             if (depack_h264)      depack_h264->on_rtp(pts_us, marker, payload, dg.arrival_qpc_ns);
             else if (depack_h265) depack_h265->on_rtp(pts_us, marker, payload, dg.arrival_qpc_ns);
         } else if (dg.kind == transport::MediaKind::audio) {

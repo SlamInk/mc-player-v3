@@ -279,7 +279,7 @@ int APIENTRY wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR cmd_line, int) {
     opts.struct_size            = sizeof(opts);
     opts.struct_version         = MC_OPEN_OPTIONS_VERSION;
     opts.url                    = url.c_str();
-    opts.protocol_hint          = MC_PROTOCOL_RTSP_TCP;     // 强制 TCP interleaved，海康 UDP 不稳定推 audio
+    opts.protocol_hint          = MC_PROTOCOL_AUTO;         // AUTO: 默认 UDP,UDP 失败回退 TCP interleaved
     opts.render_profile_hint    = MC_RENDER_PROFILE_AUTO;
     opts.allow_software_decode  = 1;
     opts.allow_tcp_fallback     = 1;

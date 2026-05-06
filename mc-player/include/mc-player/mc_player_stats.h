@@ -93,17 +93,33 @@ typedef struct mc_hdcm_component_stats_s {
     uint64_t            last_install_duration_ms;       /* 单次安装耗时；type=D 永久 0（跳浏览器）*/
 } mc_hdcm_component_stats_t;
 
-/* Frame Validity Gate 污染源（ADD §5.13 状态生命周期）：
- * 任一污染事件触发后，所有后续帧丢弃，直到下一 refresh anchor（IDR/IRAP/GDR-complete）。 */
+/* Frame Validity Gate 污染源（ADD §5.13 状态生命周期；plan §2.0 6 类细分）：
+ * 任一污染事件触发后，所有后续帧丢弃，直到下一 refresh anchor（IDR/IRAP/GDR-complete）。
+ *
+ * 1 ~ 6: gate 内部按 6 bit 缺失分类（admit() 路径自动判定）
+ * 7:     旧 EXTERNAL 兜底（保留，但应优先用 8 ~ 13 的细分类）
+ * 8 ~ 13: plan §2.0 / Phase 2 引入的 6 类细分外部触发源——
+ *        depack/jitter/codec/controller/render 各自调 mark_poisoned 时显式选择，
+ *        让 mc.gate.tainted_source.{label} metric 能精确指出污染根因（性能量度规范 §4.2）。
+ */
 typedef enum mc_gate_poison_source_e {
     MC_GATE_POISON_NONE             = 0,
-    MC_GATE_POISON_DECODE_ERROR     = 1,    /* MFT decode error / mc-libcodec decode_error */
-    MC_GATE_POISON_REFS_MISSING     = 2,    /* depack 报参考帧 gap */
-    MC_GATE_POISON_PARAMS_MISSING   = 3,    /* SPS/PPS 未缓存 */
-    MC_GATE_POISON_COLOR_MISSING    = 4,    /* 色彩元数据三级兜底未锁定 */
-    MC_GATE_POISON_REORDER_MISSING  = 5,    /* B 帧依赖未到 */
-    MC_GATE_POISON_FENCE_MISSING    = 6,    /* dual-bind fence 未 signal */
-    MC_GATE_POISON_EXTERNAL         = 7     /* device_lost / 重连等外部事件 */
+    MC_GATE_POISON_DECODE_ERROR     = 1,    /* 通用 decode error（gate 内部分类）；
+                                               外部 codec 应优先用 MFT_DECODE_ERR 或 LIBCODEC_DECODE_ERR */
+    MC_GATE_POISON_REFS_MISSING     = 2,    /* gate 内部：refs_resolved bit 缺失 */
+    MC_GATE_POISON_PARAMS_MISSING   = 3,    /* gate 内部：params_present bit 缺失 */
+    MC_GATE_POISON_COLOR_MISSING    = 4,    /* gate 内部：color_meta_known bit 缺失 */
+    MC_GATE_POISON_REORDER_MISSING  = 5,    /* gate 内部：reorder_resolved bit 缺失 */
+    MC_GATE_POISON_FENCE_MISSING    = 6,    /* gate 内部：gpu_fence_signaled bit 缺失 */
+    MC_GATE_POISON_EXTERNAL         = 7,    /* 通用外部事件（保留，应优先用 8-13 细分） */
+
+    /* v3 (Phase 2)：6 类细分污染源 (plan §2.0 / 性能量度规范 §4.2)。 */
+    MC_GATE_POISON_SEQ_GAP          = 8,    /* RTP 序号 gap (controller / jitter→depack 报告) */
+    MC_GATE_POISON_FNUM_GAP         = 9,    /* H.264 frame_num gap / H.265 POC 不连续 (mc-libcodec / depack) */
+    MC_GATE_POISON_MFT_DECODE_ERR   = 10,   /* MFT sample decode error flag (codec_mft_video) */
+    MC_GATE_POISON_DEVICE_LOST      = 11,   /* DXGI/D3D11 DEVICE_REMOVED / DEVICE_RESET (controller/device_lost) */
+    MC_GATE_POISON_ADAPTER_SWITCH   = 12,   /* 跨屏 transition (ADR-013 soft adapter switch) */
+    MC_GATE_POISON_RESIZE_INFLIGHT  = 13    /* ResizeBuffers 前未完成的 in-flight 帧 (render_swap_chain) */
 } mc_gate_poison_source_t;
 
 typedef struct mc_stats_s {
