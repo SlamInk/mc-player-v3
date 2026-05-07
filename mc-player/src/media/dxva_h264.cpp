@@ -455,6 +455,15 @@ void fill_pic_params(DXVA_PicParams_H264&         pp,
     pp.bit_depth_luma_minus8   = sps.bit_depth_luma_minus8;
     pp.bit_depth_chroma_minus8 = sps.bit_depth_chroma_minus8;
 
+    // DXVA H.264 spec quirk: Reserved16Bits 实际不是 reserved,是 driver 私有 scaling
+    // list mode 标志。ffmpeg dxva2_h264.c::ff_dxva2_h264_fill_picture_parameters 默认
+    // 设 3 (FIXME comment: "is there a way to detect the right mode?"),Intel ClearVideo
+    // 老 driver 走 0x34c workaround,部分 driver 接 0。Intel UHD 730 实测设 0 让 driver
+    // 静默 reject SubmitDecoderBuffers (深绿屏:emit 但 NV12 全 0)。设 3 对齐 ffmpeg
+    // 默认。本字段在文件后部仍被 reset 为 0 — 这里先设是为了保护 fill_pic_params 调用
+    // 顺序;后续 zero 是 H.264 spec original 定义。
+    pp.Reserved16Bits          = 3;
+
     pp.StatusReportFeedbackNumber = status_report_id ? status_report_id : 1;
 
     // RefFrameList[16] 默认全 0xFF (未占用),SDK 注释 "/* flag LT */" — AssociatedFlag = long_term。
@@ -502,7 +511,9 @@ void fill_pic_params(DXVA_PicParams_H264&         pp,
     pp.second_chroma_qp_index_offset         = pps.second_chroma_qp_index_offset;
 
     pp.ContinuationFlag                       = 1;
-    pp.Reserved16Bits                         = 0;
+    // 注:Reserved16Bits 已在前部设 3(driver scaling list mode 标志),不再 reset 为 0。
+    // ContinuationFlag = 1 让 driver 按完整 PicParams 字段读;0 = 早期 mode 1 仅读
+    // 前部小段(罕用)。
 }
 
 DXVA_Slice_H264_Short make_slice_short(uint32_t bs_offset, uint32_t bs_bytes) noexcept {

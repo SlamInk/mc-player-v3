@@ -57,6 +57,12 @@ public:
     void        flush() noexcept;
     void        stop() noexcept;
 
+    /// 运行期 silent fail 检测(driver 接受 CreateVideoDecoder 但 DDI 实际跑不通,
+    /// 表现为 GetDecoderBuffer / SubmitDecoderBuffers 持续失败)。controller 在
+    /// tick_ui 周期 poll;true 时主动拆 tier 2 降到 tier 3 sync MFT。
+    /// 与 codec_mft_video::silent_fail_confirmed() 同语义。
+    [[nodiscard]] bool silent_fail_confirmed() const noexcept;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

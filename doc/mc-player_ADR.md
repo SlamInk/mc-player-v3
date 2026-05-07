@@ -192,6 +192,28 @@
 
 ---
 
+## ADR-022 Tier 2 DXVA-direct H.264 默认 strict probe gate（窄化 ADR-015 + 修订 74acb24 informational 路径；对应 ADD §5.6.1 / §5.13）
+
+- **决策**：mc-player Tier 2 DXVA-direct H.264 路径**默认走 fixture probe strict gate** — `probe_dxva_h264_capable()` fail 即降到 Tier 3 sync software MFT（画面正常、+960ms 延迟胜过深绿屏）。env `MCP_TRUST_DRIVER_DXVA=1` 可绕过 probe 走"信任 driver"路径（VLC 风格），env `MCP_ENABLE_DXVA_H264=1/0` 提供强制开关。先前提交 `74acb24` 的"默认信任 driver"决策由本 ADR **窄化为 opt-in**。
+
+- **依据**：
+  - **实证（2026-05-07）**：Intel UHD 730 + Win11 IoT LTSC 26100.8246 上，VLC 同硬件 log 直证命中 d3d11va 硬解（`avcodec: Using D3D11VA (Intel UHD 730 vendor 8086 device 4692)`），但 mc-player tier 2 路径在 `SubmitDecoderBuffers` 返 OK 后 NV12 输出全 0 → 深绿屏（Y=0/UV=0 BT.709 → R=0/G≈95/B=0）。截图证实跨 5 项对照 ffmpeg/VLC 修复后症状仍在：(1) GUID priority list（`1B81BE68 VLD_NoFGT` 替换 `1B81BEA4 STEREO_NoFGT`）；(2) IQ Matrix buffer commit（PP+IQM+SC+BS 4 buffers，flat 16）；(3) DPB ArraySize 6→24；(4) `Reserved16Bits = 3`（ffmpeg `dxva2_h264.c` 默认）；(5) `video_session_mu` 包整段 BeginFrame→EndFrame 修双击 0x087D heap corruption 崩。差异定位收窄到 PicParams 某未深入字段（`UsedForReferenceFlags` / `NonExistingFrameFlags` / `RefPicList` / `FieldOrderCntList` 之一）或 driver workaround flag（如 `FF_DXVA2_WORKAROUND_INTEL_CLEARVIDEO` 让 `Reserved16Bits=0x34c`），实测尚未覆盖。
+  - **正确性优先于延迟（ADD §2 #12）**：用户场景下 tier 3 sync software MFT +960ms 延迟比深绿屏可接受。"默认信任 driver"会让无 tier 2 验证经验的硬件 / driver 组合直接撞上 silent fail。
+  - **Tier 2 路径仍保留 opt-in 通道**：MCP_ENABLE_DXVA_H264=1 / MCP_TRUST_DRIVER_DXVA=1 给已实测过的环境继续用 tier 2 拿低延迟。
+
+- **关系**：
+  - **窄化 ADR-015 + 提交 `74acb24`**：ADR-015 四级降级链不变，但 H.264 tier 2 默认门由"fixture probe informational"恢复"strict gate"。
+  - 与 ADR-002 / ADR-003：sync MFT path 不受影响，driver-side B-frame reorder buffer +100~960ms 延迟代价由 ADD §5.6.4 已知。
+  - 与 §5.13 Frame Validity Gate：本 ADR 不依赖 gate 检测 silent fail（gate 检测的是 emit 时点的 decode_error / refs / params 缺失，driver 接 SubmitDecoderBuffers 但输出全 0 的 silent fail 不在 gate 检测范围内）。
+  - 与 plan：plan/mc-player_重构方案.md 后续 Phase 章节追加"tier 2 DXVA H.264 driver silent fail 深挖"任务，依赖：(a) PicParams 字段级 dump 比对（mc-player vs ffmpeg 同流）；(b) ID3D11InfoQueue 抓 driver 拒绝原因；(c) 试 `Reserved16Bits=0x34c` Intel ClearVideo workaround；(d) 检视 PicParams.RefFrameList / UsedForReferenceFlags 是否漏置长期参考帧。
+
+- **后续工作（待实施）**：
+  1. 在 codec_dxva_video 加 PicParams `dump-when-decode-empty` 探针：第一帧 emit 后 readback Y plane sample，sum=0 → 同步把 PicParams hex 写入诊断 dump，便于离线对照 ffmpeg。
+  2. tier 2 启动后第一帧 silent fail 检测（之前已加 `silent_fail_confirmed_flag`），controller `tick_ui` poll → 自动降 tier 3。这是兜底机制，避免用户硬解开启 + 实际 silent fail 时画面长时间深绿。
+  3. 若实测某 driver 需要 `Reserved16Bits=0x34c`（Intel ClearVideo workaround）才能解，加 vendor=Intel 自动启用此 workaround 的代码路径，对齐 ffmpeg `FF_DXVA2_WORKAROUND_INTEL_CLEARVIDEO`。
+
+---
+
 ## 修订规范
 
 每条 ADR 的"决策"与"依据"正文是**该 ADR 写就时的历史快照**，原则上不再回头修改。当一条决策因实证或新约束被推翻或缩窄时：

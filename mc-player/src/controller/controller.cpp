@@ -871,30 +871,32 @@ struct Controller::Impl {
                 //   逼用户跌到 tier 3 sync software MFT(driver-side B-frame reorder 累
                 //   ~664ms latency)。
                 //
-                // 新策略(VLC 风格,2026-05-07 实证):默认信任 driver
-                // CheckVideoDecoderFormat + CreateVideoDecoder 成功就启用 tier 2,
-                // 不依赖 fixture probe。fixture probe 仅作诊断信息记录。
+                // 修订策略(2026-05-07 实证后,见 ADR-022):
+                //   早期版本(74acb24)默认信任 driver,基于 VLC 同硬件命中 d3d11va 推测
+                //   driver 可用。后续截图验证发现 mc-player tier 2 路径在 Intel UHD 730
+                //   + Win11 IoT LTSC 上 driver silent fail(SubmitDecoderBuffers 返 OK
+                //   但 NV12 全 0 → 深绿屏),即便已对照 ffmpeg/VLC 修 GUID priority +
+                //   IQMatrix + DPB=24 + Reserved16Bits=3 + video session mutex 也未解。
+                //   差异定位在 PicParams 某未知字段。
+                //
+                //   现行默认:严格 probe gate — fixture probe fail 即降 tier 3(画面正常,
+                //   有 +960ms latency 但胜过深绿)。VLC 行为对齐留 ADR-022 跟进。
                 //
                 // env 控制:
-                //   MCP_ENABLE_DXVA_H264=1: 强制启用(等价于默认行为,保留兼容)
-                //   MCP_ENABLE_DXVA_H264=0: 强制禁用(对照测试用)
-                //   MCP_REQUIRE_DXVA_PROBE=1: 严格模式 — fixture probe fail 即降 tier(老行为兜底)
-                //   未设置: 默认信任 driver
-                //
-                // TODO(运行期 silent fail):codec_dxva 第一帧 emit 时做 Y plane readback
-                // 抽样,sum=0/128 → set silent_fail_confirmed,controller tick_ui 周期 poll
-                // 主动降 tier 3。当前缺这一兜底,真 silent fail driver 会黑屏直到用户手动
-                // MCP_ENABLE_DXVA_H264=0 切档。
+                //   MCP_ENABLE_DXVA_H264=1: 强制启用 tier 2(高级用户实测 driver 可用时用)
+                //   MCP_ENABLE_DXVA_H264=0: 强制禁用 tier 2(同当前默认 + 显式)
+                //   MCP_TRUST_DRIVER_DXVA=1: 历史"信任 driver"行为(probe 仅诊断,不阻断)
+                //   未设置: 默认严格(probe fail = 降 tier 3 画面正常)
                 char env_buf[8]; size_t env_n = 0;
                 const bool env_set = getenv_s(&env_n, env_buf, sizeof(env_buf),
                                                "MCP_ENABLE_DXVA_H264") == 0 && env_n > 0;
                 const bool env_force_on  = env_set && env_buf[0] == '1';
                 const bool env_force_off = env_set && env_buf[0] == '0';
 
-                char rp_buf[8]; size_t rp_n = 0;
-                const bool require_probe = (getenv_s(&rp_n, rp_buf, sizeof(rp_buf),
-                                                     "MCP_REQUIRE_DXVA_PROBE") == 0
-                                            && rp_n > 0 && rp_buf[0] == '1');
+                char td_buf[8]; size_t td_n = 0;
+                const bool trust_driver = (getenv_s(&td_n, td_buf, sizeof(td_buf),
+                                                    "MCP_TRUST_DRIVER_DXVA") == 0
+                                           && td_n > 0 && td_buf[0] == '1');
 
                 bool capable;
                 const char* skip_reason = nullptr;
@@ -908,23 +910,21 @@ struct Controller::Impl {
                     MCP_LOG_INFO("Controller: tier2 DXVA H.264 forced on "
                                  "(MCP_ENABLE_DXVA_H264=1)");
                 } else {
-                    // 默认路径:仍跑 fixture probe 但不阻断,作为诊断信号。
                     pal::metric::ScopedTimer pt{reg.timer("mc.probe.tier2_h264_self_test_ns")};
                     const bool probe_pass = media::probe_dxva_h264_capable(d3d_device.Get());
-                    if (require_probe) {
-                        capable = probe_pass;
-                        if (!capable) skip_reason = "self_test_fail_silent_decode";
-                        MCP_LOGF(pal::LogLevel::info,
-                                 "Controller: tier2 DXVA H.264 strict mode "
-                                 "(MCP_REQUIRE_DXVA_PROBE=1) probe=%d → capable=%d",
-                                 probe_pass, capable);
-                    } else {
+                    if (trust_driver) {
                         capable = true;
                         MCP_LOGF(pal::LogLevel::info,
                                  "Controller: tier2 DXVA H.264 fixture probe=%d "
-                                 "(informational; driver trusted by default — VLC-style; "
-                                 "set MCP_REQUIRE_DXVA_PROBE=1 to gate strictly)",
+                                 "(MCP_TRUST_DRIVER_DXVA=1: bypass probe, may green-screen)",
                                  probe_pass);
+                    } else {
+                        capable = probe_pass;
+                        if (!capable) skip_reason = "self_test_fail_silent_decode";
+                        MCP_LOGF(pal::LogLevel::info,
+                                 "Controller: tier2 DXVA H.264 strict probe (default since ADR-022) "
+                                 "probe=%d → capable=%d",
+                                 probe_pass, capable);
                     }
                 }
 
@@ -1182,12 +1182,22 @@ struct Controller::Impl {
                     // gap > 0：丢了 diff 个包；标参考链断裂 + 上报 metric。
                     pal::metric::Registry::instance()
                         .counter("mc.tput.rtp_loss_count").inc(static_cast<uint64_t>(diff));
-                    if (gate) gate->mark_poisoned(MC_GATE_POISON_SEQ_GAP);
-                    if (depack_h264) depack_h264->mark_reference_lost();
-                    if (depack_h265) depack_h265->mark_reference_lost();
+                    // 诊断 env MCP_DISABLE_SEQGAP_POISON=1:跳过 mark_poisoned 让所有
+                    // emit 的 frame 都进 render — 用于检验 driver 实际是否解出真像素
+                    // (vs 全 0 silent fail)。生产场景不应禁。
+                    char dg[8]; size_t dn = 0;
+                    const bool seqgap_poison_disabled =
+                        getenv_s(&dn, dg, sizeof(dg), "MCP_DISABLE_SEQGAP_POISON") == 0
+                        && dn > 0 && dg[0] == '1';
+                    if (!seqgap_poison_disabled) {
+                        if (gate) gate->mark_poisoned(MC_GATE_POISON_SEQ_GAP);
+                        if (depack_h264) depack_h264->mark_reference_lost();
+                        if (depack_h265) depack_h265->mark_reference_lost();
+                    }
                     MCP_LOGF(pal::LogLevel::warn,
-                             "Controller: RTP video seq gap = %d (expected=%u got=%u)",
-                             static_cast<int>(diff), expected, rtp_seq);
+                             "Controller: RTP video seq gap = %d (expected=%u got=%u)%s",
+                             static_cast<int>(diff), expected, rtp_seq,
+                             seqgap_poison_disabled ? " [poison disabled by env]" : "");
                 } else if (diff < 0) {
                     // 乱序（jitter buffer 实装后由它处理；当前仅 inc oo counter）
                     pal::metric::Registry::instance()

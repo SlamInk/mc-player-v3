@@ -804,6 +804,39 @@ struct CodecDxvaVideo::Impl {
 
     void worker_loop() noexcept;
 
+    // ffmpeg 风格 video context 显式互斥 — ID3D10Multithread::SetMultithreadProtected
+    // 对单次方法原子,但 BeginFrame...SubmitDecoderBuffers...EndFrame 之间多次 video_ctx
+    // 调用必须作为整体串行化(ffmpeg dxva2.c::ff_dxva2_lock 用 WaitForSingleObjectEx
+    // 包整个 ff_dxva2_common_end_frame)。explorer 双击启动时序与 PowerShell 不同,
+    // 命中 race window → 0x0000087D heap corruption 崩(D3D11 debug layer 抛)。
+    // 本互斥包 flush_pending_pic_h264 / flush_pending_pic(HEVC)整段 decode session。
+    std::mutex            video_session_mu;
+
+    // 运行期 silent fail 检测(ADR-015 兜底):driver 接受 CreateVideoDecoder 但
+    // GetDecoderBuffer/SubmitDecoderBuffers 持续失败(Intel UHD 730 + IoT LTSC
+    // 实测,VLC fixture probe 也 fail)。worker 每 flush 一帧:成功 reset,失败 ++。
+    // 阈值 60 帧(@30fps ≈ 2s)即认 silent fail confirmed,controller tick_ui 周期
+    // poll 后主动拆 tier 2 → 启 tier 3 sync MFT(画面正常但延时 ~960ms,胜过深绿屏)。
+    std::atomic<bool>     silent_fail_confirmed_flag{false};
+    std::atomic<uint32_t> consecutive_decode_failures{0};
+    static constexpr uint32_t kSilentFailThreshold = 60;
+    void note_decode_outcome(bool ok) noexcept {
+        if (ok) {
+            consecutive_decode_failures.store(0, std::memory_order_release);
+        } else {
+            const uint32_t n = consecutive_decode_failures.fetch_add(
+                1, std::memory_order_acq_rel) + 1;
+            if (n == kSilentFailThreshold) {
+                silent_fail_confirmed_flag.store(true, std::memory_order_release);
+                MCP_LOGF(pal::LogLevel::error,
+                         "CodecDxvaVideo: silent_fail_confirmed after %u consecutive "
+                         "decode failures (driver accepts CreateVideoDecoder but "
+                         "GetDecoderBuffer/SubmitDecoderBuffers fail) — controller "
+                         "should demote tier 2 → tier 3", n);
+            }
+        }
+    }
+
     // ── lifecycle ──
     HRESULT init_video_device() noexcept {
         HRESULT hr = cfg.device.As(&video_device);
@@ -1169,6 +1202,9 @@ struct CodecDxvaVideo::Impl {
 
     // 提交 pic_params + slice_ctrl + bitstream → DecoderEndFrame → 拷贝到 output pool → emit
     bool flush_pending_pic() noexcept {
+        // video session 互斥(对齐 ffmpeg dxva2.c::ff_dxva2_lock,见 H.264 路径同名注释)。
+        // 用 unique_lock 显式控制,emit 前释放避免序列化 render thread。
+        std::unique_lock<std::mutex> session_lock{video_session_mu};
         if (!has_pic || !decoder || !cur_sps || !cur_pps) {
             has_pic = false;
             return false;
@@ -1231,6 +1267,9 @@ struct CodecDxvaVideo::Impl {
             if (FAILED(hr)) {
                 MCP_LOGF(pal::LogLevel::warn,
                          "CodecDxvaVideo: SubmitDecoderBuffers hr=0x%08lX", hr);
+                note_decode_outcome(false);
+            } else {
+                note_decode_outcome(true);
             }
         } else {
             MCP_LOGF(pal::LogLevel::warn,
@@ -1296,6 +1335,9 @@ struct CodecDxvaVideo::Impl {
                      "CodecDxvaVideo: first frame emit pts=%lld slice=%u poc=%d",
                      static_cast<long long>(cur_pts_us), out_slice, cur_poc);
         }
+        // 释放 video session lock,emit → controller → gate.admit → render.on_admitted
+        // 走 immediate ctx 由 ID3D10Multithread protect 自身保护,不需要 video_session_mu。
+        if (session_lock.owns_lock()) session_lock.unlock();
         if (cfg.emit) cfg.emit(std::move(f));
         ++emit_count;
 
@@ -1433,13 +1475,32 @@ struct CodecDxvaVideo::Impl {
 
     HRESULT init_decoder_h264(const h264::Sps& s) noexcept {
         if (decoder_inited) return S_OK;
-        // 枚举 driver 暴露的所有 H.264 GUID;按 MCP_DXVA_H264_GUID env var (索引 0/1/2/3) 选;
-        // 默认 0 = driver 列表首个 supported (ffmpeg D3D11VA 同样策略)。
-        UINT pick_idx = 0;
+        // 按 ffmpeg/libavcodec/dxva2.c 风格的优先级表选 GUID,而非 driver 列表
+        // 第一个。Intel UHD 730 driver 实测列表首个返 STEREO_NoFGT (1B81BEA4),
+        // 用它解普通 H.264 流 driver 拒 GetDecoderBuffer(PP)(VLC 同硬件选 VLD_NoFGT
+        // 1B81BE68 立即成功)。STEREO/MULTIVIEW 是 H.264 3D 扩展专用,普通流不能用。
+        //
+        // 优先级(高 → 低):
+        //   1. VLD_NoFGT       (1B81BE68) 主流首选 — VLC/ffmpeg 默认
+        //   2. VLD_FGT         (1B81BE69) FGT(膜噪声)备选
+        //   3. VLD_WITHFMOASO_NoFGT (1B81BE94) FMO/ASO 特殊用,极少见现网
+        //   ~~ STEREO / MULTIVIEW (1B81BEA2/A4/A6) ~~ H.264 3D/MVC 专用,跳过
+        //
+        // env MCP_DXVA_H264_GUID=N (N=0/1/2/3) 强制按 driver 列表索引选,绕过优先级。
+        constexpr GUID kPriorityGuids[] = {
+            { 0x1B81BE68, 0xA0C7, 0x11D3, { 0xB9, 0x84, 0x00, 0xC0, 0x4F, 0x2E, 0x73, 0xC5 } },  // VLD_NoFGT
+            { 0x1B81BE69, 0xA0C7, 0x11D3, { 0xB9, 0x84, 0x00, 0xC0, 0x4F, 0x2E, 0x73, 0xC5 } },  // VLD_FGT
+            { 0x1B81BE94, 0xA0C7, 0x11D3, { 0xB9, 0x84, 0x00, 0xC0, 0x4F, 0x2E, 0x73, 0xC5 } },  // VLD_WITHFMOASO_NoFGT
+        };
+        constexpr int kPriCount = sizeof(kPriorityGuids) / sizeof(kPriorityGuids[0]);
+
+        bool env_override = false;
+        UINT env_idx = 0;
         {
             char buf[8]; size_t n = 0;
             if (getenv_s(&n, buf, sizeof(buf), "MCP_DXVA_H264_GUID") == 0 && n > 0) {
-                pick_idx = static_cast<UINT>(buf[0] - '0');
+                env_override = true;
+                env_idx = static_cast<UINT>(buf[0] - '0');
             }
         }
         {
@@ -1461,11 +1522,45 @@ struct CodecDxvaVideo::Impl {
                 if (supported) h264_guids.push_back(g);
             }
             if (!h264_guids.empty()) {
-                if (pick_idx >= h264_guids.size()) pick_idx = 0;
-                profile = h264_guids[pick_idx];
-                MCP_LOGF(pal::LogLevel::info,
-                         "CodecDxvaVideo: H.264 picked GUID[%u]={%08X-...} (env MCP_DXVA_H264_GUID=%u)",
-                         pick_idx, profile.Data1, pick_idx);
+                bool picked = false;
+                if (env_override) {
+                    if (env_idx < h264_guids.size()) {
+                        profile = h264_guids[env_idx];
+                        picked  = true;
+                        MCP_LOGF(pal::LogLevel::warn,
+                                 "CodecDxvaVideo: H.264 picked GUID[%u]={%08X-...} "
+                                 "(MCP_DXVA_H264_GUID=%u env override; bypassing priority list)",
+                                 env_idx, profile.Data1, env_idx);
+                    }
+                }
+                if (!picked) {
+                    // 按优先级表选第一个 driver 暴露的标准 H.264 GUID。
+                    for (int p = 0; p < kPriCount && !picked; ++p) {
+                        for (const auto& g : h264_guids) {
+                            if (std::memcmp(&g, &kPriorityGuids[p], sizeof(GUID)) == 0) {
+                                profile = g;
+                                picked  = true;
+                                const char* name = (p == 0 ? "VLD_NoFGT"
+                                                    : p == 1 ? "VLD_FGT"
+                                                    : "VLD_WITHFMOASO_NoFGT");
+                                MCP_LOGF(pal::LogLevel::info,
+                                         "CodecDxvaVideo: H.264 picked %s ({%08X-...}) by priority",
+                                         name, profile.Data1);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if (!picked) {
+                    // 优先级表全没命中(driver 只暴露 stereo/multiview 这种边缘 profile);
+                    // 退到列表首个,记 warn — 这种 driver 现网极罕见。
+                    profile = h264_guids[0];
+                    MCP_LOGF(pal::LogLevel::warn,
+                             "CodecDxvaVideo: H.264 priority-list miss, fall back to "
+                             "GUID[0]={%08X-...} (driver did not expose any standard "
+                             "VLD profile; tier 2 may fail)",
+                             profile.Data1);
+                }
             }
         }
         HRESULT hr = pick_decoder_config(s.pic_width_in_samples_l,
@@ -1488,12 +1583,17 @@ struct CodecDxvaVideo::Impl {
         }
         dec_w = s.pic_width_in_samples_l;
         dec_h = s.pic_height_in_samples_l;
-        // DPB 大小:num_ref_frames + 1 (current) + 余量;下界 4,上界 20。
-        dpb_size = std::max<UINT>(static_cast<UINT>(s.num_ref_frames) + 2u, 4u);
+        // DPB 大小:对齐 ffmpeg/VLC d3d11va.c — surface_count = num_ref + reorder
+        // window + 当前 pic + driver 内部 pipeline buffer。VLC 实测在 Intel UHD 730
+        // 上用 24 surfaces,1280x720 创建 ID3D11VideoDecoderOutputView 成功。
+        // 之前 mc-player 用 num_ref+2 (= 6 for num_ref=4) 不够 driver pipeline 内部
+        // 周转 → silent fail (driver 接 SubmitDecoderBuffers 但输出全 0 NV12 深绿屏)。
+        // 下界提到 16,上界 24。
+        dpb_size = std::max<UINT>(static_cast<UINT>(s.num_ref_frames) + 2u, 16u);
         if (cfg_used.ConfigMinRenderTargetBuffCount > dpb_size) {
             dpb_size = cfg_used.ConfigMinRenderTargetBuffCount;
         }
-        if (dpb_size > 20) dpb_size = 20;
+        if (dpb_size > 24) dpb_size = 24;
 
         const UINT tex_w = (dec_w + 1u) & ~1u;
         const UINT tex_h = (dec_h + 1u) & ~1u;
@@ -1563,6 +1663,10 @@ struct CodecDxvaVideo::Impl {
     }
 
     bool flush_pending_pic_h264() noexcept {
+        // video session 互斥(对齐 ffmpeg dxva2.c::ff_dxva2_lock):仅锁 BeginFrame
+        // → SubmitDecoderBuffers → DecoderEndFrame 这段,emit 之前显式 unlock 让
+        // render thread / SRV upload 不被序列化(否则 presents fps 跌一半)。
+        std::unique_lock<std::mutex> session_lock{video_session_mu};
         if (!has_pic || !decoder || !cur_h264_sps || !cur_h264_pps) {
             has_pic = false;
             return false;
@@ -1713,36 +1817,64 @@ struct CodecDxvaVideo::Impl {
                      pp.slice_group_change_rate_minus1);
         }
 
+        // DXVA H.264 Inverse Quantization Matrix(IQMatrix)。
+        // ffmpeg/VLC libavcodec 始终 commit 这个 buffer(即便 PPS 没自定义 scaling list,
+        // 也填 default flat 16)。Intel UHD 730 driver 实测:不传 IQMatrix 则
+        // GetDecoderBuffer(PICTURE_PARAMETERS) 持续失败(pp=0 sc=1 bs=1)。这是
+        // mc-player 直驱 ID3D11VideoDevice 路径与 ffmpeg 路径对齐的关键步骤。
+        //
+        // DXVA_Qmatrix_H264:6 个 4x4 list (96 bytes) + 2 个 8x8 list (128 bytes)
+        //                   = 224 bytes。flat 16 = H.264 spec 默认 scaling list,
+        //                   PPS pic_scaling_matrix_present_flag=0 时即此值。
+        // TODO:PPS pic_scaling_matrix_present_flag=1 时按 PPS 实际 scaling list 填。
+        DXVA_Qmatrix_H264 qm{};
+        for (int i = 0; i < 6; ++i)
+            for (int j = 0; j < 16; ++j) qm.bScalingLists4x4[i][j] = 16;
+        for (int i = 0; i < 2; ++i)
+            for (int j = 0; j < 64; ++j) qm.bScalingLists8x8[i][j] = 16;
+
+        // 调用顺序对齐 ffmpeg/libavcodec/dxva2.c::ff_dxva2_common_end_frame:
+        // PP → IQM → BS → SC。Intel UHD 730 driver 实测对顺序敏感:SC 在 BS 之前 Get
+        // 会让 driver 在 BS Get 时拒绝 PP/QM(driver 内部 reorder pending state)。
         const bool ok_pp = submit_buffer(D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS,
                                           &pp, sizeof(pp));
+        const bool ok_qm = submit_buffer(D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX,
+                                          &qm, sizeof(qm));
+        const bool ok_bs = submit_buffer(D3D11_VIDEO_DECODER_BUFFER_BITSTREAM,
+                                          bitstream_buf.data(), bitstream_buf.size());
         const bool ok_sc = submit_buffer(D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL,
                                           h264_slice_ctrl.data(),
                                           h264_slice_ctrl.size() * sizeof(DXVA_Slice_H264_Short));
-        const bool ok_bs = submit_buffer(D3D11_VIDEO_DECODER_BUFFER_BITSTREAM,
-                                          bitstream_buf.data(), bitstream_buf.size());
 
-        if (ok_pp && ok_sc && ok_bs) {
-            D3D11_VIDEO_DECODER_BUFFER_DESC bd[3]{};
+        if (ok_pp && ok_qm && ok_sc && ok_bs) {
+            D3D11_VIDEO_DECODER_BUFFER_DESC bd[4]{};
             bd[0].BufferType = D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS;
             bd[0].DataSize   = sizeof(pp);
-            bd[1].BufferType = D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL;
-            bd[1].DataSize   = static_cast<UINT>(h264_slice_ctrl.size() * sizeof(DXVA_Slice_H264_Short));
-            bd[2].BufferType = D3D11_VIDEO_DECODER_BUFFER_BITSTREAM;
-            bd[2].DataSize   = static_cast<UINT>(bitstream_buf.size());
-            hr = video_ctx->SubmitDecoderBuffers(decoder.Get(), 3, bd);
+            bd[1].BufferType = D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX;
+            bd[1].DataSize   = sizeof(qm);
+            bd[2].BufferType = D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL;
+            bd[2].DataSize   = static_cast<UINT>(h264_slice_ctrl.size() * sizeof(DXVA_Slice_H264_Short));
+            bd[3].BufferType = D3D11_VIDEO_DECODER_BUFFER_BITSTREAM;
+            bd[3].DataSize   = static_cast<UINT>(bitstream_buf.size());
+            hr = video_ctx->SubmitDecoderBuffers(decoder.Get(), 4, bd);
             const bool have_vctx1 = false;     // SubmitDecoderBuffers1 测试无差异,回归 legacy。
             if (FAILED(hr)) {
                 MCP_LOGF(pal::LogLevel::warn,
                          "CodecDxvaVideo: H.264 SubmitDecoderBuffers hr=0x%08lX", hr);
-            } else if (trace_first) {
-                MCP_LOGF(pal::LogLevel::info,
-                         "CodecDxvaVideo: H.264 SubmitDecoderBuffers#%u OK", pic_count);
+                note_decode_outcome(false);
+            } else {
+                note_decode_outcome(true);
+                if (trace_first) {
+                    MCP_LOGF(pal::LogLevel::info,
+                             "CodecDxvaVideo: H.264 SubmitDecoderBuffers#%u OK (4 buffers: PP+IQM+SC+BS)", pic_count);
+                }
             }
             (void)have_vctx1;
         } else {
+            note_decode_outcome(false);
             MCP_LOGF(pal::LogLevel::warn,
-                     "CodecDxvaVideo: H.264 GetDecoderBuffer/Release failed (pp=%d sc=%d bs=%d)",
-                     ok_pp, ok_sc, ok_bs);
+                     "CodecDxvaVideo: H.264 GetDecoderBuffer/Release failed (pp=%d qm=%d sc=%d bs=%d)",
+                     ok_pp, ok_qm, ok_sc, ok_bs);
         }
 
         hr = video_ctx->DecoderEndFrame(decoder.Get());
@@ -1878,6 +2010,9 @@ struct CodecDxvaVideo::Impl {
                      emit_count + 1, static_cast<long long>(cur_pts_us), out_slice, cur_poc,
                      cur_h264_frame_num, f.validity_mask, f.is_keyframe, refs_armed);
         }
+        // 释放 video session lock — emit → render 走 immediate ctx 自身的 ID3D10Multithread
+        // 保护,不需要 video_session_mu。
+        if (session_lock.owns_lock()) session_lock.unlock();
         if (cfg.emit) cfg.emit(std::move(f));
         ++emit_count;
 
@@ -2057,6 +2192,10 @@ struct CodecDxvaVideo::Impl {
             const std::size_t align = 128;
             const std::size_t pad   = (align - (bitstream_buf.size() % align)) % align;
             bitstream_buf.insert(bitstream_buf.end(), pad, 0);
+            // 注:之前尝试过 ffmpeg 风格 last_slice.SliceBytesInBuffer += pad,
+            // 但实测让 Intel UHD 730 driver 解码出 decode_error → gate poison drop
+            // 50% 帧。本 driver 似乎更喜欢 SliceBytesInBuffer 严格等于真实 NAL+起始码
+            // 长度,不含 padding。padding 字节存在于 bitstream buffer 但不计入 slice。
             flush_pending_pic_h264();
         }
     }
@@ -2151,6 +2290,10 @@ void CodecDxvaVideo::flush() noexcept {
         else                 impl_->flush_pending_pic();
     }
     impl_->reset_dpb();
+}
+
+bool CodecDxvaVideo::silent_fail_confirmed() const noexcept {
+    return impl_ && impl_->silent_fail_confirmed_flag.load(std::memory_order_acquire);
 }
 
 void CodecDxvaVideo::stop() noexcept {
