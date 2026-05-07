@@ -466,6 +466,212 @@ bool parse_slice_header_min(std::span<const uint8_t> rbsp,
     return out.valid;
 }
 
+// ─── H.264 DXVA capability self-test ──────────────────────────────
+// 用 64x64 baseline H.264 IDR fixture 实际跑一帧端到端 decode + NV12 readback,
+// 验证 driver 真能解码而不是仅 CheckVideoDecoderFormat 表面 supported。
+// 解决 Intel UHD 730 等驱动 silent fail (返 OK 但 DPB 全 0) 这类伪 supported 问题。
+//
+// Fixture: ffmpeg libx264 baseline profile + CAVLC + 单帧 IDR + 64x64 全黑色 input,
+//          移除 SEI NAL → 纯 SPS+PPS+IDR 共 61 字节 Annex-B 流。
+constexpr uint8_t kH264ProbeFixture[] = {
+    0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xC0, 0x0A,    // SPS NAL (profile=66 baseline, level=10)
+    0xDC, 0x42, 0x6C, 0x04, 0x40, 0x00, 0x00, 0x03,
+    0x00, 0x40, 0x00, 0x00, 0x03, 0x00, 0x83, 0xC4,
+    0x89, 0xE0,
+    0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x0F, 0x2C, 0x80,    // PPS NAL
+    0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x04,    // IDR slice NAL (ref_idc=3, type=5)
+    0xBC, 0x98, 0xA0, 0x00, 0x38, 0xA3, 0x27, 0x27,
+    0x27, 0x5D, 0x75, 0xD7, 0x5D, 0x75, 0xD7, 0x5D,
+    0x75, 0xD7, 0x80,
+};
+
+DEFINE_GUID(kProbeH264VldNoFGT,
+    0x1b81be68, 0xa0c7, 0x11d3, 0xb9, 0x84, 0x00, 0xc0, 0x4f, 0x2e, 0x73, 0xc5);
+
+[[nodiscard]] bool probe_h264_dxva_decode_capable(ID3D11Device* device) noexcept {
+    if (!device) return false;
+    using Microsoft::WRL::ComPtr;
+
+    ComPtr<ID3D11VideoDevice>  vdev;
+    ComPtr<ID3D11DeviceContext> ctx;
+    ComPtr<ID3D11VideoContext> vctx;
+    if (FAILED(device->QueryInterface(IID_PPV_ARGS(&vdev)))) return false;
+    device->GetImmediateContext(&ctx);
+    if (FAILED(ctx.As(&vctx))) return false;
+
+    // 找一个 driver 暴露的 H.264 GUID + ConfigBitstreamRaw=1 config。
+    GUID profile_guid{};
+    bool found_profile = false;
+    {
+        const UINT n_prof = vdev->GetVideoDecoderProfileCount();
+        for (UINT i = 0; i < n_prof; ++i) {
+            GUID g{};
+            if (FAILED(vdev->GetVideoDecoderProfile(i, &g))) continue;
+            if (g != kProbeH264VldNoFGT) continue;
+            BOOL supported = FALSE;
+            if (FAILED(vdev->CheckVideoDecoderFormat(&g, DXGI_FORMAT_NV12, &supported))) continue;
+            if (supported) { profile_guid = g; found_profile = true; break; }
+        }
+    }
+    if (!found_profile) {
+        MCP_LOG_WARN("CodecDxvaVideo: H.264 self-test — driver 不支持 VLD_NoFGT");
+        return false;
+    }
+
+    D3D11_VIDEO_DECODER_DESC desc{};
+    desc.Guid = profile_guid;
+    desc.SampleWidth  = 64;
+    desc.SampleHeight = 64;
+    desc.OutputFormat = DXGI_FORMAT_NV12;
+
+    UINT n_cfg = 0;
+    if (FAILED(vdev->GetVideoDecoderConfigCount(&desc, &n_cfg)) || n_cfg == 0) {
+        MCP_LOG_WARN("CodecDxvaVideo: H.264 self-test — GetVideoDecoderConfigCount=0");
+        return false;
+    }
+    D3D11_VIDEO_DECODER_CONFIG cfg{};
+    bool found_cfg = false;
+    for (UINT i = 0; i < n_cfg; ++i) {
+        D3D11_VIDEO_DECODER_CONFIG c{};
+        if (FAILED(vdev->GetVideoDecoderConfig(&desc, i, &c))) continue;
+        if (c.ConfigBitstreamRaw == 1) { cfg = c; found_cfg = true; break; }
+    }
+    if (!found_cfg) {
+        MCP_LOG_WARN("CodecDxvaVideo: H.264 self-test — 无 ConfigBitstreamRaw=1 config");
+        return false;
+    }
+
+    ComPtr<ID3D11VideoDecoder> decoder;
+    if (FAILED(vdev->CreateVideoDecoder(&desc, &cfg, &decoder))) {
+        MCP_LOG_WARN("CodecDxvaVideo: H.264 self-test — CreateVideoDecoder 失败");
+        return false;
+    }
+
+    D3D11_TEXTURE2D_DESC td{};
+    td.Width = 64; td.Height = 64;
+    td.MipLevels = 1; td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_NV12;
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_DECODER;
+    ComPtr<ID3D11Texture2D> dpb_tex;
+    if (FAILED(device->CreateTexture2D(&td, nullptr, &dpb_tex))) return false;
+
+    D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC vd{};
+    vd.DecodeProfile = profile_guid;
+    vd.ViewDimension = D3D11_VDOV_DIMENSION_TEXTURE2D;
+    vd.Texture2D.ArraySlice = 0;
+    ComPtr<ID3D11VideoDecoderOutputView> view;
+    if (FAILED(vdev->CreateVideoDecoderOutputView(dpb_tex.Get(), &vd, &view))) return false;
+
+    // PicParams: minimal H.264 baseline IDR (64x64,frame_num=0,POC=0,no refs)。
+    DXVA_PicParams_H264 pp{};
+    pp.wFrameWidthInMbsMinus1  = 3;     // 64/16-1
+    pp.wFrameHeightInMbsMinus1 = 3;
+    pp.CurrPic.bPicEntry       = 0x00;  // DPB[0]
+    pp.num_ref_frames          = 1;
+    pp.chroma_format_idc       = 1;
+    pp.RefPicFlag              = 1;
+    pp.MbsConsecutiveFlag      = 1;
+    pp.frame_mbs_only_flag     = 1;
+    pp.IntraPicFlag            = 1;
+    pp.bit_depth_luma_minus8   = 0;
+    pp.bit_depth_chroma_minus8 = 0;
+    pp.StatusReportFeedbackNumber = 1;
+    for (auto& e : pp.RefFrameList) e.bPicEntry = 0xFF;
+    pp.UsedForReferenceFlags = 0;
+    pp.NonExistingFrameFlags = 0;
+    pp.ContinuationFlag      = 1;
+    pp.log2_max_frame_num_minus4         = 0;
+    pp.pic_order_cnt_type                = 0;
+    pp.log2_max_pic_order_cnt_lsb_minus4 = 0;
+    pp.direct_8x8_inference_flag         = 0;
+    pp.entropy_coding_mode_flag          = 0;     // CAVLC (baseline)
+    pp.deblocking_filter_control_present_flag = 1;
+
+    // Slice ctrl: 整个 fixture 第三个 NAL (IDR slice) 的位置和大小。
+    // SPS = bytes 0..25 (26 bytes), PPS = bytes 26..34 (9 bytes), IDR = bytes 35..60 (26 bytes)。
+    DXVA_Slice_H264_Short sc{};
+    sc.BSNALunitDataLocation = 35;
+    sc.SliceBytesInBuffer    = 26;
+    sc.wBadSliceChopping     = 0;
+
+    if (FAILED(vctx->DecoderBeginFrame(decoder.Get(), view.Get(), 0, nullptr))) {
+        MCP_LOG_WARN("CodecDxvaVideo: H.264 self-test — DecoderBeginFrame 失败");
+        return false;
+    }
+
+    auto submit = [&](D3D11_VIDEO_DECODER_BUFFER_TYPE type, const void* src, std::size_t n) -> bool {
+        UINT bs = 0; void* bp = nullptr;
+        if (FAILED(vctx->GetDecoderBuffer(decoder.Get(), type, &bs, &bp))) return false;
+        if (n > bs) { vctx->ReleaseDecoderBuffer(decoder.Get(), type); return false; }
+        std::memcpy(bp, src, n);
+        return SUCCEEDED(vctx->ReleaseDecoderBuffer(decoder.Get(), type));
+    };
+    // bitstream 必须 padding 到 128-byte 对齐。
+    std::vector<uint8_t> bs_buf(kH264ProbeFixture, kH264ProbeFixture + sizeof(kH264ProbeFixture));
+    const std::size_t pad = (128 - (bs_buf.size() % 128)) % 128;
+    bs_buf.insert(bs_buf.end(), pad, 0);
+
+    bool ok = true;
+    ok &= submit(D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS, &pp, sizeof(pp));
+    ok &= submit(D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL, &sc, sizeof(sc));
+    ok &= submit(D3D11_VIDEO_DECODER_BUFFER_BITSTREAM, bs_buf.data(), bs_buf.size());
+    if (ok) {
+        D3D11_VIDEO_DECODER_BUFFER_DESC bd[3]{};
+        bd[0].BufferType = D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS;
+        bd[0].DataSize   = sizeof(pp);
+        bd[1].BufferType = D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL;
+        bd[1].DataSize   = sizeof(sc);
+        bd[2].BufferType = D3D11_VIDEO_DECODER_BUFFER_BITSTREAM;
+        bd[2].DataSize   = static_cast<UINT>(bs_buf.size());
+        if (FAILED(vctx->SubmitDecoderBuffers(decoder.Get(), 3, bd))) ok = false;
+    }
+    if (FAILED(vctx->DecoderEndFrame(decoder.Get()))) ok = false;
+    if (!ok) {
+        MCP_LOG_WARN("CodecDxvaVideo: H.264 self-test — submit/end frame 失败");
+        return false;
+    }
+
+    // NV12 readback: fixture 是全黑 → Y plane 应该 ≈ 16 (BT.709 limited 黑值);
+    // driver silent fail 时 Y 全 0 (truly empty) 或全 128 (driver 中性灰)。
+    D3D11_TEXTURE2D_DESC sd{};
+    sd.Width = 64; sd.Height = 64 + 32;     // Y + UV/2
+    sd.MipLevels = 1; sd.ArraySize = 1;
+    sd.Format = DXGI_FORMAT_NV12;
+    sd.SampleDesc.Count = 1;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    ComPtr<ID3D11Texture2D> staging;
+    if (FAILED(device->CreateTexture2D(&sd, nullptr, &staging))) return false;
+    ctx->CopySubresourceRegion(staging.Get(), 0, 0, 0, 0, dpb_tex.Get(), 0, nullptr);
+
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (FAILED(ctx->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m))) return false;
+    const uint8_t* y = static_cast<const uint8_t*>(m.pData);
+    uint64_t y_sum = 0;
+    uint8_t  y_min = 255, y_max = 0;
+    for (UINT r = 0; r < 8; ++r) {
+        const uint8_t* row = y + static_cast<std::size_t>(r) * m.RowPitch;
+        for (UINT c = 0; c < 64; ++c) {
+            y_sum += row[c];
+            if (row[c] < y_min) y_min = row[c];
+            if (row[c] > y_max) y_max = row[c];
+        }
+    }
+    ctx->Unmap(staging.Get(), 0);
+
+    // 全黑 IDR: Y 应该 ≈ 16 (limited range black),允许 14-32 容差。
+    // 全 0 = driver silent fail。全 128 = driver 中性灰 fill (decode 启动但 fail)。
+    const bool plausible_black = (y_min >= 8 && y_max <= 64);
+    const bool actual_decoded  = (y_sum > 0) && plausible_black;
+    MCP_LOGF(actual_decoded ? pal::LogLevel::info : pal::LogLevel::warn,
+             "CodecDxvaVideo: H.264 self-test NV12 Y[8x64] sum=%llu min=%u max=%u → capable=%d "
+             "(全 0/128 = driver silent fail;~16 = 全黑 IDR 解码成功)",
+             static_cast<unsigned long long>(y_sum), y_min, y_max, actual_decoded);
+    return actual_decoded;
+}
+
 }  // namespace (anonymous)
 
 // ─── Impl ──────────────────────────────────────────────────────
@@ -1994,5 +2200,11 @@ void CodecDxvaVideo::Impl::worker_loop() noexcept {
 // 视频路径不在 worker_loop 主动 drop_oldest — 见 kAuQueueCap 注释。
 // (旧代码:while (au_queue.approx_size() > 1) try_drop_oldest();
 //  导致 ref 链每帧都断,driver 静默输出黑 NV12,Phase 4 实测黑屏根因)
+
+// ─── 公开 capability self-test 入口 ──────────────────────────────
+// controller 在 ADR-015 tier 2 选档前调用,replace 表面 CheckVideoDecoderFormat。
+bool probe_dxva_h264_capable(ID3D11Device* device) noexcept {
+    return probe_h264_dxva_decode_capable(device);
+}
 
 }  // namespace mcp::media

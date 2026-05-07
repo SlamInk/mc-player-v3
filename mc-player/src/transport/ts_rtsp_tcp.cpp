@@ -58,6 +58,14 @@ struct ParsedUrl {
 };
 
 bool parse_rtsp_url(std::string_view url, ParsedUrl& out) noexcept {
+    // 与 ts_rtsp_udp.cpp::parse_rtsp_url 保持一致:trim ASCII 空白,
+    // 防御 caller 传入含尾部空格的 URL 触发 SETUP 拼接畸形 URI(详见 udp 版注释)。
+    auto is_ws = [](char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f';
+    };
+    while (!url.empty() && is_ws(url.front())) url.remove_prefix(1);
+    while (!url.empty() && is_ws(url.back()))  url.remove_suffix(1);
+
     auto sch_end = url.find("://");
     if (sch_end == std::string_view::npos) return false;
     out.scheme.assign(url.substr(0, sch_end));
@@ -195,6 +203,10 @@ public:
             return MC_ERR_PROTOCOL;
         }
 
+        // PLAY 之前先发布 channel_map(release 同步),防止 server 在 PLAY 前发 interleaved
+        // 触发 unordered_map concurrent emplace+find race。channel_map_ 自此 read-only。
+        channels_published_.store(true, std::memory_order_release);
+
         if (mc_status_t s = client_.do_play(base_url_, session_id_, connect_timeout_ms); s != MC_OK) {
             close_unlocked();
             return s;
@@ -224,6 +236,9 @@ public:
     mc_status_t send_rtcp(MediaKind kind, std::span<const uint8_t> bytes) noexcept override {
         if (bytes.empty() || bytes.size() > 0xFFFF) return MC_ERR_INVALID_ARG;
         if (!running_.load(std::memory_order_acquire)) return MC_ERR_INVALID_STATE;
+        // 与 dispatch_interleaved 同样需要 acquire 同步,否则 SETUP 期间用户调 send_rtcp
+        // 与 line 192 的 emplace 并发 → unordered_map UB。
+        if (!channels_published_.load(std::memory_order_acquire)) return MC_ERR_INVALID_STATE;
         uint8_t ch;
         {
             auto it = rtcp_ch_by_kind_.find(kind);
@@ -414,6 +429,9 @@ private:
     }
 
     void dispatch_interleaved(uint8_t ch, std::span<const uint8_t> payload) noexcept {
+        // 在 channel_map_ 完全发布前(SETUP 阶段)直接 drop,与 channels_published_.store
+        // release 配对,确保读侧看到完整 map 写入结果而不是半态 hashtable。
+        if (!channels_published_.load(std::memory_order_acquire)) return;
         auto it = channel_map_.find(ch);
         if (it == channel_map_.end()) return;
         if (!it->second.is_rtcp) {
@@ -477,10 +495,15 @@ private:
     uint32_t                    keepalive_ms_    = kDefaultKeepaliveMs;
 
     // interleaved channel → media 路由
+    // RX 线程在 SETUP 期间已 running,但 channel_map_ 由用户线程在 SETUP 后才填(line 185)。
+    // PLAY 200 OK 之前 server 不应发 interleaved 帧,但畸形流仍可能 race;
+    // channels_published_ 给 RX 一道 happens-before 同步点(release 写,acquire 读)
+    // 让 dispatch_interleaved 在写入完成前直接 drop,杜绝 unordered_map 半态读。
     std::unordered_map<uint8_t, ChannelInfo> channel_map_;
     std::vector<SdpMedia::Kind>              channel_kinds_;
     // 出站 RTCP 路由：MediaKind → interleaved channel
     std::unordered_map<MediaKind, uint8_t>   rtcp_ch_by_kind_;
+    std::atomic<bool>                        channels_published_{false};
 };
 
 }  // namespace

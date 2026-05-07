@@ -214,6 +214,19 @@ void run_stats_pump(mc_player_t player, std::atomic<bool>& stop) {
                          static_cast<unsigned long long>(s.gate_poison_enter_count),
                          static_cast<unsigned long long>(s.gate_poison_drops));
             }
+            // 9 段 stage p95 + e2e_client_internal —— 性能量度规范 §2 hot path 分解。
+            // 单位 ns,展示用 µs(整数除法 1000)便于读;0 表示该段尚无样本(未启用 / 冷启动)。
+            log_line("[mc-player] p95 us  rx=%llu jitter=%llu depack=%llu dec_alloc=%llu dec_actual=%llu dec_out=%llu upload=%llu yuv2rgb=%llu present_q=%llu | e2e_internal=%llu",
+                     static_cast<unsigned long long>(s.stage_udp_rx_p95_ns        / 1000),
+                     static_cast<unsigned long long>(s.stage_jitter_dwell_p95_ns  / 1000),
+                     static_cast<unsigned long long>(s.stage_depack_p95_ns        / 1000),
+                     static_cast<unsigned long long>(s.stage_decode_alloc_p95_ns  / 1000),
+                     static_cast<unsigned long long>(s.stage_decode_actual_p95_ns / 1000),
+                     static_cast<unsigned long long>(s.stage_decode_output_p95_ns / 1000),
+                     static_cast<unsigned long long>(s.stage_upload_p95_ns        / 1000),
+                     static_cast<unsigned long long>(s.stage_yuv2rgb_p95_ns       / 1000),
+                     static_cast<unsigned long long>(s.stage_present_queue_p95_ns / 1000),
+                     static_cast<unsigned long long>(s.e2e_client_internal_p95_ns / 1000));
         }
     }
 }

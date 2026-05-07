@@ -202,6 +202,10 @@ struct Controller::Impl {
     std::unique_ptr<media::FrameValidityGate>     gate;
     std::unique_ptr<media::RenderD3d11>           render;
 
+    // sync software MFT silent fail 降档:tick_ui 周期 poll codec_video 状态,
+    // 检测到 silent_fail_confirmed 后只触发一次降档(避免 race 重复 stop/start)。
+    bool                                          tier3_demoted_to_tier4 = false;
+
     // 音频管线（ADD §5.8 / §5.11）：RTP audio → depack → MFT decode → WASAPI 渲染。
     std::unique_ptr<media::DepackAac>             depack_aac;
     std::unique_ptr<media::CodecMftAudio>         codec_audio;
@@ -526,6 +530,21 @@ struct Controller::Impl {
         // Color：三级兜底由 resolve_color 内部完成。
         media::ColorOverride no_override{};
         resolved_color = media::resolve_color(vui, height_hint, no_override);
+
+        // env escape valve:MCP_FORCE_LOWLATENCY=1 强制 LowLatency on,绕过 ADD §5.6.4
+        // B-Frame Policy。背景:sync software MFT(IoT LTSC 兜底档)在 prefer_low_latency=
+        // false 时强启 driver-side reorder buffer +66~100ms,VLC libavcodec 同流无此代价
+        // (caller-side reorder)。本 env 让用户对照 VLC 实测能否在自家流上接受花屏风险换
+        // 100ms 延时收益。SPS 报 reorder>0 但实际 -bf 0 的现网编码器命中此 env 不花屏。
+        char ll_env[8]; size_t ll_n = 0;
+        if (getenv_s(&ll_n, ll_env, sizeof(ll_env), "MCP_FORCE_LOWLATENCY") == 0
+            && ll_n > 0 && ll_env[0] == '1' && !decoded_no_b_frames) {
+            decoded_no_b_frames = true;
+            MCP_LOG_WARN("Controller: MCP_FORCE_LOWLATENCY=1 → forcing LowLatency on "
+                         "despite SPS reorder>0 (ADD §5.6.4 warns of garble risk on "
+                         "real B-frame streams; recover by unsetting env)");
+        }
+
         MCP_LOGF(pal::LogLevel::info,
                  "Controller: codec policy: low_latency=%d (default optimistic; runtime PTS-inversion fallback) "
                  "color(pri=%d range=%d mat=%d) h_hint=%u",
@@ -843,25 +862,80 @@ struct Controller::Impl {
                     record_skip(2, "profile_unsupported");
                 }
             } else if (video_codec == MC_VIDEO_CODEC_H264) {
-                // Phase 4 H.264 DXVA-direct 实装在 Intel UHD driver 上 silent fail
-                // (driver 返 OK 但 DPB 全 0;ffmpeg D3D11VA 同硬件能解,差异在 PicParams 某
-                // 字段,无 GPL-clean 参考,根因尚未定位)。默认跳过此档,走 tier 3 sync software
-                // MFT(Microsoft H264 Decoder MFT,IoT LTSC 兜底可用)。
-                // 设 MCP_ENABLE_DXVA_H264=1 强制启用以便继续调试。
-                const bool enable_dxva_h264 = []{
-                    char buf[8]; size_t n = 0;
-                    return getenv_s(&n, buf, sizeof(buf), "MCP_ENABLE_DXVA_H264") == 0
-                           && n > 0 && buf[0] == '1';
-                }();
-                if (enable_dxva_h264) {
+                // ADR-015 capability-then-select(用户要求"完备硬件能力检查后 再决定是否回退"):
+                //   driver CheckVideoDecoderFormat 返 TRUE 不等于真能解码 — Intel UHD 730 +
+                //   Win11 IoT LTSC 上观察到 self-test fixture(64x64 baseline IDR)在 driver
+                //   上 fail,但实流 1280x720 high profile 直接 d3d11va 完美解码(VLC 实证)。
+                //
+                //   即:fixture self-test 是 false negative,过严判据反而把能用的硬件挡掉,
+                //   逼用户跌到 tier 3 sync software MFT(driver-side B-frame reorder 累
+                //   ~664ms latency)。
+                //
+                // 新策略(VLC 风格,2026-05-07 实证):默认信任 driver
+                // CheckVideoDecoderFormat + CreateVideoDecoder 成功就启用 tier 2,
+                // 不依赖 fixture probe。fixture probe 仅作诊断信息记录。
+                //
+                // env 控制:
+                //   MCP_ENABLE_DXVA_H264=1: 强制启用(等价于默认行为,保留兼容)
+                //   MCP_ENABLE_DXVA_H264=0: 强制禁用(对照测试用)
+                //   MCP_REQUIRE_DXVA_PROBE=1: 严格模式 — fixture probe fail 即降 tier(老行为兜底)
+                //   未设置: 默认信任 driver
+                //
+                // TODO(运行期 silent fail):codec_dxva 第一帧 emit 时做 Y plane readback
+                // 抽样,sum=0/128 → set silent_fail_confirmed,controller tick_ui 周期 poll
+                // 主动降 tier 3。当前缺这一兜底,真 silent fail driver 会黑屏直到用户手动
+                // MCP_ENABLE_DXVA_H264=0 切档。
+                char env_buf[8]; size_t env_n = 0;
+                const bool env_set = getenv_s(&env_n, env_buf, sizeof(env_buf),
+                                               "MCP_ENABLE_DXVA_H264") == 0 && env_n > 0;
+                const bool env_force_on  = env_set && env_buf[0] == '1';
+                const bool env_force_off = env_set && env_buf[0] == '0';
+
+                char rp_buf[8]; size_t rp_n = 0;
+                const bool require_probe = (getenv_s(&rp_n, rp_buf, sizeof(rp_buf),
+                                                     "MCP_REQUIRE_DXVA_PROBE") == 0
+                                            && rp_n > 0 && rp_buf[0] == '1');
+
+                bool capable;
+                const char* skip_reason = nullptr;
+                if (env_force_off) {
+                    capable     = false;
+                    skip_reason = "disabled_by_env";
+                    MCP_LOG_INFO("Controller: tier2 DXVA H.264 disabled "
+                                 "(MCP_ENABLE_DXVA_H264=0 force disable)");
+                } else if (env_force_on) {
+                    capable = true;
+                    MCP_LOG_INFO("Controller: tier2 DXVA H.264 forced on "
+                                 "(MCP_ENABLE_DXVA_H264=1)");
+                } else {
+                    // 默认路径:仍跑 fixture probe 但不阻断,作为诊断信号。
+                    pal::metric::ScopedTimer pt{reg.timer("mc.probe.tier2_h264_self_test_ns")};
+                    const bool probe_pass = media::probe_dxva_h264_capable(d3d_device.Get());
+                    if (require_probe) {
+                        capable = probe_pass;
+                        if (!capable) skip_reason = "self_test_fail_silent_decode";
+                        MCP_LOGF(pal::LogLevel::info,
+                                 "Controller: tier2 DXVA H.264 strict mode "
+                                 "(MCP_REQUIRE_DXVA_PROBE=1) probe=%d → capable=%d",
+                                 probe_pass, capable);
+                    } else {
+                        capable = true;
+                        MCP_LOGF(pal::LogLevel::info,
+                                 "Controller: tier2 DXVA H.264 fixture probe=%d "
+                                 "(informational; driver trusted by default — VLC-style; "
+                                 "set MCP_REQUIRE_DXVA_PROBE=1 to gate strictly)",
+                                 probe_pass);
+                    }
+                }
+
+                if (capable) {
                     media::CodecDxvaVideo::Config dcfg;
                     dcfg.codec  = video_codec;
                     dcfg.device = d3d_device;
                     dcfg.emit   = [this](media::VideoFrame&& f) { on_decoded_frame(std::move(f)); };
                     codec_dxva  = std::make_unique<media::CodecDxvaVideo>(std::move(dcfg));
                     if (mc_status_t s = codec_dxva->start(); s == MC_OK) {
-                        MCP_LOGF(pal::LogLevel::info,
-                                 "Controller: tier2 DXVA-direct H.264 active (MCP_ENABLE_DXVA_H264=1)");
+                        MCP_LOG_INFO("Controller: tier2 DXVA-direct H.264 active");
                         activate(MC_DECODER_DXVA_DIRECT, 2);
                         return MC_OK;
                     } else {
@@ -869,13 +943,10 @@ struct Controller::Impl {
                                  "Controller: tier2 DXVA-direct H.264 start failed status=%d",
                                  static_cast<int>(s));
                         codec_dxva.reset();
-                        record_skip(2, "profile_unsupported");
+                        record_skip(2, "start_failed");
                     }
                 } else {
-                    record_skip(2, "h264_disabled_pending_root_cause");
-                    MCP_LOG_INFO("Controller: tier2 DXVA-direct H.264 disabled "
-                                 "(set MCP_ENABLE_DXVA_H264=1 to enable; pending Intel driver "
-                                 "PicParams 兼容性根因定位)");
+                    record_skip(2, skip_reason ? skip_reason : "self_test_fail_silent_decode");
                 }
             } else {
                 record_skip(2, "codec_unsupported");
@@ -1024,7 +1095,12 @@ struct Controller::Impl {
         e.stream_info.struct_version = MC_STREAM_INFO_VERSION;
         e.stream_info.video_codec        = video_codec;
         e.stream_info.video_decoder_kind = decoder_kind;
-        e.stream_info.active_protocol    = MC_PROTOCOL_RTSP_UDP;
+        // 协议跟随 caller hint:AUTO / RTSP_UDP 走 UDP transport,RTSP_TCP 走 TCP interleaved。
+        // make_rtsp_transport 当前实装与此对应(详见 ts_rtsp_udp.cpp::make_rtsp_transport)。
+        // TODO: UDP→TCP 自动 fallback 落地后需在 transport 上报实际选择,这里同步更新。
+        e.stream_info.active_protocol    =
+            (options.protocol_hint == MC_PROTOCOL_RTSP_TCP)
+                ? MC_PROTOCOL_RTSP_TCP : MC_PROTOCOL_RTSP_UDP;
 
         // GPU 信息：从 caps_probe 取所选 adapter 的描述与 VRAM 分类。
         e.stream_info.gpu_kind = MC_GPU_KIND_UNKNOWN;
@@ -1319,6 +1395,9 @@ mc_status_t Controller::get_stream_info(mc_stream_info_t& inout) const noexcept 
     }
     inout.video_codec        = impl_->video_codec;
     inout.video_decoder_kind = impl_->decoder_kind;
+    inout.active_protocol    =
+        (impl_->options.protocol_hint == MC_PROTOCOL_RTSP_TCP)
+            ? MC_PROTOCOL_RTSP_TCP : MC_PROTOCOL_RTSP_UDP;
 
     inout.gpu_kind = MC_GPU_KIND_UNKNOWN;
     inout.gpu_description[0] = '\0';
@@ -1340,6 +1419,46 @@ mc_status_t Controller::tick_ui() noexcept {
         ui->set_stats(s);
     }
     impl_->render->tick_ui();
+
+    // ADR-015 sync software MFT silent fail 自动降档(IoT LTSC 缺核心解码 dll 时,
+    // sync MFT 仍激活但 ProcessOutput 输出全 0 NV12 → render 显示深绿屏)。
+    // codec_mft_video 启动期 readback Y plane 检测,confirmed=true 时一次性降到 tier 4。
+    if (!impl_->tier3_demoted_to_tier4 &&
+        impl_->codec_video &&
+        impl_->codec_video->silent_fail_confirmed()) {
+        std::scoped_lock lk{impl_->mu};
+        if (!impl_->tier3_demoted_to_tier4 && impl_->codec_video) {
+            MCP_LOG_ERROR("Controller: tier3 sync software MFT silent fail confirmed, "
+                          "降档到 tier4 mc-libcodec");
+            auto& reg = pal::metric::Registry::instance();
+            reg.counter("mc.probe.tier_skip_reason.tier3.silent_fail_runtime").inc();
+            impl_->codec_video->stop();
+            impl_->codec_video.reset();
+            if (impl_->gate) impl_->gate->reset();
+
+            media::CodecLibcodecVideo::Config lcfg;
+            lcfg.codec  = impl_->video_codec;
+            lcfg.device = impl_->d3d_device;
+            lcfg.emit   = [this](media::VideoFrame&& f) { impl_->on_decoded_frame(std::move(f)); };
+            impl_->codec_libcodec = std::make_unique<media::CodecLibcodecVideo>(std::move(lcfg));
+            if (mc_status_t s = impl_->codec_libcodec->start(); s == MC_OK) {
+                impl_->decoder_kind = MC_DECODER_LIBCODEC;
+                reg.gauge("mc.decoder.kind").set(MC_DECODER_LIBCODEC);
+                reg.gauge("mc.probe.tier_selected").set(4);
+                MCP_LOG_INFO("Controller: tier4 mc-libcodec active (downgraded from tier3)");
+            } else {
+                MCP_LOGF(pal::LogLevel::error,
+                         "Controller: tier4 libcodec start failed status=%d "
+                         "(after tier3 silent fail) → 无可用解码档,显示冻结",
+                         static_cast<int>(s));
+                impl_->codec_libcodec.reset();
+                impl_->decoder_kind = MC_DECODER_NONE;
+                reg.gauge("mc.decoder.kind").set(MC_DECODER_NONE);
+            }
+            impl_->tier3_demoted_to_tier4 = true;
+        }
+    }
+
     // ADR-014 / ADD §5.10.5：Present Epoch 陈旧区域 watchdog 已由 T5 渲染线程自驱
     // （render_thread_loop 内每 ~frame_period 唤醒一次），main 不再触发。
     return MC_OK;

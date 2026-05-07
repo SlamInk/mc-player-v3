@@ -4,19 +4,15 @@ namespace mclc {
 
 namespace {
 
-/// 找下一个 Annex-B 起始码（0x000001 或 0x00000001）。返回起始码起始位置；找不到返 size。
+/// 找下一个 Annex-B 起始码 [0,0,1] 子串。返回 [0,0,1] 子串的起始位置;
+/// 注意 4-byte 起始码 [0,0,0,1] 中 [0,0,1] 子串始于 prefix 的第 2 字节(index +1)。
+/// 找不到返 size。
 std::size_t find_start_code(std::span<const uint8_t> data, std::size_t from) noexcept {
     if (data.size() < 3) return data.size();
     for (std::size_t i = from; i + 2 < data.size(); ++i) {
         if (data[i] == 0 && data[i + 1] == 0 && data[i + 2] == 1) return i;
     }
     return data.size();
-}
-
-/// 起始码长度：3（0x000001）或 4（0x00000001）。
-std::size_t start_code_length(std::span<const uint8_t> data, std::size_t pos) noexcept {
-    if (pos > 0 && data[pos - 1] == 0) return 4;
-    return 3;
 }
 
 void extract_rbsp(std::span<const uint8_t> ebsp, std::vector<uint8_t>& rbsp) noexcept {
@@ -44,7 +40,13 @@ void hevc_split_nals(std::span<const uint8_t> annexb,
                       std::vector<uint8_t>&     scratch_rbsp) noexcept {
     std::size_t i = find_start_code(annexb, 0);
     while (i < annexb.size()) {
-        const std::size_t start = i + start_code_length(annexb, i);
+        // [0,0,1] 子串占 i..i+2,无论前置是否 4-byte 形式 [0,0,0,1],NAL 起点恒为 i+3:
+        //   3-byte: data[i..i+2]=[0,0,1],NAL 始于 i+3 ✓
+        //   4-byte: [0,0,0,1] 中 [0,0,1] 始于 i=prefix_start+1,prefix 占 i-1..i+2,
+        //           NAL 始于 (i-1)+4 = i+3 ✓
+        // 旧 start = i + start_code_length(=4) 在 4-byte 形式下错位 1 字节,
+        // 跳过 NAL header 第一字节 → NAL 解析全错位(SPS/PPS/slice header 不可读)。
+        const std::size_t start = i + 3;
         const std::size_t next  = find_start_code(annexb, start + 1);
 
         // 计算 NAL 边界：[start, end)，end 是下一个起始码前一字节（剔可选 0x00 padding）。

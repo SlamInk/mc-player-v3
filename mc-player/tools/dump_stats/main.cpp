@@ -16,8 +16,13 @@
 
 #include "mc-player/mc_player.h"
 
+#include "media/codec_dxva_video.h"
 #include "pal/etw_provider.h"
 #include "pal/metric.h"
+
+#include <Windows.h>
+#include <d3d11.h>
+#include <wrl/client.h>
 
 #include <chrono>
 #include <cstdio>
@@ -150,15 +155,61 @@ void dump_json(const mcp::pal::metric::Registry::Snapshot& snap) {
 
 }  // namespace
 
+// 跑 codec_dxva_video.cpp 的 H.264 baseline IDR end-to-end probe 自检。
+// 与 controller 在档 2 启动前调的 probe_dxva_h264_capable 路径一致——
+// 区别仅是不依赖 RTSP 流,直接在本机 D3D11 设备上跑一帧 64x64 全黑 IDR fixture。
+//
+// 用途:
+//   1. 离线诊断 driver silent fail 现象(返 OK 但 DPB 全 0/全 128)
+//   2. 验证 probe 函数本身在某台机器上的判定结果
+//   3. CI 环境能力 baseline 测量
+//
+// 退出码:
+//   0 = capable=true (driver 能解 64x64 baseline IDR)
+//   3 = capable=false (silent fail / decoder 创建失败)
+//   4 = D3D11 设备创建失败(无 GPU 驱动)
+int run_probe_h264_dxva() {
+    using Microsoft::WRL::ComPtr;
+    ComPtr<ID3D11Device>        device;
+    ComPtr<ID3D11DeviceContext> ctx;
+    D3D_FEATURE_LEVEL           fl = D3D_FEATURE_LEVEL_11_0;
+    const D3D_FEATURE_LEVEL     fls[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0 };
+    HRESULT hr = D3D11CreateDevice(
+        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
+        D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+        fls, _countof(fls), D3D11_SDK_VERSION,
+        &device, &fl, &ctx);
+    if (FAILED(hr) || !device) {
+        std::fprintf(stderr,
+                     "probe-h264-dxva: D3D11CreateDevice failed hr=0x%08lX\n",
+                     static_cast<unsigned long>(hr));
+        return 4;
+    }
+
+    const bool capable = mcp::media::probe_dxva_h264_capable(device.Get());
+    std::fprintf(stdout,
+                 "{\"probe\":\"h264_dxva\",\"capable\":%s,\"feature_level\":\"0x%X\"}\n",
+                 capable ? "true" : "false", static_cast<unsigned>(fl));
+    return capable ? 0 : 3;
+}
+
 int main(int argc, char** argv) {
     int duration_ms = 0;
     bool self_test  = false;
+    bool probe_h264 = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "--duration_ms") == 0 && i + 1 < argc) {
             duration_ms = std::atoi(argv[++i]);
         } else if (std::strcmp(argv[i], "--self_test") == 0) {
             self_test = true;
+        } else if (std::strcmp(argv[i], "--probe-h264-dxva") == 0) {
+            probe_h264 = true;
         }
+    }
+
+    if (probe_h264) {
+        // probe 路径不需要 mc_global_init / metric registry,直接跑后退出。
+        return run_probe_h264_dxva();
     }
 
     mc_init_options_t init{};

@@ -62,6 +62,16 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+/// 真实端到端 self-test：跑一帧 64x64 baseline H.264 IDR fixture 走 ID3D11VideoDevice，
+/// 读回 NV12 Y plane 校验解码结果合理（≈16 全黑）。
+///
+/// 用途：解决 Intel UHD 730 / Win11 IoT LTSC 等驱动 silent fail 场景——
+/// CheckVideoDecoderFormat 返 TRUE，但 SubmitDecoderBuffers 后 DPB 为全 0 或全 128，
+/// 上层无法仅靠表面 supported flag 判断真实能力。
+///
+/// 用 ADR-015 四档链选档前的"capability-then-select"决策依据。
+[[nodiscard]] bool probe_dxva_h264_capable(ID3D11Device* device) noexcept;
+
 }  // namespace mcp::media
 
 #endif  // MC_PLAYER_MEDIA_CODEC_DXVA_VIDEO_H_

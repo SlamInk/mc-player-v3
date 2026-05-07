@@ -54,8 +54,12 @@ private:
     mutable std::mutex                  mu_;
     std::unique_ptr<controller::Controller> controller_;
 
+    // event_cb_ 与 event_user_ 必须配对读取——任一线程读旧 cb + 新 user(或反之)
+    // 都会把指针错喂给 caller 代码。两者都 atomic + emit_event 用 acquire 顺序读,
+    // set_event_callback 写 user 在前(release)、cb 在后(release),让读 cb 时 user
+    // happens-before 已可见。
     std::atomic<mc_event_callback_fn>   event_cb_{nullptr};
-    void*                               event_user_{nullptr};
+    std::atomic<void*>                  event_user_{nullptr};
 
     mc_state_t                          state_{MC_STATE_IDLE};
 };

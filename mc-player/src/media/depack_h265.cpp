@@ -91,7 +91,8 @@ struct BitReader {
         int zeros = 0;
         while (!bad && read_bits(1) == 0) {
             ++zeros;
-            if (zeros > 32) { bad = true; return 0; }
+            // zeros == 32 触发 (1u << 32) UB,与 depack_h264 一致收紧到 >= 32 set_bad。
+            if (zeros >= 32) { bad = true; return 0; }
         }
         if (bad) return 0;
         if (zeros == 0) return 0;

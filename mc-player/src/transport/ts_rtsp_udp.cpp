@@ -39,6 +39,16 @@ struct ParsedUrl {
 };
 
 bool parse_rtsp_url(std::string_view url, ParsedUrl& out) noexcept {
+    // 防御 caller 传入含 leading/trailing whitespace 的 URL(命令行残留 / 配置文件粘贴)。
+    // RFC 3986 §3 URI 不允许 unencoded whitespace,这里直接 trim 容忍而不是拒绝,
+    // 否则 SETUP 拼接 control_uri 时空格会塞进 URI 中段触发 server FIN(实测华为/海康
+    // IPC 表现:OPTIONS/DESCRIBE 容忍尾部空格回 200,SETUP 拼出 host 后空格直接关连接)。
+    auto is_ws = [](char c) {
+        return c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\v' || c == '\f';
+    };
+    while (!url.empty() && is_ws(url.front())) url.remove_prefix(1);
+    while (!url.empty() && is_ws(url.back()))  url.remove_suffix(1);
+
     auto sch_end = url.find("://");
     if (sch_end == std::string_view::npos) return false;
     out.scheme.assign(url.substr(0, sch_end));
@@ -126,13 +136,22 @@ public:
     void close() noexcept { s_.reset(); }
 
     bool send_all(std::span<const uint8_t> bytes) noexcept {
-        if (!s_.valid()) return false;
+        if (!s_.valid()) {
+            MCP_LOG_WARN("TcpStream::send_all socket invalid");
+            return false;
+        }
         const uint8_t* p = bytes.data();
         std::size_t   n = bytes.size();
         while (n > 0) {
             int sent = ::send(s_.get(), reinterpret_cast<const char*>(p),
                                static_cast<int>(std::min<std::size_t>(n, INT_MAX)), 0);
-            if (sent <= 0) return false;
+            if (sent <= 0) {
+                MCP_LOGF(pal::LogLevel::warn,
+                         "TcpStream::send_all send failed sent=%d wsa_err=%d "
+                         "(remaining=%zu)",
+                         sent, ::WSAGetLastError(), n);
+                return false;
+            }
             p += sent;
             n -= static_cast<std::size_t>(sent);
         }
@@ -140,11 +159,22 @@ public:
     }
 
     bool read_some(std::vector<uint8_t>& out) noexcept {
-        if (!s_.valid()) return false;
+        if (!s_.valid()) {
+            MCP_LOG_WARN("TcpStream::read_some socket invalid");
+            return false;
+        }
         out.resize(4096);
         int n = ::recv(s_.get(), reinterpret_cast<char*>(out.data()),
                         static_cast<int>(out.size()), 0);
-        if (n <= 0) return false;
+        if (n == 0) {
+            MCP_LOG_WARN("TcpStream::read_some recv=0 (FIN, socket closed by peer)");
+            return false;
+        }
+        if (n < 0) {
+            MCP_LOGF(pal::LogLevel::warn,
+                     "TcpStream::read_some recv failed wsa_err=%d", ::WSAGetLastError());
+            return false;
+        }
         out.resize(static_cast<std::size_t>(n));
         return true;
     }

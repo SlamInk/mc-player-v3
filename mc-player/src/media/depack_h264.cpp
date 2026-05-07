@@ -84,7 +84,10 @@ struct BitReader {
         int zeros = 0;
         while (!bad && read_bits(1) == 0) {
             ++zeros;
-            if (zeros > 32) { bad = true; return 0; }
+            // H.264 §9.1 ue(v) 最大 32 leading zeros 对应 (1<<32)-1 上限;
+            // zeros == 32 触发 (1u << 32) 是 UB(shift >= unsigned type 宽度),
+            // 收紧为 zeros >= 32 set_bad,与 spec 上限对齐(允许 codeNum 表示 [0, 2^32-2])。
+            if (zeros >= 32) { bad = true; return 0; }
         }
         if (bad) return 0;
         if (zeros == 0) return 0;

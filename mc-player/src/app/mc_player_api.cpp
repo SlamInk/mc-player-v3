@@ -155,6 +155,12 @@ MC_API mc_status_t mc_open(mc_player_t handle, const mc_open_options_t* options)
     return guarded([&]() -> mc_status_t {
         if (!handle)  return MC_ERR_NULL_HANDLE;
         if (!options) return MC_ERR_INVALID_ARG;
+        // ABI 演进契约(ADD §5.7.2): caller struct 不得小于 lib 编译期 sizeof,
+        // 否则后段字段访问越出 caller buffer。新 caller + 旧 lib 是反向兼容,
+        // 那是 lib 的接受度,不在本守卫范围。
+        if (options->struct_size < sizeof(mc_open_options_t)) {
+            return MC_ERR_INVALID_ARG;
+        }
         return handle->impl.open(*options);
     });
 }

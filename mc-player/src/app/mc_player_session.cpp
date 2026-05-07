@@ -61,7 +61,9 @@ mc_status_t Session::set_render_target(HWND hwnd) noexcept {
 }
 
 mc_status_t Session::set_event_callback(mc_event_callback_fn cb, void* user) noexcept {
-    event_user_ = user;
+    // 顺序: user 先 release 写、cb 后 release 写。emit_event 端 acquire 读 cb,
+    // 若 cb 非 null 则 user 一定已可见(release/acquire 同步)。
+    event_user_.store(user, std::memory_order_release);
     event_cb_.store(cb, std::memory_order_release);
     return MC_OK;
 }
@@ -139,8 +141,9 @@ mc_status_t Session::set_show_add_modal(bool show) noexcept {
 }
 
 void Session::emit_event(const mc_event_t& evt) noexcept {
-    auto cb = event_cb_.load(std::memory_order_acquire);
-    if (cb) cb(event_user_, &evt);
+    auto cb   = event_cb_.load(std::memory_order_acquire);
+    auto user = event_user_.load(std::memory_order_acquire);
+    if (cb) cb(user, &evt);
 }
 
 void Session::on_controller_event(const controller::Event& evt) noexcept {

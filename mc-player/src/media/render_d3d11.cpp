@@ -287,10 +287,14 @@ struct RenderD3d11::Impl {
 
         const bool tearing =
             (swap_chain->active_present_mode() == MC_PRESENT_MODE_TEARING);
+        // ADD §5.10.5 epoch 不变量: video Present 与 DCOMP commit 同 epoch 配对,
+        // Present 失败时不应调 on_presented(否则 last_present_ns 被错误更新 → watchdog
+        // 看不出 stale,且 commit_pending 被 clear → DCOMP commit 触发提交未上屏的 visual)。
+        // 失败路径交给 device-lost 接管,这里保留 commit_pending=true 让下个 epoch 检测到 skew。
         if (swap_chain->present(tearing) == MC_OK) {
             presents.fetch_add(1, std::memory_order_relaxed);
+            if (epoch) epoch->on_presented(pal::Clock::now_ns());
         }
-        if (epoch) epoch->on_presented(pal::Clock::now_ns());
     }
 
     void render_locked(const VideoFrame& frame) noexcept {
@@ -322,42 +326,73 @@ struct RenderD3d11::Impl {
             y_srv  = slot.y;
             uv_srv = slot.uv;
         } else {
-            D3D11_SHADER_RESOURCE_VIEW_DESC y_desc{};
-            y_desc.Format         = DXGI_FORMAT_R8_UNORM;
-            if (is_array) {
-                y_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-                y_desc.Texture2DArray.MostDetailedMip = 0;
-                y_desc.Texture2DArray.MipLevels       = 1;
-                y_desc.Texture2DArray.FirstArraySlice = slice;
-                y_desc.Texture2DArray.ArraySize       = 1;
+            // D3D11 NV12 SRV 显式 PlaneSlice (D3D11.3+ ID3D11Device3 + SRV_DESC1) —
+            // Intel UHD driver 上,旧 SRV_DESC + R8G8_UNORM 隐式 plane=1 行为 buggy:
+            // SRV sample UV 总返 0 → BT.709 (Y=16,U=0,V=0) 转 RGB 出 (R=0, G≈95, B=0)
+            // 深绿屏(用户截图根因)。SRV_DESC1.Texture2D.PlaneSlice=1 显式选 UV plane,
+            // 与 R8G8_UNORM format 配合,driver 一致映射到 UV。
+            ComPtr<ID3D11Device3> dev3;
+            if (SUCCEEDED(cfg.device.As(&dev3))) {
+                D3D11_SHADER_RESOURCE_VIEW_DESC1 y1{};
+                y1.Format         = DXGI_FORMAT_R8_UNORM;
+                if (is_array) {
+                    y1.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+                    y1.Texture2DArray.MostDetailedMip = 0;
+                    y1.Texture2DArray.MipLevels       = 1;
+                    y1.Texture2DArray.FirstArraySlice = slice;
+                    y1.Texture2DArray.ArraySize       = 1;
+                    y1.Texture2DArray.PlaneSlice      = 0;
+                } else {
+                    y1.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                    y1.Texture2D.MostDetailedMip = 0;
+                    y1.Texture2D.MipLevels       = 1;
+                    y1.Texture2D.PlaneSlice      = 0;
+                }
+                ComPtr<ID3D11ShaderResourceView1> y1_srv;
+                HRESULT hy = dev3->CreateShaderResourceView1(tex_ptr, &y1, &y1_srv);
+                if (FAILED(hy)) {
+                    MCP_LOGF(pal::LogLevel::error,
+                             "RenderD3d11: SRV1 Y plane hr=0x%08lX (NV12 %ux%u arr=%u)",
+                             hy, tex_desc.Width, tex_desc.Height, tex_desc.ArraySize);
+                    return;
+                }
+                D3D11_SHADER_RESOURCE_VIEW_DESC1 uv1 = y1;
+                uv1.Format = DXGI_FORMAT_R8G8_UNORM;
+                if (is_array) uv1.Texture2DArray.PlaneSlice = 1;
+                else          uv1.Texture2D.PlaneSlice      = 1;
+                ComPtr<ID3D11ShaderResourceView1> uv1_srv;
+                HRESULT hu = dev3->CreateShaderResourceView1(tex_ptr, &uv1, &uv1_srv);
+                if (FAILED(hu)) {
+                    MCP_LOGF(pal::LogLevel::error,
+                             "RenderD3d11: SRV1 UV plane hr=0x%08lX", hu);
+                    return;
+                }
+                // SRV1 自然向下 cast 到 SRV (it's derived).
+                hy = y1_srv.As(&y_srv);
+                hu = uv1_srv.As(&uv_srv);
+                static std::atomic<bool> logged{false};
+                if (!logged.exchange(true, std::memory_order_relaxed)) {
+                    MCP_LOG_INFO("RenderD3d11: NV12 SRV with explicit PlaneSlice (D3D11.3 SRV1)");
+                }
             } else {
-                y_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                y_desc.Texture2D.MostDetailedMip = 0;
-                y_desc.Texture2D.MipLevels       = 1;
-            }
-            HRESULT hr_srv_y = cfg.device->CreateShaderResourceView(tex_ptr, &y_desc, &y_srv);
-            if (FAILED(hr_srv_y)) {
-                static std::atomic<bool> warned{false};
-                if (!warned.exchange(true, std::memory_order_relaxed)) {
-                    MCP_LOGF(pal::LogLevel::error,
-                             "RenderD3d11: CreateShaderResourceView Y failed hr=0x%08lX "
-                             "(arraySize=%u format=%d bind=0x%X) — 视频静默丢帧；"
-                             "需要 codec 改 SR-only ArraySize=1 输出",
-                             hr_srv_y, tex_desc.ArraySize, tex_desc.Format, tex_desc.BindFlags);
+                // D3D11.3 不可用 — 回退旧路径(Intel UHD 上可能深绿)。
+                D3D11_SHADER_RESOURCE_VIEW_DESC y_desc{};
+                y_desc.Format         = DXGI_FORMAT_R8_UNORM;
+                if (is_array) {
+                    y_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+                    y_desc.Texture2DArray.MostDetailedMip = 0;
+                    y_desc.Texture2DArray.MipLevels       = 1;
+                    y_desc.Texture2DArray.FirstArraySlice = slice;
+                    y_desc.Texture2DArray.ArraySize       = 1;
+                } else {
+                    y_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                    y_desc.Texture2D.MostDetailedMip = 0;
+                    y_desc.Texture2D.MipLevels       = 1;
                 }
-                return;
-            }
-            D3D11_SHADER_RESOURCE_VIEW_DESC uv_desc = y_desc;
-            uv_desc.Format = DXGI_FORMAT_R8G8_UNORM;
-            HRESULT hr_srv_uv = cfg.device->CreateShaderResourceView(tex_ptr, &uv_desc, &uv_srv);
-            if (FAILED(hr_srv_uv)) {
-                static std::atomic<bool> warned{false};
-                if (!warned.exchange(true, std::memory_order_relaxed)) {
-                    MCP_LOGF(pal::LogLevel::error,
-                             "RenderD3d11: CreateShaderResourceView UV failed hr=0x%08lX",
-                             hr_srv_uv);
-                }
-                return;
+                if (FAILED(cfg.device->CreateShaderResourceView(tex_ptr, &y_desc, &y_srv))) return;
+                D3D11_SHADER_RESOURCE_VIEW_DESC uv_desc = y_desc;
+                uv_desc.Format = DXGI_FORMAT_R8G8_UNORM;
+                if (FAILED(cfg.device->CreateShaderResourceView(tex_ptr, &uv_desc, &uv_srv))) return;
             }
             slot.tex   = tex_ptr;
             slot.slice = slice;
@@ -419,10 +454,14 @@ struct RenderD3d11::Impl {
         // timeout 50ms 防止显示器异常时 T5 永久 block。
         const bool tearing =
             (swap_chain->active_present_mode() == MC_PRESENT_MODE_TEARING);
-        if (swap_chain->present(tearing) == MC_OK) {
-            presents.fetch_add(1, std::memory_order_relaxed);
-        }
+        // ADD §5.10.5 epoch 不变量: 见上方 render_ui_only_locked 注释。
+        // Present 失败保留 commit_pending=true,延时统计同样跳过(arrival_qpc_ns vs
+        // 未发生的 Present 时间无意义)。
         const int64_t now_ns = pal::Clock::now_ns();
+        if (swap_chain->present(tearing) != MC_OK) {
+            return;
+        }
+        presents.fetch_add(1, std::memory_order_relaxed);
         if (epoch) epoch->on_presented(now_ns);
 
         // 端到端延时统计（P0-4）：frame.arrival_qpc_ns 来自 RTP 第一包的 QPC 戳，

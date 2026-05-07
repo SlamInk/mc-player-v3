@@ -11,6 +11,8 @@ target_link_libraries(mc_player_dump_stats
     PRIVATE
         mc_player::mc_player
         mcp_compile_options
+        d3d11
+        dxgi
 )
 
 # 让 dump_stats 能用 internal headers (pal/metric.h, pal/etw_provider.h)。

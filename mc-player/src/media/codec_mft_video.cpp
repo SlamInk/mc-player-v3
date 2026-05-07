@@ -15,8 +15,10 @@
 #include <thread>
 
 #include "pal/cache_line.h"
+#include "pal/clock.h"
 #include "pal/error.h"
 #include "pal/log.h"
+#include "pal/metric.h"
 #include "pal/spsc_queue.h"
 #include "pal/thread.h"
 
@@ -106,19 +108,38 @@ struct CodecMftVideo::Impl {
 
     // PTS-keyed arrival 戳兜底 ring（仅 T4 单线程访问，无锁）。MFT 不保证
     // 自定义 attribute 透传；GetUINT64 失败时按 SampleTime (us) 回查 ring。
-    struct ArrivalEntry { int64_t pts_us; int64_t arrival_qpc_ns; };
-    static constexpr std::size_t   kArrivalRingSize = 16;
+    //
+    // 容量 = 128 覆盖 sync software MFT 的 driver-side B-frame reorder buffer。
+    // 旧值 16 在 prefer_low_latency=false 路径下不够:driver 缓 >16 帧时 ring 已
+    // 被新 AU 覆盖,emit 第 0 帧时第 0 帧 entry 已不在 ring → lookup 总返 0 →
+    // arrival_qpc_ns=0 → e2e_client_internal_ns metric 永远空。lowlat 路径
+    // (driver 立即吐)无此问题。128 帧 @30fps ≈ 4.2s,远超 reorder buffer 上限。
+    // Entry 双戳:arrival = depack first-packet RX,submit = ProcessInput 前。
+    // emit 时 (now - arrival) → e2e_client_internal、(now - submit) → dec_actual。
+    struct ArrivalEntry {
+        int64_t pts_us         = 0;
+        int64_t arrival_qpc_ns = 0;
+        int64_t submit_qpc_ns  = 0;
+    };
+    static constexpr std::size_t   kArrivalRingSize = 128;
     std::array<ArrivalEntry, kArrivalRingSize> arrival_ring_{};
     std::size_t                    arrival_ring_head_ = 0;
 
-    void record_arrival(int64_t pts_us, int64_t arrival_qpc_ns) noexcept {
-        if (arrival_qpc_ns == 0) return;
-        arrival_ring_[arrival_ring_head_ % kArrivalRingSize] = {pts_us, arrival_qpc_ns};
+    void record_arrival(int64_t pts_us, int64_t arrival_qpc_ns, int64_t submit_qpc_ns) noexcept {
+        // 即便 arrival_qpc_ns=0 也写,因为 dec_actual 不依赖 arrival,仅依赖 submit。
+        arrival_ring_[arrival_ring_head_ % kArrivalRingSize] =
+            {pts_us, arrival_qpc_ns, submit_qpc_ns};
         ++arrival_ring_head_;
     }
     int64_t lookup_arrival(int64_t pts_us) const noexcept {
         for (const auto& e : arrival_ring_) {
             if (e.pts_us == pts_us && e.arrival_qpc_ns != 0) return e.arrival_qpc_ns;
+        }
+        return 0;
+    }
+    int64_t lookup_submit(int64_t pts_us) const noexcept {
+        for (const auto& e : arrival_ring_) {
+            if (e.pts_us == pts_us && e.submit_qpc_ns != 0) return e.submit_qpc_ns;
         }
         return 0;
     }
@@ -129,6 +150,16 @@ struct CodecMftVideo::Impl {
     DWORD                           output_sample_size = 0;
     DWORD                           output_sample_align = 0;
     bool                            sync_streaming_started = false;
+
+    // Silent fail detection (sync software MFT path):
+    // IoT LTSC 缺 mfh264dec.dll 等核心 dll 时,driver/MFT 仍可激活但 ProcessOutput
+    // 返出全 0 NV12,render shader sample 出深绿 (Y=0,UV=0 转 BT.709 RGB 是 mid-green)。
+    // 第一帧到 N 帧 readback Y plane 抽样,全 0 即标 decode_error,frame_validity_gate
+    // 自动 drop,N 帧后 silent_fail_confirmed=true 阻塞 emit 让 controller 降档。
+    static constexpr unsigned       kSilentFailProbeFrames = 3;
+    unsigned                        silent_probe_count   = 0;
+    unsigned                        silent_probe_zero_n  = 0;
+    std::atomic<bool>               silent_fail_confirmed{false};
 
     // P0-1 真零拷贝（fast path）：MFT sample 直接喂 render，省去 SR-only 私有 pool 的
     // CopySubresourceRegion blit (~0.1-0.2 ms/帧)。runtime 决定是否启用：
@@ -148,6 +179,8 @@ struct CodecMftVideo::Impl {
     bool ensure_upload_texture(UINT w, UINT h) noexcept {
         if (upload_tex && upload_w == w && upload_h == h) return true;
         upload_tex.Reset();
+        upload_staging_.Reset();
+
         D3D11_TEXTURE2D_DESC desc{};
         desc.Width            = w;
         desc.Height           = h;
@@ -155,14 +188,28 @@ struct CodecMftVideo::Impl {
         desc.ArraySize        = 1;
         desc.Format           = DXGI_FORMAT_NV12;
         desc.SampleDesc.Count = 1;
-        desc.Usage            = D3D11_USAGE_DYNAMIC;
+        desc.Usage            = D3D11_USAGE_DEFAULT;
         desc.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
-        desc.CPUAccessFlags   = D3D11_CPU_ACCESS_WRITE;
-        if (FAILED(cfg.device->CreateTexture2D(&desc, nullptr, &upload_tex))) return false;
+        desc.CPUAccessFlags   = 0;
+        HRESULT hr = cfg.device->CreateTexture2D(&desc, nullptr, &upload_tex);
+        if (FAILED(hr)) {
+            MCP_LOGF(pal::LogLevel::error,
+                     "CodecMftVideo: NV12 default tex %ux%u hr=0x%08lX", w, h, hr);
+            return false;
+        }
+
+        D3D11_TEXTURE2D_DESC sd = desc;
+        sd.Usage          = D3D11_USAGE_STAGING;
+        sd.BindFlags      = 0;
+        sd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        hr = cfg.device->CreateTexture2D(&sd, nullptr, &upload_staging_);
+        if (FAILED(hr)) { upload_tex.Reset(); return false; }
+
         upload_w = w;
         upload_h = h;
         return true;
     }
+    ComPtr<ID3D11Texture2D> upload_staging_;
 
     // ─── helpers ───────────────────────────────────────────────────
     HRESULT enable_async() noexcept {
@@ -435,7 +482,8 @@ HRESULT CodecMftVideo::Impl::on_need_input() noexcept {
         sample->SetUINT32(MFSampleExtension_CleanPoint, 1);
     }
     // 端到端延时探针：双路径透传（attribute + PTS ring 兜底）。
-    record_arrival(au.pts_us, au.arrival_qpc_ns);
+    // submit_qpc_ns 用于 dec_actual 段计时(ProcessInput 前 → emit 时差)。
+    record_arrival(au.pts_us, au.arrival_qpc_ns, pal::Clock::now_ns());
     if (au.arrival_qpc_ns != 0) {
         sample->SetUINT64(kArrivalQpcNsAttr, static_cast<UINT64>(au.arrival_qpc_ns));
     }
@@ -452,19 +500,32 @@ HRESULT CodecMftVideo::Impl::on_have_output() noexcept {
     out.dwStreamID = kFirstStreamId;
     DWORD status   = 0;
     hr = transform->ProcessOutput(0, 1, &out, &status);
+    // MFT spec: STREAM_CHANGE / FAIL 路径下 caller 仍负责 release out.pSample(若 driver
+    // 自分配)与 out.pEvents。统一在分支前清理避免 leak per call。
+    auto release_out = [&]() {
+        if (out.pSample) { out.pSample->Release(); out.pSample = nullptr; }
+        if (out.pEvents) { out.pEvents->Release(); out.pEvents = nullptr; }
+    };
     if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+        release_out();
         update_output_dims();
         // STREAM_CHANGE 时 fast_path 还未决定（需要看真 sample 的 BindFlags），保留
         // ensure_out_pool 让 slow path 可立即工作；fast path 启用后该 pool 不被使用。
         ensure_out_pool();
         return S_OK;
     }
-    if (FAILED(hr)) return hr;
-    if (!out.pSample) return S_OK;
+    if (FAILED(hr)) {
+        release_out();
+        return hr;
+    }
+    if (!out.pSample) {
+        if (out.pEvents) { out.pEvents->Release(); out.pEvents = nullptr; }
+        return S_OK;
+    }
 
     ComPtr<IMFSample> sample;
     sample.Attach(out.pSample);
-    if (out.pEvents) out.pEvents->Release();
+    if (out.pEvents) { out.pEvents->Release(); out.pEvents = nullptr; }
 
     if (out_width == 0 || out_height == 0) {
         update_output_dims();
@@ -578,6 +639,16 @@ HRESULT CodecMftVideo::Impl::on_have_output() noexcept {
         }
     }
 
+    // dec_actual = 现在 - submit_qpc_ns (ProcessInput 前)。涵盖 driver-side reorder buffer。
+    if (const int64_t sub = lookup_submit(f.pts_us); sub != 0) {
+        const int64_t now_ns = pal::Clock::now_ns();
+        const int64_t delta  = now_ns - sub;
+        if (delta > 0) {
+            pal::metric::Registry::instance()
+                .timer("mc.stage.decode_actual_ns").record(delta);
+        }
+    }
+
     if (cfg.emit) cfg.emit(std::move(f));
     return S_OK;
 }
@@ -602,7 +673,7 @@ HRESULT CodecMftVideo::Impl::submit_sync(const PendingAu& au) noexcept {
     sample->SetSampleTime(au.pts_us * 10);
     if (au.keyframe) sample->SetUINT32(MFSampleExtension_CleanPoint, 1);
     // 端到端延时探针：双路径透传（attribute + PTS ring 兜底）。
-    record_arrival(au.pts_us, au.arrival_qpc_ns);
+    record_arrival(au.pts_us, au.arrival_qpc_ns, pal::Clock::now_ns());
     if (au.arrival_qpc_ns != 0) {
         sample->SetUINT64(kArrivalQpcNsAttr, static_cast<UINT64>(au.arrival_qpc_ns));
     }
@@ -647,8 +718,20 @@ HRESULT CodecMftVideo::Impl::drain_sync_output() noexcept {
                      "CodecMftVideo: sync ProcessOutput[loop=%d] hr=0x%08lX status=0x%lX provides=%d",
                      loops, hr, status, mft_provides_samples);
         }
-        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return S_OK;
+        // MFT spec: STREAM_CHANGE / FAIL 路径下 caller 仍负责 release driver-allocated
+        // sample / events。sync 路径 mft_provides_samples=false 时 out.pSample 是 host
+        // 给的 raw ref(host_sample 仍持有 ref),不要 release;mft_provides_samples=true
+        // 时 driver 自分配 sample,需 release。
+        auto release_sync_out = [&]() {
+            if (mft_provides_samples && out.pSample) {
+                out.pSample->Release();
+                out.pSample = nullptr;
+            }
+            if (out.pEvents) { out.pEvents->Release(); out.pEvents = nullptr; }
+        };
+        if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) { release_sync_out(); return S_OK; }
         if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+            release_sync_out();
             // 选 NV12 作为 output（必须在 update_output_dims 之前；driver 设新 type 后才有 frame size）
             for (DWORD i = 0; ; ++i) {
                 ComPtr<IMFMediaType> type;
@@ -683,8 +766,11 @@ HRESULT CodecMftVideo::Impl::drain_sync_output() noexcept {
             }
             continue;
         }
-        if (FAILED(hr)) return hr;
-        if (!out.pSample) return S_OK;
+        if (FAILED(hr)) { release_sync_out(); return hr; }
+        if (!out.pSample) {
+            if (out.pEvents) { out.pEvents->Release(); out.pEvents = nullptr; }
+            return S_OK;
+        }
         ComPtr<IMFSample> result;
         if (mft_provides_samples) {
             // driver 自分配，需要 release ref
@@ -693,7 +779,7 @@ HRESULT CodecMftVideo::Impl::drain_sync_output() noexcept {
             // host 已通过 host_sample 持有 ref，仅别名引用，不抢 ownership
             result = host_sample;
         }
-        if (out.pEvents) out.pEvents->Release();
+        if (out.pEvents) { out.pEvents->Release(); out.pEvents = nullptr; }
 
         // RAM buffer → NV12 texture upload + emit
         ComPtr<IMFMediaBuffer> mbuf;
@@ -718,30 +804,85 @@ HRESULT CodecMftVideo::Impl::drain_sync_output() noexcept {
 
         if (out_width == 0 || out_height == 0) update_output_dims();
         if (out_width == 0 || out_height == 0) { mbuf->Unlock(); continue; }
+
+        // Silent fail probe:前 N 帧抽样 Y + UV plane,全 0 或 UV 偏离 128 中性灰
+        // 一定阈值即认 driver silent fail。深绿屏根因可能是 Y=16(正确黑)但 UV=0
+        // (而非 128 中性灰),render shader 转 RGB 出 (0, 95, 0) 深绿。
+        // 抽样窗口 4 行 × 64 列 = 256 像素。
+        bool decode_silent_fail = false;
+        if (silent_probe_count < kSilentFailProbeFrames) {
+            ++silent_probe_count;
+            const UINT rows  = std::min<UINT>(4, out_height);
+            const UINT cols  = std::min<UINT>(64, out_width);
+            uint64_t y_sum  = 0;
+            uint64_t uv_sum = 0;
+            uint8_t  uv_min = 255, uv_max = 0;
+            for (UINT r = 0; r < rows; ++r) {
+                for (UINT c = 0; c < cols; ++c) y_sum += base[r * out_width + c];
+            }
+            const uint8_t* uv_base = base + out_width * out_height;
+            const UINT uv_rows = std::min<UINT>(2, out_height / 2);
+            for (UINT r = 0; r < uv_rows; ++r) {
+                for (UINT c = 0; c < cols; ++c) {
+                    const uint8_t v = uv_base[r * out_width + c];
+                    uv_sum += v;
+                    if (v < uv_min) uv_min = v;
+                    if (v > uv_max) uv_max = v;
+                }
+            }
+            // 真实解码: Y plane 范围广(自然图像 Y_min<<Y_max),UV plane 围绕 128 ± 大方差。
+            // silent fail: Y 全 0 或 全 16(纯黑) 同时 UV 全 0 (driver 未写) 或 全 128 中性灰
+            // 但黑画面有效解码时 UV 应是 128 中性灰附近,不会全 0。
+            // 判定: UV 平均偏离 128 太远(<32 或 >224) 且 var=0 → silent fail。
+            const uint64_t uv_n = static_cast<uint64_t>(uv_rows) * cols;
+            const uint64_t uv_mean = uv_n ? (uv_sum / uv_n) : 0;
+            const bool uv_constant     = (uv_min == uv_max);
+            const bool uv_far_from_128 = (uv_mean < 32) || (uv_mean > 224);
+            if (uv_constant && uv_far_from_128) ++silent_probe_zero_n;
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecMftVideo: silent-fail probe#%u Y[%ux%u]sum=%llu UV mean=%llu min=%u max=%u",
+                     silent_probe_count, rows, cols,
+                     static_cast<unsigned long long>(y_sum),
+                     static_cast<unsigned long long>(uv_mean), uv_min, uv_max);
+            if (silent_probe_count == kSilentFailProbeFrames &&
+                silent_probe_zero_n == kSilentFailProbeFrames) {
+                silent_fail_confirmed.store(true, std::memory_order_release);
+                MCP_LOG_ERROR("CodecMftVideo: sync software MFT silent fail confirmed "
+                              "(N=3 帧 UV plane 常量且偏离 128 → driver 没真解码,"
+                              "render 会出深绿屏); controller 应降档 tier 4");
+            }
+            if (uv_constant && uv_far_from_128) decode_silent_fail = true;
+        } else if (silent_fail_confirmed.load(std::memory_order_acquire)) {
+            decode_silent_fail = true;
+        }
+
         if (!ensure_upload_texture(out_width, out_height)) { mbuf->Unlock(); continue; }
 
-        // NV12 单 subresource Map：driver 给 Y plane 起始；UV plane 在 base+RowPitch*Height。
+        if (emit_n <= 3) MCP_LOGF(pal::LogLevel::info, "CodecMftVideo: sync emit#%d before staging Map", emit_n);
         D3D11_MAPPED_SUBRESOURCE m{};
-        HRESULT hmap = ctx->Map(upload_tex.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m);
+        HRESULT hm = ctx->Map(upload_staging_.Get(), 0, D3D11_MAP_WRITE, 0, &m);
         if (emit_n <= 3) {
             MCP_LOGF(pal::LogLevel::info,
-                     "CodecMftVideo: sync emit#%d Map hr=0x%08lX rowpitch=%u",
-                     emit_n, hmap, static_cast<unsigned>(m.RowPitch));
+                     "CodecMftVideo: sync emit#%d staging Map hr=0x%08lX rp=%u",
+                     emit_n, hm, static_cast<unsigned>(m.RowPitch));
         }
-        if (FAILED(hmap)) { mbuf->Unlock(); continue; }
-        // 拷 Y plane（RAM 是 packed 即 stride=width，texture map 的 RowPitch 通常 >= width）
-        auto* dst = static_cast<uint8_t*>(m.pData);
-        for (UINT row = 0; row < out_height; ++row) {
-            std::memcpy(dst + row * m.RowPitch, base + row * out_width, out_width);
+        if (SUCCEEDED(hm)) {
+            auto* dst = static_cast<uint8_t*>(m.pData);
+            for (UINT row = 0; row < out_height; ++row) {
+                std::memcpy(dst + row * m.RowPitch, base + row * out_width, out_width);
+            }
+            const uint8_t* src_uv = base + out_width * out_height;
+            uint8_t* dst_uv = dst + m.RowPitch * out_height;
+            const UINT uv_rows = out_height / 2;
+            for (UINT row = 0; row < uv_rows; ++row) {
+                std::memcpy(dst_uv + row * m.RowPitch, src_uv + row * out_width, out_width);
+            }
+            ctx->Unmap(upload_staging_.Get(), 0);
+            ctx->CopyResource(upload_tex.Get(), upload_staging_.Get());
+            // 注:GPU readback verify 路径会 Map(READ) 强制 CPU-GPU 同步 stall worker
+            // (前次实测连 staging Map 都 hang),已移除。NV12 上传链路前次 readback 已验证
+            // default tex UV=128 正确,根因在 render 端 SRV PlaneSlice 隐式映射 buggy。
         }
-        // 拷 UV plane（NV12 UV plane 在 RAM 紧跟 Y 之后；texture 中也在 m.pData + RowPitch * height）
-        const uint8_t* src_uv = base + out_width * out_height;
-        uint8_t* dst_uv = dst + m.RowPitch * out_height;
-        const UINT uv_rows = out_height / 2;
-        for (UINT row = 0; row < uv_rows; ++row) {
-            std::memcpy(dst_uv + row * m.RowPitch, src_uv + row * out_width, out_width);
-        }
-        ctx->Unmap(upload_tex.Get(), 0);
 
         mbuf->Unlock();
 
@@ -763,6 +904,8 @@ HRESULT CodecMftVideo::Impl::drain_sync_output() noexcept {
         f.color_range         = cfg.color.range;
         f.color_matrix        = cfg.color.matrix;
         f.validity_mask       = kValidityAll;
+        // Silent fail: 让 frame_validity_gate 自动 drop;render 显示 last_good 而非深绿。
+        f.decode_error        = decode_silent_fail;
         // 端到端延时探针：sample attribute → PTS ring 兜底。
         {
             UINT64 arr = 0;
@@ -770,6 +913,16 @@ HRESULT CodecMftVideo::Impl::drain_sync_output() noexcept {
                 f.arrival_qpc_ns = static_cast<int64_t>(arr);
             } else {
                 f.arrival_qpc_ns = lookup_arrival(f.pts_us);
+            }
+        }
+        // dec_actual = 现在 - submit_qpc_ns (ProcessInput 前)。
+        // 涵盖 driver-side reorder buffer + 实际解码耗时。
+        if (const int64_t sub = lookup_submit(f.pts_us); sub != 0) {
+            const int64_t now_ns = pal::Clock::now_ns();
+            const int64_t delta  = now_ns - sub;
+            if (delta > 0) {
+                pal::metric::Registry::instance()
+                    .timer("mc.stage.decode_actual_ns").record(delta);
             }
         }
         if (cfg.emit) cfg.emit(std::move(f));
@@ -1129,6 +1282,7 @@ void CodecMftVideo::stop() noexcept {
     impl_->device_manager.Reset();
     impl_->out_pool.Reset();
     impl_->upload_tex.Reset();
+    impl_->upload_staging_.Reset();
     impl_->ctx.Reset();
 
     // P1-6: MFT 已 Reset → 所有飞行 sample 释放 → buffer ref 归 pool 自有 → 安全清空。
@@ -1150,6 +1304,10 @@ void CodecMftVideo::stop() noexcept {
                  static_cast<unsigned long long>(p.alloc_oversize));
     }
     impl_->input_buf_pool.clear();
+}
+
+bool CodecMftVideo::silent_fail_confirmed() const noexcept {
+    return impl_ && impl_->silent_fail_confirmed.load(std::memory_order_acquire);
 }
 
 }  // namespace mcp::media

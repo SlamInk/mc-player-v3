@@ -193,19 +193,30 @@ struct CodecMftAudio::Impl {
                          hr, status, provides ? 1 : 0);
             }
 
-            if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) break;
+            // MFT spec: STREAM_CHANGE / FAIL / NEED_MORE_INPUT 路径 caller 仍负责
+            // release driver-allocated pSample(provides=true 时)与 pEvents。同 video MFT。
+            auto release_ob = [&]() {
+                if (provides && ob.pSample) { ob.pSample->Release(); ob.pSample = nullptr; }
+                if (ob.pEvents) { ob.pEvents->Release(); ob.pEvents = nullptr; }
+            };
+
+            if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) { release_ob(); break; }
 
             if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
+                release_ob();
                 if (reselect_output_float()) continue;
                 MCP_LOG_WARN("CodecMftAudio: STREAM_CHANGE 后未找到 float-32 output type");
                 break;
             }
 
             if (FAILED(hr)) {
+                release_ob();
                 MCP_LOGF(pal::LogLevel::warn,
                          "CodecMftAudio: ProcessOutput hr=0x%08lX", hr);
                 break;
             }
+            // 成功路径下也释放 pEvents(pSample 由后续 Attach/raw 路径处理)。
+            if (ob.pEvents) { ob.pEvents->Release(); ob.pEvents = nullptr; }
 
             // 引用计数语义（MSDN）：
             //   - provides=true → MFT 把它 AddRef 过的 sample 写到 ob.pSample，caller 必须 Release。

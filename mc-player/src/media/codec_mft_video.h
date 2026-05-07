@@ -91,6 +91,11 @@ public:
     void flush() noexcept;
     void stop() noexcept;
 
+    /// Silent fail 检测结果(sync software MFT 路径独有,详见 .cpp 注释)。
+    /// 启动后 N 帧 readback Y plane,全 0 即认 driver/MFT silent fail。
+    /// controller 应在 PLAYING 后周期 poll,true 时主动降档 tier 4 mc-libcodec。
+    [[nodiscard]] bool silent_fail_confirmed() const noexcept;
+
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

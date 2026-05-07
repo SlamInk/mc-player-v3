@@ -80,8 +80,12 @@ struct RtspClient::Impl {
             }
         }
         std::string serialized = req.serialize();
+        MCP_LOGF(pal::LogLevel::info,
+                 "RTSP TX cseq=%u method=%s uri=%s bytes=%zu",
+                 req.cseq, req.method.c_str(), req.uri.c_str(), serialized.size());
         if (!io.send(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(serialized.data()),
                                                serialized.size()))) {
+            MCP_LOG_WARN("RTSP TX send failed (socket error)");
             return MC_ERR_IO;
         }
 
@@ -89,17 +93,26 @@ struct RtspClient::Impl {
             std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
 
         std::vector<uint8_t> chunk;
+        std::size_t total_recv = 0;
         while (true) {
             chunk.clear();
             if (!io.read_some(chunk)) {
+                MCP_LOGF(pal::LogLevel::warn,
+                         "RTSP RX read_some failed cseq=%u total_bytes_before_fail=%zu "
+                         "(socket closed by peer or timeout)",
+                         req.cseq, total_recv);
                 return MC_ERR_IO;
             }
+            total_recv += chunk.size();
             if (!chunk.empty()) {
                 parser.append(std::string_view{
                     reinterpret_cast<const char*>(chunk.data()), chunk.size()});
             }
             if (auto r = parser.next_response()) {
                 resp = std::move(*r);
+                MCP_LOGF(pal::LogLevel::info,
+                         "RTSP RX cseq=%u status=%d (req cseq=%u, body_bytes=%zu)",
+                         resp.cseq, resp.status_code, req.cseq, resp.body.size());
                 if (resp.cseq == req.cseq) {
                     return MC_OK;
                 }
@@ -107,6 +120,9 @@ struct RtspClient::Impl {
                 continue;
             }
             if (std::chrono::steady_clock::now() >= deadline) {
+                MCP_LOGF(pal::LogLevel::warn,
+                         "RTSP RX timeout cseq=%u total_bytes=%zu",
+                         req.cseq, total_recv);
                 return MC_ERR_TIMEOUT;
             }
         }

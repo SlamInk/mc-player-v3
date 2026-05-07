@@ -49,6 +49,8 @@ public:
     }
 
     [[nodiscard]] bool bad() const noexcept { return bad_; }
+    /// 显式置 bad,语义解析(syntax check)失败时由 caller 调用,与 IO 越界一致归类。
+    void               set_bad() noexcept { bad_ = true; }
     [[nodiscard]] bool more_rbsp_data() const noexcept;
 
 private:

@@ -54,13 +54,30 @@ void parse_st_rps(BitReader&                       br,
         if (st_rps_idx == list.size()) {
             delta_idx_minus1 = br.read_ue();
         }
+        // 防御损坏码流: delta_idx_minus1 + 1 > st_rps_idx 会让 ref_rps_idx 无符号回卷,
+        // 后续 list[ref_rps_idx] 越界访问。slice header 路径下尤其需要(攻击者可控位)。
+        if (delta_idx_minus1 + 1u > st_rps_idx) {
+            br.set_bad();
+            return;
+        }
         const uint32_t ref_rps_idx = st_rps_idx - (delta_idx_minus1 + 1);
+        if (ref_rps_idx >= list.size()) {
+            br.set_bad();
+            return;
+        }
         const bool delta_rps_sign  = br.read_bit1();
         const uint32_t abs_delta_rps_minus1 = br.read_ue();
         const int32_t delta_rps = (delta_rps_sign ? -1 : 1) *
                                     static_cast<int32_t>(abs_delta_rps_minus1 + 1);
 
         const ShortTermRefPicSet& ref = list[ref_rps_idx];
+        // ref.num_negative_pics / num_positive_pics 各受 SPS §A.4.2 限制 ≤ 16,
+        // 但损坏码流可能让 ref 自身 num_negative_pics 异常大;n_ref 也得 cap。
+        if (ref.num_negative_pics < 0 || ref.num_negative_pics > 16 ||
+            ref.num_positive_pics < 0 || ref.num_positive_pics > 16) {
+            br.set_bad();
+            return;
+        }
         const int n_ref = ref.num_negative_pics + ref.num_positive_pics + 1;
         std::vector<uint8_t> used_by_curr(n_ref, 0);
         std::vector<uint8_t> use_delta(n_ref, 1);
@@ -118,9 +135,17 @@ void parse_st_rps(BitReader&                       br,
         }
         out.num_positive_pics = i;
     } else {
-        out.num_negative_pics = static_cast<int>(br.read_ue());
-        out.num_positive_pics = static_cast<int>(br.read_ue());
-        if (out.num_negative_pics > 16 || out.num_positive_pics > 16) return;
+        // 先到本地变量再赋值 out,避免 cap 越界时 out 已含异常值导致 caller 误用。
+        const uint32_t neg = br.read_ue();
+        const uint32_t pos = br.read_ue();
+        if (neg > 16 || pos > 16) {
+            br.set_bad();
+            out.num_negative_pics = 0;
+            out.num_positive_pics = 0;
+            return;
+        }
+        out.num_negative_pics = static_cast<int>(neg);
+        out.num_positive_pics = static_cast<int>(pos);
         int32_t prev = 0;
         for (int i = 0; i < out.num_negative_pics; ++i) {
             const uint32_t delta_poc_s0_minus1 = br.read_ue();
