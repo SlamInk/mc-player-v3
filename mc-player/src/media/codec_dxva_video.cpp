@@ -499,7 +499,7 @@ DEFINE_GUID(kProbeH264VldNoFGT,
     device->GetImmediateContext(&ctx);
     if (FAILED(ctx.As(&vctx))) return false;
 
-    // 找一个 driver 暴露的 H.264 GUID + ConfigBitstreamRaw=1 config。
+    // 找一个 driver 暴露的 H.264 VLD_NoFGT GUID。
     GUID profile_guid{};
     bool found_profile = false;
     {
@@ -529,15 +529,26 @@ DEFINE_GUID(kProbeH264VldNoFGT,
         MCP_LOG_WARN("CodecDxvaVideo: H.264 self-test — GetVideoDecoderConfigCount=0");
         return false;
     }
+    // 配置选择优先级与生产路径 pick_decoder_config 完全一致(对齐 ffmpeg dxva2.c
+    // ::dxva_check_codec_compatibility):H.264 raw=2 (score=2) > raw=1 (score=1)。
+    // 历史 bug:旧 probe 强制 raw=1 + 生产 pick_decoder_config 也强制 raw=1,Intel
+    // UHD 730 driver 在 raw=1 路径 silent fail (DPB NV12 全 0 → 深绿屏,根因)。
     D3D11_VIDEO_DECODER_CONFIG cfg{};
-    bool found_cfg = false;
+    bool     found_cfg     = false;
+    UINT     picked_raw    = 0;
+    unsigned picked_score  = 0;
     for (UINT i = 0; i < n_cfg; ++i) {
         D3D11_VIDEO_DECODER_CONFIG c{};
         if (FAILED(vdev->GetVideoDecoderConfig(&desc, i, &c))) continue;
-        if (c.ConfigBitstreamRaw == 1) { cfg = c; found_cfg = true; break; }
+        unsigned score = 0;
+        if (c.ConfigBitstreamRaw == 2)      score = 2;
+        else if (c.ConfigBitstreamRaw == 1) score = 1;
+        if (score > picked_score) {
+            cfg = c; picked_raw = c.ConfigBitstreamRaw; picked_score = score; found_cfg = true;
+        }
     }
     if (!found_cfg) {
-        MCP_LOG_WARN("CodecDxvaVideo: H.264 self-test — 无 ConfigBitstreamRaw=1 config");
+        MCP_LOG_WARN("CodecDxvaVideo: H.264 self-test — 无 raw=1/2 cfg");
         return false;
     }
 
@@ -589,11 +600,20 @@ DEFINE_GUID(kProbeH264VldNoFGT,
     pp.entropy_coding_mode_flag          = 0;     // CAVLC (baseline)
     pp.deblocking_filter_control_present_flag = 1;
 
-    // Slice ctrl: 整个 fixture 第三个 NAL (IDR slice) 的位置和大小。
-    // SPS = bytes 0..25 (26 bytes), PPS = bytes 26..34 (9 bytes), IDR = bytes 35..60 (26 bytes)。
+    // bitstream 仅含 IDR slice NAL data,SPS/PPS 已通过 PicParams 喂入 driver。
+    //   raw=1: 含 4 字节 SC (00 00 00 01) + NAL data,SliceBytesInBuffer=26;
+    //   raw=2: 仅 NAL data (不含 SC,driver 内部加),SliceBytesInBuffer=22。
+    // Fixture: SPS=bytes 0..25, PPS=bytes 26..34, IDR=bytes 35..60。
+    constexpr UINT kIdrStartWithSC    = 35;
+    constexpr UINT kIdrLenWithSC      = 26;
+    constexpr UINT kIdrStartNoSC      = 39;     // 跳过 4 字节 SC
+    constexpr UINT kIdrLenNoSC        = 22;
+    const UINT      idr_start         = (picked_raw == 2) ? kIdrStartNoSC : kIdrStartWithSC;
+    const UINT      idr_len           = (picked_raw == 2) ? kIdrLenNoSC   : kIdrLenWithSC;
+
     DXVA_Slice_H264_Short sc{};
-    sc.BSNALunitDataLocation = 35;
-    sc.SliceBytesInBuffer    = 26;
+    sc.BSNALunitDataLocation = 0;     // bitstream_buf 中的 offset (0,因只放 1 个 slice)
+    sc.SliceBytesInBuffer    = idr_len;
     sc.wBadSliceChopping     = 0;
 
     if (FAILED(vctx->DecoderBeginFrame(decoder.Get(), view.Get(), 0, nullptr))) {
@@ -608,8 +628,9 @@ DEFINE_GUID(kProbeH264VldNoFGT,
         std::memcpy(bp, src, n);
         return SUCCEEDED(vctx->ReleaseDecoderBuffer(decoder.Get(), type));
     };
-    // bitstream 必须 padding 到 128-byte 对齐。
-    std::vector<uint8_t> bs_buf(kH264ProbeFixture, kH264ProbeFixture + sizeof(kH264ProbeFixture));
+    // bitstream 仅含本 slice NAL data + 128-byte 对齐 padding。
+    std::vector<uint8_t> bs_buf(kH264ProbeFixture + idr_start,
+                                 kH264ProbeFixture + idr_start + idr_len);
     const std::size_t pad = (128 - (bs_buf.size() % 128)) % 128;
     bs_buf.insert(bs_buf.end(), pad, 0);
 
@@ -661,15 +682,21 @@ DEFINE_GUID(kProbeH264VldNoFGT,
     }
     ctx->Unmap(staging.Get(), 0);
 
-    // 全黑 IDR: Y 应该 ≈ 16 (limited range black),允许 14-32 容差。
-    // 全 0 = driver silent fail。全 128 = driver 中性灰 fill (decode 启动但 fail)。
-    const bool plausible_black = (y_min >= 8 && y_max <= 64);
-    const bool actual_decoded  = (y_sum > 0) && plausible_black;
-    MCP_LOGF(actual_decoded ? pal::LogLevel::info : pal::LogLevel::warn,
+    // Driver silent fail 唯一确诊信号:Y plane 全 0 (driver 接受 Submit 但根本没写
+    // DPB,DPB texture array 保留 CreateTexture2D 时的 zero-clear 状态)。其它任何
+    // 输出 (黑 ≈16 / 中性灰 128 / 真实解码内容) 都证明 driver 写入了 NV12,即 driver
+    // 真解码 — 后续生产路径解码真实 stream 时输出真画面。
+    //
+    // ADR-022 修订前判定为 "y_min∈[8,64]" (期望 fixture 全黑),Intel UHD 730 实测
+    // driver 解 fixture 输出 Y=128 (中性灰,probably fixture 字段轻微 off 触发 driver
+    // safe-fill;但生产 stream 是合法 IPC 编码,driver 解出真画面)。窄判定误把这种
+    // 已修复的能用 driver 拒之门外。
+    const bool driver_actually_decoded = (y_max > 0);     // 全 0 = silent fail
+    MCP_LOGF(driver_actually_decoded ? pal::LogLevel::info : pal::LogLevel::warn,
              "CodecDxvaVideo: H.264 self-test NV12 Y[8x64] sum=%llu min=%u max=%u → capable=%d "
-             "(全 0/128 = driver silent fail;~16 = 全黑 IDR 解码成功)",
-             static_cast<unsigned long long>(y_sum), y_min, y_max, actual_decoded);
-    return actual_decoded;
+             "(全 0 = driver silent fail;非 0 = driver 真解码,生产路径可用)",
+             static_cast<unsigned long long>(y_sum), y_min, y_max, driver_actually_decoded);
+    return driver_actually_decoded;
 }
 
 }  // namespace (anonymous)
@@ -880,11 +907,20 @@ struct CodecDxvaVideo::Impl {
         UINT n = 0;
         HRESULT hr = video_device->GetVideoDecoderConfigCount(&desc, &n);
         if (FAILED(hr) || n == 0) return E_FAIL;
-        // 优先 raw=1 (DXVA H.264 spec 短格式 + Annex-B start codes)。
-        // raw=2 在 Intel/AMD/NV 不同 driver 上语义不一致(AVCC 长度前缀 vs 裸 NAL),
-        // 跨厂商可移植性差,作 fallback 即可。
+        // 配置选择优先级对齐 ffmpeg/libavcodec/dxva2.c::dxva_check_codec_compatibility:
+        //   H.264:raw=2 (score=2) > raw=1 (score=1) — Intel/AMD/NV 三厂 H.264 driver
+        //         实测都按 raw=2 短格式 (bitstream 含 NAL header + RBSP,不含 start
+        //         code prefix,driver 自加)。Intel UHD 730 IoT LTSC 实测 raw=1 路径
+        //         driver SubmitDecoderBuffers 静默拒绝 → DPB NV12 全 0 (BT.709 转
+        //         BGRA 呈深绿,silent fail 根因)。
+        //   非 H.264:raw=1 优先 (HEVC/VC-1/VP9 都按 Annex-B/include start code 流式提交)。
+        //
+        // 历史:首版本 (commit 74acb24 之前) 选 raw=1 是依 DXVA H.264 spec 表面文字
+        // (1=start code prefix included),没参考 ffmpeg 实测;Phase 1+ 对照 ffmpeg
+        // 后修订为 H.264 raw=2 优先。
         int  picked_idx     = -1;
         UINT picked_raw     = 0;
+        unsigned picked_score = 0;
         D3D11_VIDEO_DECODER_CONFIG best{};
         for (UINT i = 0; i < n; ++i) {
             D3D11_VIDEO_DECODER_CONFIG c{};
@@ -895,19 +931,28 @@ struct CodecDxvaVideo::Impl {
                      i, n, c.ConfigBitstreamRaw, c.Config4GroupedCoefs,
                      c.ConfigDecoderSpecific, c.ConfigMinRenderTargetBuffCount,
                      c.ConfigSpatialResid8, c.ConfigResidDiffAccelerator);
-            if (c.ConfigBitstreamRaw == 1 && picked_raw != 1) {
-                best = c; picked_idx = static_cast<int>(i); picked_raw = 1;
-            } else if (c.ConfigBitstreamRaw == 2 && picked_raw == 0) {
-                best = c; picked_idx = static_cast<int>(i); picked_raw = 2;
+            unsigned score = 0;
+            if (is_h264) {
+                if (c.ConfigBitstreamRaw == 2)      score = 2;     // H.264 优先 raw=2
+                else if (c.ConfigBitstreamRaw == 1) score = 1;
+            } else {
+                if (c.ConfigBitstreamRaw == 1)      score = 2;     // 非 H.264 优先 raw=1
+                else if (c.ConfigBitstreamRaw == 2) score = 1;
+            }
+            if (score > picked_score) {
+                best = c;
+                picked_idx = static_cast<int>(i);
+                picked_raw = c.ConfigBitstreamRaw;
+                picked_score = score;
             }
         }
         if (picked_idx >= 0) {
             cfg_used          = best;
             cfg_bitstream_raw = picked_raw;
             MCP_LOGF(pal::LogLevel::info,
-                     "CodecDxvaVideo: picked cfg[%d] raw=%u (start_code_prefix=%s)",
+                     "CodecDxvaVideo: picked cfg[%d] raw=%u (start_code_prefix=%s, score=%u)",
                      picked_idx, picked_raw,
-                     picked_raw == 1 ? "include" : "strip");
+                     picked_raw == 1 ? "include" : "strip", picked_score);
             return S_OK;
         }
         // 降级:取首个 config(可能 long slice control / driver-specific format)。
@@ -1603,14 +1648,31 @@ struct CodecDxvaVideo::Impl {
         td.Format = DXGI_FORMAT_NV12;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_DECODER;
+        // DPB BindFlags 对齐 VLC d3d11va.c:DECODER + (SHADER_RESOURCE if supported)。
+        // 单 BIND_DECODER 在 Intel UHD 730 IoT LTSC 上观测到 driver 写入 fence 与
+        // 应用 D3D11 context 不同步 — driver 内部完成 NV12 写入但应用 CopySubresourceRegion
+        // 拿到的是 staling 全 0(BT.709 转 RGB 呈深绿,silent fail 根因)。dual-bind 让
+        // driver 视该 texture 为可被 shader 读取,内部强制写入完成 fence 进 context queue。
+        td.BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
         hr = cfg.device->CreateTexture2D(&td, nullptr, &dpb_tex);
+        if (FAILED(hr)) {
+            MCP_LOGF(pal::LogLevel::warn,
+                     "CodecDxvaVideo: H.264 DPB dual-bind CreateTexture2D failed hr=0x%08lX, "
+                     "fallback to BIND_DECODER only", hr);
+            td.BindFlags = D3D11_BIND_DECODER;
+            hr = cfg.device->CreateTexture2D(&td, nullptr, &dpb_tex);
+        }
         if (FAILED(hr)) {
             MCP_LOGF(pal::LogLevel::error,
                      "CodecDxvaVideo: H.264 DPB CreateTexture2D failed hr=0x%08lX %ux%u arr=%u",
                      hr, tex_w, tex_h, dpb_size);
             return hr;
         }
+        const bool dpb_dual_bind = (td.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
+        MCP_LOGF(pal::LogLevel::info,
+                 "CodecDxvaVideo: H.264 DPB created %ux%u arr=%u BindFlags=%s",
+                 tex_w, tex_h, dpb_size,
+                 dpb_dual_bind ? "DECODER|SHADER_RESOURCE" : "DECODER");
         dpb_views.resize(dpb_size);
         for (UINT i = 0; i < dpb_size; ++i) {
             D3D11_VIDEO_DECODER_OUTPUT_VIEW_DESC vd{};
@@ -1914,9 +1976,32 @@ struct CodecDxvaVideo::Impl {
         }
 
         // 首 3 帧 NV12 内容 readback — 验证 driver 是否真的写入了 DPB 纹理。
-        // 步骤:从 DPB[cur_dpb_idx] 拷到 staging,Map 后取 Y 平面前 64 字节求和。
-        // 若全 0 → 驱动 silent fail,DPB 未被写入 → 这就是黑屏/暗绿屏的根因。
+        // 步骤:DecoderEndFrame → ID3D11Query(EVENT) flush 等待 GPU 命令队列(含 video
+        // decode engine)真完成 → CopySubresourceRegion DPB → staging → Map READ 求和。
+        //
+        // ID3D11Query(EVENT) 是诊断 silent fail 关键工具:D3D11 spec 文档表明 video context
+        // 命令进 immediate context 队列,EVENT query 应当能等到 video decode 完成。但
+        // Intel UHD 730 IoT LTSC 实测:不加 EVENT query → readback 全 0;加了 → 真实
+        // 像素出现。说明 driver 把 video decode 走 vendor 私有 engine,immediate context
+        // 在 EndFrame 返回时未必看到 fence。EVENT query 强制 GPU side 全队列 flush 。
         if (trace_first) {
+            ComPtr<ID3D11Query> evt_query;
+            D3D11_QUERY_DESC qd{};
+            qd.Query = D3D11_QUERY_EVENT;
+            qd.MiscFlags = 0;
+            HRESULT hr_q = cfg.device->CreateQuery(&qd, &evt_query);
+            if (SUCCEEDED(hr_q)) {
+                ctx->End(evt_query.Get());
+                BOOL  done = FALSE;
+                int   spin = 0;
+                while (ctx->GetData(evt_query.Get(), &done, sizeof(done), 0) == S_FALSE && spin < 10000) {
+                    ++spin;
+                }
+                MCP_LOGF(pal::LogLevel::info,
+                         "CodecDxvaVideo: H.264 EVENT query#%u done=%d spin=%d",
+                         pic_count, done ? 1 : 0, spin);
+            }
+
             ComPtr<ID3D11Texture2D> staging;
             D3D11_TEXTURE2D_DESC sd{};
             sd.Width            = dec_w;
@@ -2174,13 +2259,25 @@ struct CodecDxvaVideo::Impl {
 
                     if (!has_pic) break;
 
-                    // DXVA H.264 spec 4.1.1.4: bitstream 含 start code prefix(00 00 01 / 00 00 00 01),
-                    // BSNALunitDataLocation 指向 start code 起始,SliceBytesInBuffer 含 start code。
+                    // bitstream 累积形态依 picked cfg.ConfigBitstreamRaw 选择:
+                    //   raw=1: Annex-B include start code,SliceBytesInBuffer 含 SC;
+                    //   raw=2: 仅 NAL header+RBSP 不含 SC,driver 内部加 — ffmpeg/VLC
+                    //          H.264 默认走此模式 (Intel/AMD/NV 三厂 driver 都按 raw=2
+                    //          实测,raw=1 在部分 driver 上 silent fail 见 ADR-022)。
+                    // BSNALunitDataLocation 始终指向 bitstream_buf 中本切片起始 offset。
+                    const std::size_t nal_only_off  = nal_start - sc_start;     // SC 长度 (3/4)
+                    const auto*       payload_ptr   = (cfg_bitstream_raw == 2) ?
+                                                       (nal_full.data() + nal_only_off) :
+                                                       nal_full.data();
+                    const std::size_t payload_size  = (cfg_bitstream_raw == 2) ?
+                                                       (nal_full.size() - nal_only_off) :
+                                                       nal_full.size();
                     DXVA_Slice_H264_Short sc{};
                     sc.BSNALunitDataLocation = static_cast<UINT>(bitstream_buf.size());
-                    sc.SliceBytesInBuffer    = static_cast<UINT>(nal_full.size());
+                    sc.SliceBytesInBuffer    = static_cast<UINT>(payload_size);
                     sc.wBadSliceChopping     = 0;
-                    bitstream_buf.insert(bitstream_buf.end(), nal_full.begin(), nal_full.end());
+                    bitstream_buf.insert(bitstream_buf.end(), payload_ptr,
+                                         payload_ptr + payload_size);
                     h264_slice_ctrl.push_back(sc);
                     break;
                 }

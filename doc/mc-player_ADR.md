@@ -212,6 +212,30 @@
   2. tier 2 启动后第一帧 silent fail 检测（之前已加 `silent_fail_confirmed_flag`），controller `tick_ui` poll → 自动降 tier 3。这是兜底机制，避免用户硬解开启 + 实际 silent fail 时画面长时间深绿。
   3. 若实测某 driver 需要 `Reserved16Bits=0x34c`（Intel ClearVideo workaround）才能解，加 vendor=Intel 自动启用此 workaround 的代码路径，对齐 ffmpeg `FF_DXVA2_WORKAROUND_INTEL_CLEARVIDEO`。
 
+**修订记录（2026-05-08）**：silent fail root cause 已定位并修复（详 ADR-023）— 选 cfg 优先级反了，应该 H.264 raw=2 优先；旧 mc-player 强选 raw=1 让 Intel UHD 730 driver silent fail。修复后 ADR-022 strict probe gate **保留**（仍是默认门），但 probe 现在通过、自动激活 tier 2 — 不再实质降级到 tier 3。本 ADR 决策（默认走 strict gate + opt-in `MCP_TRUST_DRIVER_DXVA`）作为兜底语义保留，原决策 / 原依据正文不变。
+
+---
+
+## ADR-023 Tier 2 DXVA-direct H.264 raw=2 优先选 cfg + DPB dual-bind（解 ADR-022 silent fail；对应 ADD §5.6.1 / §5.6.2.2）
+
+- **决策**：mc-player Tier 2 DXVA-direct H.264 路径选 `D3D11_VIDEO_DECODER_CONFIG` 时按 ffmpeg 评分排序 — **H.264 优先 raw=2 (score=2)，次选 raw=1 (score=1)**；非 H.264 codec 仍优先 raw=1。同时 DPB texture array `BindFlags` 改为 `D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE`（dual-bind 对齐 VLC `d3d11va.c`）。生产路径 + probe self-test 路径同步切换。
+
+- **依据**：
+  - **实证（2026-05-08）**：Intel UHD 730 IoT LTSC 上对照 ffmpeg `libavcodec/dxva2.c::dxva_check_codec_compatibility` 发现选 cfg 评分函数中 H.264 + raw=2 → score=2，raw=1 → score=1（注释 line 139-144 显式写法）。mc-player 旧路径强选 raw=1 → Intel driver `SubmitDecoderBuffers` 返 OK 但 NV12 全 0（深绿屏 silent fail，五项 ffmpeg/VLC 对照修复都没解掉）。改 raw=2 优先 + bitstream 对应 strip start code prefix 后：(a) probe self-test capable=1（Y plane 输出非 0），(b) 生产路径首帧 NV12 readback Y[0..15] 含真实纹理（avg=147 nonconst=99.5%），(c) PrintWindow 截图显示真实摄像头画面而非深绿。
+  - **DXVA H.264 spec ConfigBitstreamRaw 语义**：1=bitstream 含 Annex-B start code prefix（`00 00 01` / `00 00 00 01`），driver 不重写；2=bitstream 仅含 NAL header + RBSP（不含 SC），driver 内部加。Intel/AMD/NV 三厂 H.264 driver 实测都按 raw=2 优化 — VLD entropy 解码器内部 buffer 直接食 NAL data，省去 SC scan 步骤。raw=1 在多个 driver 上是 legacy fallback；某些 driver 对 raw=1 路径无优化甚至 silent fail。
+  - **DPB BindFlags dual-bind**：VLC `modules/codec/avcodec/d3d11va.c::DxCreateDecoderSurfaces` line 543-547 — DPB texture 创建时 `texDesc.BindFlags = D3D11_BIND_DECODER`，再按 `D3D11_FORMAT_SUPPORT_SHADER_LOAD` 探测决定是否加 `D3D11_BIND_SHADER_RESOURCE`。dual-bind 让 driver 视该 texture 为可被 shader 读取，内部强制写入完成 fence 进 immediate context queue（单 BIND_DECODER 时部分 driver fence 走 vendor 私有 ME engine queue，与应用 D3D11 context 不同步，CopySubresourceRegion 拷出 stale 全 0）。
+
+- **关系**：
+  - **解 ADR-022**：silent fail 已 root-cause；ADR-022 默认 strict probe gate 保留，但 probe 现在通过即可走 tier 2，不再实质降级。
+  - **窄化 ADR-015**：ADR-015 四级降级链不变，但 tier 2 H.264 路径在 Intel UHD 730 + IoT LTSC 上从"实测 silent fail 失效"恢复"实测可用"；ADR-015 描述的 vendor SDK → DXVA-direct → MFT → libcodec 链条对所有平台都重新通畅。
+  - 与 ADR-022 五项 ffmpeg/VLC 对照修复（GUID priority / IQ Matrix / DPB=24 / Reserved16Bits=3 / video_session_mu）：那些修复在 raw=1 路径下没收敛是因为根因在 cfg 选择层；它们是必要但不充分。配合本 ADR 后整体形成完整 ffmpeg/VLC 对齐。
+  - 与 ADD §5.6.2.2 DXVA-direct 路径：实施层细节（cfg 选择 / BindFlags / NAL strip）由本 ADR 落地，不需 ADD 章节改动；ADD 仍权威记录硬件加速路径原理。
+
+- **后续工作（可选）**：
+  1. 进一步对齐 ffmpeg padding 规则：当前 mc-player bitstream buffer padding 不计入 `SliceBytesInBuffer`；ffmpeg 是把 padding 加到最后一片的 `SliceBytesInBuffer`。Intel UHD 730 实测两种都解码，但跨厂商或可能差异。
+  2. probe fixture 全黑判定：当前判定放宽到"`y_max > 0` 即非全 0"；可重新生成一个真正的全黑 64x64 IDR fixture，恢复严格 `y_min∈[8,64]` 黑值检查，提升 probe 假阳性 / 假阴性辨识度。
+  3. DPB dual-bind fallback：当前先尝试 dual-bind、失败回退单 BIND_DECODER；某些 GPU（如老 AMD UVD）可能不支持 NV12 array dual-bind 需要走 fallback，长期观察是否有副作用。
+
 ---
 
 ## 修订规范
