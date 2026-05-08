@@ -66,9 +66,10 @@ struct PendingAu {
 //      找不到 ref → 静默输出黑色 NV12 → 黑屏直到下一 IDR)
 //   3. producer overflow 时丢 newest;后续 decode_error 自然 poison gate,
 //      等下一 IDR 自然恢复
-// cap=16 = 0.5s @ 30fps,足够覆盖 IPC 流的 GOP 边界 SPS/PPS/IDR 突发 +
-//   起始期 driver init 滞后(典型 200-400ms)。
-constexpr std::size_t kAuQueueCap = 16;
+// cap=64 = ~2.1s @ 30fps,与 codec_dxva_video 同步抬升。原 16 在 codec init
+// (probe + cfg pick + DPB create) 800~1200ms 期间已被 producer 推满,后续 IDR
+// 被 newest-drop → gate 永远等不到 anchor 解 poison(2026-05-08 实测)。
+constexpr std::size_t kAuQueueCap = 64;
 
 // 自定义 IMFSample attribute — 透传 arrival_qpc_ns。MFT 文档未明示
 // input→output 自定义 attribute 透传，实测 driver 行为不一；失败时回退

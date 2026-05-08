@@ -441,6 +441,16 @@ void DepackH264::emit_au(int64_t pts_us, bool with_extradata) noexcept {
 
 void DepackH264::mark_reference_lost() noexcept {
     refs_lost_ = true;
+    // RTP seq gap → 任何正在重组的 FU-A 都不可信(丢的可能是中间分片,继续 push
+    // 后续分片到 fu_buffer_ 会得损坏 NAL,driver 解码出 partial 真实数据 + zero-fill
+    // / 错位 → 花屏顶部一条带真实数据 + 下方 UV 错位渐变)。同样 au_buffer_ 累积
+    // 的前序 NAL 也不可信(IDR slice 跨多 RTP 时丢中间分片导致 IDR 不完整,driver
+    // 解出顶部宏块 + 后续 zero-fill,直接 emit 给 render → 花屏)。
+    fu_buffer_.clear();
+    fu_in_progress_ = false;
+    au_buffer_.clear();
+    saw_idr_in_au_      = false;
+    saw_recovery_in_au_ = false;
 }
 
 void DepackH264::reset() noexcept {

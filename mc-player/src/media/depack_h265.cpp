@@ -317,7 +317,16 @@ void DepackH265::emit_au(int64_t pts_us, bool with_extradata) noexcept {
     current_arrival_qpc_ns_ = 0;
 }
 
-void DepackH265::mark_reference_lost() noexcept { refs_lost_ = true; }
+void DepackH265::mark_reference_lost() noexcept {
+    refs_lost_ = true;
+    // RTP seq gap → 丢正在重组的 FU 与 au_buffer_ 中累积的 NAL,等下一 IRAP 重 anchor。
+    // 与 H.264 同因:中间分片丢失会让 driver 解出 partial 真实数据 + zero-fill 花屏。
+    fu_buffer_.clear();
+    fu_in_progress_     = false;
+    au_buffer_.clear();
+    saw_irap_in_au_     = false;
+    saw_recovery_in_au_ = false;
+}
 
 void DepackH265::reset() noexcept {
     au_buffer_.clear();

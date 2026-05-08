@@ -179,6 +179,16 @@ public:
         return true;
     }
 
+    // 取已 connect 成功的 peer 地址 — 上层用其 IP + RTSP SETUP 解出的 server_rtcp_port
+    // prime UDP RTCP 通道的 peer_addr,这样首个 PLI 不必等 server 发过来一个 RTCP 学路由。
+    bool peer_address(sockaddr_storage& out, int& out_len) const noexcept {
+        if (!s_.valid()) return false;
+        out_len = sizeof(out);
+        return ::getpeername(s_.get(),
+                              reinterpret_cast<sockaddr*>(&out),
+                              &out_len) == 0;
+    }
+
 private:
     pal::SocketGuard s_;
 };
@@ -267,6 +277,35 @@ public:
             mc.timeout_seconds = result.timeout_seconds;
             mc.rtp             = std::move(pair.rtp);
             mc.rtcp            = std::move(pair.rtcp);
+
+            // Bootstrap RTCP peer addr:server IP 取自 signaling TCP getpeername,
+            // RTCP port 取自 SETUP response Transport: server_port=A-B 的 B。
+            // 不做这步首帧 PLI 会 send 失败(MC_ERR_INVALID_STATE),原 RX 路径只在
+            // 收到 server 主动发 RTCP SR 才学到 peer_addr → 摄像头默认 5+s 才下首
+            // SR,期间 PLI 全丢 → controller 的 SEQ_GAP poison 永远等不到 IDR。
+            if (result.server_rtcp_port != 0) {
+                sockaddr_storage signaling_peer{};
+                int              signaling_peer_len = 0;
+                if (signaling_.peer_address(signaling_peer, signaling_peer_len)) {
+                    std::memcpy(&mc.peer_rtcp_addr, &signaling_peer, sizeof(signaling_peer));
+                    mc.peer_rtcp_addr_len = signaling_peer_len;
+                    if (signaling_peer.ss_family == AF_INET) {
+                        reinterpret_cast<sockaddr_in*>(&mc.peer_rtcp_addr)->sin_port =
+                            ::htons(result.server_rtcp_port);
+                    } else if (signaling_peer.ss_family == AF_INET6) {
+                        reinterpret_cast<sockaddr_in6*>(&mc.peer_rtcp_addr)->sin6_port =
+                            ::htons(result.server_rtcp_port);
+                    }
+                    mc.peer_rtcp_set = true;
+                    MCP_LOGF(pal::LogLevel::info,
+                             "TsRtspUdp: %s RTCP peer primed via SETUP server_port=%u "
+                             "(family=%d) — first PLI 可立刻发,无需等 server SR",
+                             m.kind == SdpMedia::Kind::video ? "video" : "audio",
+                             static_cast<unsigned>(result.server_rtcp_port),
+                             static_cast<int>(signaling_peer.ss_family));
+                }
+            }
+
             channels_.push_back(std::move(mc));
             sdp_ = sdp;
         }

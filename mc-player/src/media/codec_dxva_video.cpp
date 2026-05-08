@@ -724,6 +724,11 @@ struct CodecDxvaVideo::Impl {
     std::vector<ComPtr<ID3D11VideoDecoderOutputView>>       dpb_views;
     UINT                                                     dpb_size = 8;
 
+    // ID3D11Query(EVENT) — 复用,每帧 End/GetData 等 video decode 真完成后再
+    // CopySubresourceRegion 到 out_pool。若不等 → driver partial-written DPB 拷给
+    // render → 花屏(详见 flush_pending_pic_h264 fence wait 注释)。
+    ComPtr<ID3D11Query>                                     decode_fence_query;
+
     struct DpbEntry {
         bool    used = false;
         int32_t poc = 0;
@@ -819,9 +824,16 @@ struct CodecDxvaVideo::Impl {
     //   3. producer overflow 时丢 newest;后续 decode_error 自然 poison gate,
     //      等下一 IDR 自然恢复(或上报 PLI 主动催 IDR)
     //
-    // cap=16 = 0.5s @ 30fps,足够覆盖 IPC 流的 GOP 边界 SPS/PPS/IDR 突发 +
-    //   起始期 driver init 滞后(典型 200-400ms)。
-    static constexpr std::size_t kAuQueueCap = 16;
+    // cap=64 = ~2.1s @ 30fps,覆盖:
+    //   a) controller→codec init 滞后(probe+cfg pick+DPB create 实测 800~1200ms,
+    //      期间 producer 已往 queue 推 AU,过小 cap=16 ≈0.5s 在 setup 完成前已
+    //      满 → 后续 IDR try_push 被 newest-drop → gate 永远等不到 anchor)
+    //   b) 网络抖动:30 fps 下 60 包丢 1 (实测 IoT LTSC + 海康 IPC) 触发 SEQ_GAP
+    //      poison,期间 PLI 重请求 IDR 到达需要 RTT + server 处理,~150-500ms
+    //   c) GOP 边界 SPS/PPS/IDR 突发 + B-frame reorder
+    // 不再担心 ref 链问题 — producer/worker 都不主动 drop_oldest,只在 producer
+    // 端 overflow 时 drop newest。
+    static constexpr std::size_t kAuQueueCap = 64;
 
     std::thread                          worker_thread;
     std::atomic<bool>                    worker_stop{false};
@@ -1711,6 +1723,14 @@ struct CodecDxvaVideo::Impl {
             return E_FAIL;
         }
 
+        // 创建复用 EVENT query,emit 路径每帧 fence wait 用。
+        D3D11_QUERY_DESC qd_evt{};
+        qd_evt.Query = D3D11_QUERY_EVENT;
+        if (FAILED(cfg.device->CreateQuery(&qd_evt, &decode_fence_query))) {
+            MCP_LOG_WARN("CodecDxvaVideo: H.264 CreateQuery(EVENT) 失败 — emit 路径将不等 fence,可能花屏");
+            decode_fence_query.Reset();
+        }
+
         decoder_inited = true;
         MCP_LOGF(pal::LogLevel::info,
                  "CodecDxvaVideo: H.264 decoder ready %ux%u dpb=%u (Annex-B raw=%u) "
@@ -1950,6 +1970,27 @@ struct CodecDxvaVideo::Impl {
         if (trace_first) {
             char tag[24]; std::snprintf(tag, sizeof(tag), "h264.flush#%u", pic_count);
             drain_d3d11_messages(tag);
+        }
+
+        // ID3D11Query(EVENT) fence wait — DecoderEndFrame 在 immediate context 命令队列
+        // 上是异步入队;后续 CopySubresourceRegion(DPB → out_pool)若不等 video decode
+        // 真完成,driver 把 partial-written DPB 拷给 render 端 → out_pool 含 Y plane
+        // 顶部已写、UV plane 未写的混合内容 → render sample 出花屏(顶部真实图、下部
+        // UV 错位渐变)。Intel UHD 730 上 trace_first 实测首帧 spin=10000 才 done;
+        // 后续帧 spin~3-5k = 微秒级,生产路径加此等待对 30fps throughput 影响可忽略。
+        if (decode_fence_query) {
+            ctx->End(decode_fence_query.Get());
+            BOOL done = FALSE;
+            int  spin = 0;
+            while (ctx->GetData(decode_fence_query.Get(), &done, sizeof(done), 0) == S_FALSE
+                   && spin < 100000) {
+                ++spin;
+            }
+            if (trace_first) {
+                MCP_LOGF(pal::LogLevel::info,
+                         "CodecDxvaVideo: H.264 emit fence#%u done=%d spin=%d",
+                         pic_count, done ? 1 : 0, spin);
+            }
         }
 
         // 标记 DPB 槽

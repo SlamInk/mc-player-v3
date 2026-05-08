@@ -223,10 +223,18 @@ struct Controller::Impl {
     std::atomic<uint64_t>                      au_count{0};
     std::atomic<uint64_t>                      idr_count{0};
 
-    // RTCP 上行：本端 sender SSRC（每会话随机一次） + 视频远端 SSRC（首个视频 RTP 学到）。
-    // pli_sent 走 atomic_flag — 只允许首帧到达时发一次 PLI，触发摄像头立即推 IDR。
+    // RTCP 上行:本端 sender SSRC(每会话随机一次) + 视频远端 SSRC(首个视频 RTP 学到)。
+    // first_pli_sent 是首帧专用的 atomic_flag(test_and_set 一次性触发);
+    // SEQ_GAP 路径不复用它,改用限频 last_video_pli_ns_ + video_remote_ssrc 重发 PLI。
     uint32_t                                   local_sender_ssrc = 0;
-    std::atomic_flag                           pli_sent = ATOMIC_FLAG_INIT;
+    std::atomic_flag                           first_pli_sent = ATOMIC_FLAG_INIT;
+    // 视频远端 SSRC,首个 video RTP 学到后保存供 SEQ_GAP 后续重发 PLI 复用。
+    std::atomic<uint32_t>                      video_remote_ssrc{0};
+    // 上次 PLI 发送的 QPC ns,RFC 4585 §6.3.1 immediate feedback minimum interval
+    // 用于限频:连续 SEQ_GAP 风暴下不要每次都发 PLI(否则反向 DDoS 摄像头),
+    // 200 ms 是 dither_max 的实务下限,且 << GOP 周期(几秒),不会拖慢恢复。
+    std::atomic<int64_t>                       last_video_pli_ns{0};
+    static constexpr int64_t                   kPliMinIntervalNs = 200'000'000;  // 200 ms
 
     // Phase 2：RTP 视频 seq 跟踪 + 16-bit wrap-aware gap 检测。gap>0 时调
     // depack->mark_reference_lost + gate->mark_poisoned(SEQ_GAP)，让 §5.13 Frame
@@ -555,9 +563,31 @@ struct Controller::Impl {
                  height_hint);
     }
 
-    // 构造 RFC 4585 §3.1 兼容的复合包（RR + SDES + PLI）并下发到 transport。
-    // 仅 RTSP-TCP interleaved 路径会真的把 RTCP 送回摄像头；UDP / WHEP transport 当前
-    // send_rtcp 返回 MC_ERR_UNSUPPORTED，调用方静默丢弃。
+    // 限频包装:RFC 4585 §6.3.1 immediate feedback mode 下保持 minimum interval,
+    // 否则 SEQ_GAP 风暴(每帧丢一包)会触发每帧一个 PLI → server 反向被打爆。
+    // reason 仅用于 trace 日志区分首帧 vs SEQ_GAP vs 其他来源。controller 当前 RTP
+    // 处理单线程,这里 atomic load+store 不做 CAS — 即使未来扩展多线程同时通过限频
+    // 多发一两次 PLI 也不致命(server 端 PLI 幂等,只会刷一次 IDR)。
+    void try_send_video_pli(uint32_t media_ssrc, const char* reason) noexcept {
+        const int64_t now_ns  = pal::Clock::qpc_now_ns();
+        const int64_t prev_ns = last_video_pli_ns.load(std::memory_order_acquire);
+        if (prev_ns != 0 && (now_ns - prev_ns) < kPliMinIntervalNs) {
+            return;
+        }
+        last_video_pli_ns.store(now_ns, std::memory_order_release);
+        send_video_pli(media_ssrc);
+        if (reason) {
+            MCP_LOGF(pal::LogLevel::trace,
+                     "Controller: PLI fired reason=%s media_ssrc=0x%08X "
+                     "(min_interval=%lld ms)",
+                     reason, media_ssrc,
+                     static_cast<long long>(kPliMinIntervalNs / 1'000'000));
+        }
+    }
+
+    // 构造 RFC 4585 §3.1 兼容的复合包(RR + SDES + PLI)并下发到 transport。
+    // 仅 RTSP-TCP interleaved + RTSP-UDP(SETUP 后 prime peer_rtcp_addr 路径)会真的把
+    // RTCP 送回摄像头;WHEP transport 当前 send_rtcp 返回 MC_ERR_UNSUPPORTED,调用方静默丢弃。
     void send_video_pli(uint32_t media_ssrc) noexcept {
         if (!transport) return;
         std::array<uint8_t, 64> buf{};
@@ -1158,15 +1188,19 @@ struct Controller::Impl {
         if (dg.kind == transport::MediaKind::video) {
             // 视频时钟固定 90 kHz：us = ts * 1e6 / 90000 = ts * 100 / 9
             const int64_t pts_us = static_cast<int64_t>(ts) * 100 / 9;
-            // 首个视频 RTP 触发 PLI：摄像头收到立即下发 IDR，缩短首帧延时。
-            // 多数低延时摄像头 GOP 几秒，进流时若位于 GOP 中段，无 PLI 时要等下一个
-            // 周期性 IDR；PLI 把这段空窗压到一帧 RTT 之内（RFC 4585 §6.3.1）。
-            if (!pli_sent.test_and_set(std::memory_order_acq_rel)) {
-                const uint32_t media_ssrc = (static_cast<uint32_t>(p[8])  << 24) |
-                                              (static_cast<uint32_t>(p[9])  << 16) |
-                                              (static_cast<uint32_t>(p[10]) <<  8) |
-                                               static_cast<uint32_t>(p[11]);
-                send_video_pli(media_ssrc);
+            // 首个视频 RTP:学到 remote SSRC 并触发首次 PLI。
+            // 摄像头收 PLI 立即下发 IDR,缩短首帧延时。多数低延时摄像头 GOP 几秒,
+            // 进流时若位于 GOP 中段,无 PLI 时要等下一个周期性 IDR;PLI 把这段空窗
+            // 压到一帧 RTT 之内(RFC 4585 §6.3.1)。
+            // SSRC 同步保存到 video_remote_ssrc 供 SEQ_GAP 路径复用 PLI(参考链断时
+            // 立即重请求 IDR,而不是等下次 GOP)。
+            const uint32_t media_ssrc = (static_cast<uint32_t>(p[8])  << 24) |
+                                          (static_cast<uint32_t>(p[9])  << 16) |
+                                          (static_cast<uint32_t>(p[10]) <<  8) |
+                                           static_cast<uint32_t>(p[11]);
+            video_remote_ssrc.store(media_ssrc, std::memory_order_release);
+            if (!first_pli_sent.test_and_set(std::memory_order_acq_rel)) {
+                try_send_video_pli(media_ssrc, "first_rtp");
             }
             // Phase 2：RTP seq gap 检测（性能量度规范 §4.2 SEQ_GAP 触发源）。
             // RTP header 第 2-3 字节是 16-bit sequence number（big endian）。
@@ -1179,7 +1213,7 @@ struct Controller::Impl {
                 const uint16_t expected = static_cast<uint16_t>(video_seq_last + 1);
                 const int16_t  diff     = static_cast<int16_t>(rtp_seq - expected);
                 if (diff > 0) {
-                    // gap > 0：丢了 diff 个包；标参考链断裂 + 上报 metric。
+                    // gap > 0:丢了 diff 个包;标参考链断裂 + 上报 metric。
                     pal::metric::Registry::instance()
                         .counter("mc.tput.rtp_loss_count").inc(static_cast<uint64_t>(diff));
                     // 诊断 env MCP_DISABLE_SEQGAP_POISON=1:跳过 mark_poisoned 让所有
@@ -1193,6 +1227,15 @@ struct Controller::Impl {
                         if (gate) gate->mark_poisoned(MC_GATE_POISON_SEQ_GAP);
                         if (depack_h264) depack_h264->mark_reference_lost();
                         if (depack_h265) depack_h265->mark_reference_lost();
+                        // RFC 4585 §6.3.1 PLI: SEQ_GAP 后参考链已断,gate poisoned 仅
+                        // anchor 帧能解。摄像头 GOP 几秒长,不主动请求 IDR 期间所有非
+                        // anchor 帧都被 gate drop → 黑屏 N 秒。这里立即发 PLI 让
+                        // server 紧急下 IDR,把恢复时间从一个 GOP 周期压到 RTT。
+                        // 限频在 try_send_video_pli 内部(200 ms),防丢包风暴下 PLI 风暴。
+                        const uint32_t ssrc = video_remote_ssrc.load(std::memory_order_acquire);
+                        if (ssrc != 0) {
+                            try_send_video_pli(ssrc, "seq_gap");
+                        }
                     }
                     MCP_LOGF(pal::LogLevel::warn,
                              "Controller: RTP video seq gap = %d (expected=%u got=%u)%s",
@@ -1262,7 +1305,9 @@ struct Controller::Impl {
             std::uniform_int_distribution<uint32_t> dis(1, 0xFFFFFFFFu);
             local_sender_ssrc = dis(gen);
         }
-        pli_sent.clear(std::memory_order_release);
+        first_pli_sent.clear(std::memory_order_release);
+        video_remote_ssrc.store(0, std::memory_order_release);
+        last_video_pli_ns.store(0, std::memory_order_release);
 
         if (mc_status_t s = caps_probe.probe(); s != MC_OK) {
             emit_error(s, "DxgiCapsProbe failed");
