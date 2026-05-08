@@ -1349,18 +1349,29 @@ struct CodecDxvaVideo::Impl {
         dpb[cur_dpb_idx].poc  = cur_poc;
         dpb[cur_dpb_idx].output_pending = true;
 
-        // 拷贝 DPB slice → output pool slice（对 BIND_DECODER → BIND_SHADER_RESOURCE 跨 BindFlag 拷贝）。
-        // ArraySize=1 的 fallback pool，dst slice 必须是 0；DPB slice 仍然按 cur_dpb_idx。
+        // 拷贝 DPB slice → output pool slice(BIND_DECODER → BIND_SHADER_RESOURCE 跨 BindFlag)。
+        // ArraySize=1 fallback pool 时 dst slice 必须是 0;DPB slice 仍按 cur_dpb_idx。
+        //
+        // D3D11 NV12 multi-plane format:每 plane 是独立 subresource。subresource =
+        //   MipSlice + ArraySlice * MipLevels + PlaneSlice * MipLevels * ArraySize
+        // MipLevels=1 时 plane 0 (Y) of slice K = K;plane 1 (UV) = ArraySize + K。
+        // 单 call 只拷 plane 0,UV 永远 0/undefined → 紫色花屏(详见 H.264 emit 注释)。
         const UINT out_slice = out_pool_array_capable ? out_next : 0;
         if (out_pool_array_capable) {
             out_next = (out_next + 1) % out_pool_size;
         }
         ctx->CopySubresourceRegion(out_pool.Get(), out_slice, 0, 0, 0,
                                     dpb_tex.Get(), cur_dpb_idx, nullptr);
+        ctx->CopySubresourceRegion(out_pool.Get(),
+                                    out_slice + out_pool_size, 0, 0, 0,
+                                    dpb_tex.Get(),
+                                    cur_dpb_idx + dpb_size, nullptr);
         if (trace_first) {
             MCP_LOGF(pal::LogLevel::info,
-                     "CodecDxvaVideo: flush#%u CopySubresourceRegion done dpb=%u→pool=%u",
-                     pic_count, cur_dpb_idx, out_slice);
+                     "CodecDxvaVideo: flush#%u Copy Y+UV planes dpb=%u→pool=%u (Y sub=%u/%u UV sub=%u/%u)",
+                     pic_count, cur_dpb_idx, out_slice,
+                     cur_dpb_idx, out_slice,
+                     cur_dpb_idx + dpb_size, out_slice + out_pool_size);
         }
 
         // emit
@@ -2002,8 +2013,24 @@ struct CodecDxvaVideo::Impl {
         if (out_pool_array_capable) {
             out_next = (out_next + 1) % out_pool_size;
         }
+        // D3D11 NV12 multi-plane format 的 CopySubresourceRegion:每个 plane 是独立
+        // subresource(microsoft docs:"Each plane of a YUV format is treated as its
+        // own subresource for the purposes of this method")。subresource index =
+        //   MipSlice + ArraySlice * MipLevels + PlaneSlice * MipLevels * ArraySize
+        // MipLevels=1 时:plane 0 (Y) of slice K = K;plane 1 (UV) = ArraySize + K。
+        //
+        // 单 call CopySubresourceRegion(slice) 只拷 plane 0 (Y),plane 1 (UV) 在
+        // out_pool 内永远是初始化值(0/undefined)→ render NV12→RGB 在 BT.709 下:
+        //   R = 1.164*(Y-16) + 1.793*(V-128) → V=0 时 R = 1.164*(Y-16) - 229.5 (负溢)
+        //   B = 1.164*(Y-16) + 2.115*(U-128) → U=0 时 B = 1.164*(Y-16) - 270.7 (负溢)
+        // 经 saturate clamp 出大面积紫色 + 灰色错位渐变(2026-05-08 实测 root cause)。
+        // 必须显式拷 UV plane(subresource = slice + ArraySize),稳妥对齐 D3D11 spec。
         ctx->CopySubresourceRegion(out_pool.Get(), out_slice, 0, 0, 0,
                                     dpb_tex.Get(), cur_dpb_idx, nullptr);
+        ctx->CopySubresourceRegion(out_pool.Get(),
+                                    out_slice + out_pool_size, 0, 0, 0,
+                                    dpb_tex.Get(),
+                                    cur_dpb_idx + dpb_size, nullptr);
 
         // 把首帧 bitstream 同步落盘,可独立用 ffmpeg/ffplay 验证编码是否正确。
         if (pic_count == 1) {
