@@ -287,22 +287,35 @@ public:
                 sockaddr_storage signaling_peer{};
                 int              signaling_peer_len = 0;
                 if (signaling_.peer_address(signaling_peer, signaling_peer_len)) {
-                    std::memcpy(&mc.peer_rtcp_addr, &signaling_peer, sizeof(signaling_peer));
-                    mc.peer_rtcp_addr_len = signaling_peer_len;
-                    if (signaling_peer.ss_family == AF_INET) {
-                        reinterpret_cast<sockaddr_in*>(&mc.peer_rtcp_addr)->sin_port =
-                            ::htons(result.server_rtcp_port);
-                    } else if (signaling_peer.ss_family == AF_INET6) {
-                        reinterpret_cast<sockaddr_in6*>(&mc.peer_rtcp_addr)->sin6_port =
-                            ::htons(result.server_rtcp_port);
+                    // peer_rtcp_addr 是 sockaddr_in6 (28 bytes),signaling_peer 是
+                    // sockaddr_storage (128 bytes)。直接 memcpy(sizeof storage) 会写
+                    // 溢出 100 bytes 砸坏后续 channel 字段 → heap corruption →
+                    // CFG fail-fast (STATUS_BREAKPOINT)。Win11 IoT LTSC 实测 sockaddr_in
+                    // (IPv4) 16 bytes / sockaddr_in6 28 bytes 都 fit,clamp 到目标容量。
+                    const int copy_len = signaling_peer_len > 0
+                        ? std::min<int>(signaling_peer_len,
+                                          static_cast<int>(sizeof(mc.peer_rtcp_addr)))
+                        : 0;
+                    if (copy_len > 0) {
+                        std::memcpy(&mc.peer_rtcp_addr, &signaling_peer,
+                                    static_cast<size_t>(copy_len));
+                        mc.peer_rtcp_addr_len = copy_len;
+                        if (signaling_peer.ss_family == AF_INET) {
+                            reinterpret_cast<sockaddr_in*>(&mc.peer_rtcp_addr)->sin_port =
+                                ::htons(result.server_rtcp_port);
+                        } else if (signaling_peer.ss_family == AF_INET6) {
+                            reinterpret_cast<sockaddr_in6*>(&mc.peer_rtcp_addr)->sin6_port =
+                                ::htons(result.server_rtcp_port);
+                        }
+                        mc.peer_rtcp_set = true;
+                        MCP_LOGF(pal::LogLevel::info,
+                                 "TsRtspUdp: %s RTCP peer primed via SETUP server_port=%u "
+                                 "(family=%d copy_len=%d) — first PLI 可立刻发",
+                                 m.kind == SdpMedia::Kind::video ? "video" : "audio",
+                                 static_cast<unsigned>(result.server_rtcp_port),
+                                 static_cast<int>(signaling_peer.ss_family),
+                                 copy_len);
                     }
-                    mc.peer_rtcp_set = true;
-                    MCP_LOGF(pal::LogLevel::info,
-                             "TsRtspUdp: %s RTCP peer primed via SETUP server_port=%u "
-                             "(family=%d) — first PLI 可立刻发,无需等 server SR",
-                             m.kind == SdpMedia::Kind::video ? "video" : "audio",
-                             static_cast<unsigned>(result.server_rtcp_port),
-                             static_cast<int>(signaling_peer.ss_family));
                 }
             }
 
