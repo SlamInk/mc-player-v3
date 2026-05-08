@@ -326,73 +326,44 @@ struct RenderD3d11::Impl {
             y_srv  = slot.y;
             uv_srv = slot.uv;
         } else {
-            // D3D11 NV12 SRV 显式 PlaneSlice (D3D11.3+ ID3D11Device3 + SRV_DESC1) —
-            // Intel UHD driver 上,旧 SRV_DESC + R8G8_UNORM 隐式 plane=1 行为 buggy:
-            // SRV sample UV 总返 0 → BT.709 (Y=16,U=0,V=0) 转 RGB 出 (R=0, G≈95, B=0)
-            // 深绿屏(用户截图根因)。SRV_DESC1.Texture2D.PlaneSlice=1 显式选 UV plane,
-            // 与 R8G8_UNORM format 配合,driver 一致映射到 UV。
-            ComPtr<ID3D11Device3> dev3;
-            if (SUCCEEDED(cfg.device.As(&dev3))) {
-                D3D11_SHADER_RESOURCE_VIEW_DESC1 y1{};
-                y1.Format         = DXGI_FORMAT_R8_UNORM;
-                if (is_array) {
-                    y1.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-                    y1.Texture2DArray.MostDetailedMip = 0;
-                    y1.Texture2DArray.MipLevels       = 1;
-                    y1.Texture2DArray.FirstArraySlice = slice;
-                    y1.Texture2DArray.ArraySize       = 1;
-                    y1.Texture2DArray.PlaneSlice      = 0;
-                } else {
-                    y1.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                    y1.Texture2D.MostDetailedMip = 0;
-                    y1.Texture2D.MipLevels       = 1;
-                    y1.Texture2D.PlaneSlice      = 0;
-                }
-                ComPtr<ID3D11ShaderResourceView1> y1_srv;
-                HRESULT hy = dev3->CreateShaderResourceView1(tex_ptr, &y1, &y1_srv);
-                if (FAILED(hy)) {
-                    MCP_LOGF(pal::LogLevel::error,
-                             "RenderD3d11: SRV1 Y plane hr=0x%08lX (NV12 %ux%u arr=%u)",
-                             hy, tex_desc.Width, tex_desc.Height, tex_desc.ArraySize);
-                    return;
-                }
-                D3D11_SHADER_RESOURCE_VIEW_DESC1 uv1 = y1;
-                uv1.Format = DXGI_FORMAT_R8G8_UNORM;
-                if (is_array) uv1.Texture2DArray.PlaneSlice = 1;
-                else          uv1.Texture2D.PlaneSlice      = 1;
-                ComPtr<ID3D11ShaderResourceView1> uv1_srv;
-                HRESULT hu = dev3->CreateShaderResourceView1(tex_ptr, &uv1, &uv1_srv);
-                if (FAILED(hu)) {
-                    MCP_LOGF(pal::LogLevel::error,
-                             "RenderD3d11: SRV1 UV plane hr=0x%08lX", hu);
-                    return;
-                }
-                // SRV1 自然向下 cast 到 SRV (it's derived).
-                hy = y1_srv.As(&y_srv);
-                hu = uv1_srv.As(&uv_srv);
-                static std::atomic<bool> logged{false};
-                if (!logged.exchange(true, std::memory_order_relaxed)) {
-                    MCP_LOG_INFO("RenderD3d11: NV12 SRV with explicit PlaneSlice (D3D11.3 SRV1)");
-                }
+            // VLC d3d11_fmt.cpp::D3D11_AllocateResourceView 标准路径:用旧版
+            // CreateShaderResourceView,按 SRV.Format (R8_UNORM / R8G8_UNORM) 让 D3D11
+            // runtime 自动映射到 NV12 的 plane 0 / plane 1。不用 SRV1.PlaneSlice —
+            // Intel UHD 730 + Win11 IoT LTSC driver 对 NV12 array texture + SRV1
+            // PlaneSlice=1 处理 buggy:实测 PlaneSlice=1 取到的是 plane 0 (Y) 数据,
+            // shader 当 UV 用 → r/g/b 都基于 Y 算,大面积紫色 + 灰色错位渐变(2026-05-08
+            // root cause)。VLC 实测 UHD 730 + Win11 上工作 — 这条 driver path 稳定。
+            D3D11_SHADER_RESOURCE_VIEW_DESC y_desc{};
+            y_desc.Format = DXGI_FORMAT_R8_UNORM;
+            if (is_array) {
+                y_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
+                y_desc.Texture2DArray.MostDetailedMip = 0;
+                y_desc.Texture2DArray.MipLevels       = 1;
+                y_desc.Texture2DArray.FirstArraySlice = slice;
+                y_desc.Texture2DArray.ArraySize       = 1;
             } else {
-                // D3D11.3 不可用 — 回退旧路径(Intel UHD 上可能深绿)。
-                D3D11_SHADER_RESOURCE_VIEW_DESC y_desc{};
-                y_desc.Format         = DXGI_FORMAT_R8_UNORM;
-                if (is_array) {
-                    y_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-                    y_desc.Texture2DArray.MostDetailedMip = 0;
-                    y_desc.Texture2DArray.MipLevels       = 1;
-                    y_desc.Texture2DArray.FirstArraySlice = slice;
-                    y_desc.Texture2DArray.ArraySize       = 1;
-                } else {
-                    y_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                    y_desc.Texture2D.MostDetailedMip = 0;
-                    y_desc.Texture2D.MipLevels       = 1;
-                }
-                if (FAILED(cfg.device->CreateShaderResourceView(tex_ptr, &y_desc, &y_srv))) return;
-                D3D11_SHADER_RESOURCE_VIEW_DESC uv_desc = y_desc;
-                uv_desc.Format = DXGI_FORMAT_R8G8_UNORM;
-                if (FAILED(cfg.device->CreateShaderResourceView(tex_ptr, &uv_desc, &uv_srv))) return;
+                y_desc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+                y_desc.Texture2D.MostDetailedMip = 0;
+                y_desc.Texture2D.MipLevels       = 1;
+            }
+            HRESULT hy = cfg.device->CreateShaderResourceView(tex_ptr, &y_desc, &y_srv);
+            if (FAILED(hy)) {
+                MCP_LOGF(pal::LogLevel::error,
+                         "RenderD3d11: NV12 Y SRV hr=0x%08lX (%ux%u arr=%u slice=%u)",
+                         hy, tex_desc.Width, tex_desc.Height, tex_desc.ArraySize, slice);
+                return;
+            }
+            D3D11_SHADER_RESOURCE_VIEW_DESC uv_desc = y_desc;
+            uv_desc.Format = DXGI_FORMAT_R8G8_UNORM;
+            HRESULT hu = cfg.device->CreateShaderResourceView(tex_ptr, &uv_desc, &uv_srv);
+            if (FAILED(hu)) {
+                MCP_LOGF(pal::LogLevel::error,
+                         "RenderD3d11: NV12 UV SRV hr=0x%08lX (slice=%u)", hu, slice);
+                return;
+            }
+            static std::atomic<bool> logged{false};
+            if (!logged.exchange(true, std::memory_order_relaxed)) {
+                MCP_LOG_INFO("RenderD3d11: NV12 SRV via Format (R8/R8G8,VLC-style,driver auto plane)");
             }
             slot.tex   = tex_ptr;
             slot.slice = slice;
