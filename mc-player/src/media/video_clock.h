@@ -147,14 +147,10 @@ public:
     static constexpr double  kCoeffThreshold  = 0.2;       // VLC COEFF_THRESHOLD
     static constexpr int64_t kDiscontinuityUs = 200'000;   // 30fps 33-67ms,3x 余量
     /// Client buffer:deadline_present = master.convert_to_system(pts) + 此值。
-    /// 实测约束(LAN rtsp 30fps):
-    ///   - decode_delay (RTP arrival → frame popped from render queue) ≈ 35-45ms;
-    ///   - T5 处理时间 = wait + present,present ≈ 5ms;
-    ///   - 必须 T5 < codec push interval (33ms) 否则 backlog 累积:
-    ///     wait + 5 < 33 → wait < 28 → render_target < decode + 28 = 60-70ms。
-    /// 取 60ms:wait 平均 ~20ms,T5 ~25ms < codec 33ms,backlog 自然 drain。
-    /// 客户端总延迟 ≈ jitter 30 + decode 40 + render_target 60 = 130ms 仍可接受。
-    static constexpr int64_t kRenderTargetLatencyNs = 60'000'000LL;     // 60ms
+    /// 100ms 覆盖 IDR 解码 100ms 期 codec emit starve;不需要更大,因为 source PTS 严格,
+    /// T5 严格按 source PTS 推进,稳态 backlog ≈ buffer / frame_period = 3 frame。
+    /// 客户端总延迟 ≈ jitter 30 + 100 = ~130ms。
+    static constexpr int64_t kRenderTargetLatencyNs = 100'000'000LL;     // 100ms
 
 private:
     mutable std::mutex      mu_;

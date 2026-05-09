@@ -179,16 +179,15 @@ int64_t VideoClock::convert_to_system(int64_t pts_us,
         // anchor,后续 PTS-paced 接管。
         return now_qpc_fallback;
     }
-    // Phase 2 改用 last_present anchor(而非 first anchor)+ source PTS delta 推进:
-    //   deadline_arrival = last_qpc + (pts - last_pts) * 1000 ns/us
-    // 关键:anchor 用 last_present_qpc 而非 first_arrival_qpc。原因:
-    //   first_arrival 是 RTP IDR 时刻,但 first frame 到 T5 处理已经 50+ms 后,
-    //   所有后续 expected 远在 wall_now 未来 → wait 巨大 → backlog 永久。
-    //   用 last_present_qpc 让 anchor 跟 T5 实际进度,deadline 与 actual 同步。
-    //   每帧 master_update 时 advance last_qpc = arrival_qpc,
-    //   convert_to_system 算 last_qpc + (pts - last_pts)*1000 = 最近一帧 + 单帧间距。
-    const int64_t stream_offset_ns = (pts_us - ctx_.last_pts_us) * 1000;
-    return ctx_.last_qpc_ns + stream_offset_ns;
+    // 永久 first anchor:expected_arrival_N = start_qpc + (pts_N - start_pts) * 1000ns/us。
+    //   - GOP burst 时 codec emit 多帧但每帧 expected 仍按 source PTS 严格 33.33ms 推进,
+    //     T5 wait 到各自 deadline 才 present → 输出严格匹配 source 节奏;
+    //   - 不用 last_present anchor:last 在 GOP burst 时被 codec emit 时刻干扰漂移;
+    //   - 不用 EMA coeff:codec emit 是 burst pattern,instant_coeff 跳变让 EMA 不收敛。
+    //   - 接受 source/wall clock 频率差累积(典型 < 100ppm,30 秒 < 3ms 无感);
+    //     长期累积超 200ms 由 discontinuity 路径重 anchor。
+    const int64_t stream_offset_ns = (pts_us - ctx_.start_pts_us) * 1000;
+    return ctx_.start_qpc_ns + stream_offset_ns;
 }
 
 bool VideoClock::wait_until(int64_t deadline_qpc_ns) noexcept {

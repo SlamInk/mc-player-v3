@@ -97,14 +97,14 @@ struct RenderD3d11::Impl {
     //
     // last_good / has_last_good 仅 T5 写入与读取，无需锁。
     // 投递队列 pending_queue 由 codec 线程写、T5 读;codec 在 GOP 边界 reorder buffer
-    // drain 时会 burst emit 多帧(典型 IBBBP 跨 GOP:单次 push 触发 emit P_old + emit
-    // IDR_new 两帧),旧版单 slot drop-old 会丢失 P_old → 「跳跃」感。
+    // drain 时会 burst emit 多帧(典型 IBBBP 跨 GOP:IDR 解码 100ms 后 burst emit
+    // 多个被 reorder 缓存的 P/B 帧),队列必须容纳 burst 否则 drop_oldest 破坏 PTS 序列
+    // 让 deadline 计算误差,反而引入跳动。
     //
-    // 改为容量 8 的 FIFO 小 queue:
-    //   - codec 端 push_back 入队;若满则 drop_oldest(最 stale 的 PTS)。
-    //   - T5 端 pop_front 按 PTS 顺序消费(reorder 已保证 emit 端 PTS 单调)。
-    // 容量 8 = ~270ms @30fps,覆盖 GOP 边界 burst(典型 1-3 帧)+ short-burst 网络重传。
-    // 对齐 VLC vout queue 风格但不做 PTS-vs-master_clock 调度(下个 plan)。
+    // T5 端 pop_front 按 PTS 顺序消费(reorder 已保证 emit 端 PTS 单调),按 source PTS
+    // 计算 deadline,wait_until 节流 backlog ≈ buffer / frame_period(稳态 ≈ 3 帧)。
+    // 大 cap 仅吸收 startup burst,不影响稳态 backlog 大小(由 PTS-paced wait 决定)。
+    // 对齐 VLC vout queue + clock_Wait 风格 — source PTS 是唯一节奏来源。
     VideoFrame                              last_good;
     bool                                    has_last_good = false;
     std::atomic<int64_t>                    frame_period_ns{0};   // 0 = 未知（watchdog 走 fallback）
@@ -159,10 +159,11 @@ struct RenderD3d11::Impl {
     std::thread                             render_thread;
     std::atomic<bool>                       render_stop{false};
     pal::HandleGuard                        wake_event;             // auto-reset
-    // Phase 4 vsync interval=2 模式:Present 内部 block 直到 N vsync,T5 处理速度
-    // 严格锁定 GPU vsync。queue cap=8 限制 backlog,startup burst > 8 帧的丢帧用
-    // drop_oldest 容忍(对画面无感,因 burst 帧时间几乎相同)。
-    static constexpr std::size_t            kPendingQueueCap = 8;
+    // Buffer 300ms @ 30fps ≈ 9 frames steady;cap=64 容纳 startup burst,backlog skip
+    // 强制收敛到 buffer 大小防 e2e 累积。
+    // 大 cap 容纳 startup burst 不丢帧 — frame 序列连续是 PTS-based deadline 正确性前提。
+    // 稳态 backlog 受 PTS-paced wait 严格锁 = buffer / frame_period ≈ 3 frame,不依赖 cap。
+    static constexpr std::size_t            kPendingQueueCap = 64;
     std::mutex                              pending_mu;
     std::deque<VideoFrame>                  pending_queue;
     std::atomic<uint64_t>                   pending_drops{0};       // 队列满时 drop_oldest 计数
@@ -485,15 +486,12 @@ struct RenderD3d11::Impl {
         // 把"管线占满到 vsync"的额外帧时延吃掉（DXGI 推荐路径）。
         const bool tearing =
             (swap_chain->active_present_mode() == MC_PRESENT_MODE_TEARING);
-        // Phase 4 frame doubling:动态计算 sync_interval 让 GPU 严格锁 N 个 vsync 周期。
-        //   30fps source / 60Hz display → SyncInterval=2 = 33.33ms/frame 严格匹配 source;
-        //   60fps source / 60Hz display → SyncInterval=1;
-        //   嗅探未稳定(头 < 8 帧)用 SyncInterval=0 立即 present(allow_tearing 兜底)。
-        // 与 wait_until/PTS-paced 互斥:GPU 锁帧主导节奏,不再应用层 sleep。
-        const int64_t vsync_period = frame_period_ns.load(std::memory_order_acquire);
-        const uint32_t sync_interval = sync_est.compute_sync_interval(vsync_period);
+        // Phase 5:SyncInterval=0(立即 Present + tearing 兜底)避免与应用层 wait_until 双重等待。
+        // 节奏由 video_clock.wait_until(deadline) 在应用层精确控制,GPU 不锁帧。
+        // 对齐 VLC D3D11 模块 SyncInterval=0 行为(Explore 已确认)。
+        (void)sync_est;     // 仍嗅探 source frame_period 供后续(audio master / stats)用
         const int64_t now_ns = pal::Clock::now_ns();
-        if (swap_chain->present(sync_interval, tearing && sync_interval == 0) != MC_OK) {
+        if (swap_chain->present(0, tearing) != MC_OK) {
             return;
         }
         presents.fetch_add(1, std::memory_order_relaxed);
@@ -727,33 +725,43 @@ void RenderD3d11::Impl::render_thread_loop() noexcept {
         }
 
         if (got_frame) {
-            // Phase 4 主路径 — vsync interval=2 frame doubling(GPU 锁帧):
-            //   1. sync_est.observe(pts) 嗅探 source frame_period(EMA last 16 帧);
-            //   2. master_update(arrival_qpc, pts) 维护 video_clock 状态供后续 audio
-            //      master 接入用,Phase 4 本身不读 video_clock(GPU 锁帧主导节奏);
-            //   3. render_locked(frame) 内部 swap_chain.present(sync_interval=2),
-            //      Present 内部 block 直到 N vsync,T5 处理速率严格 = display/N。
-            //   30fps source / 60Hz display → SyncInterval=2 = 33.33ms/frame 严格;
-            //   消除"短-短-长" 因 vsync drift 引起的跳动。
+            // Phase 5 纯 PTS-paced 调度(对齐 VLC `vlc_clock_Wait`):
+            //   - master_update 用 RTP arrival_qpc + source PTS 学 stream→system 转换;
+            //   - convert_to_system(pts) → 该帧 source 推流到达时刻(等价 RTP arrival);
+            //   - deadline_present = expected_arrival + kRenderTargetLatencyNs(100ms 客户端 buffer);
+            //   - 100ms buffer 覆盖 IDR 100ms decode starve + reorder + 网络 jitter,稳态 backlog
+            //     ≈ buffer / frame_period = 3 frame,不依赖 cap;cap=64 仅吸收 startup burst 不丢帧。
+            //   - 不调整 PTS,不依赖 frame count:source PTS 单调推进,T5 严格按 source 节奏 present;
+            //   - B 帧:codec reorder buffer 已保证 emit 顺序 = display order 单调,T5 直接消费即可。
+            //   - SyncInterval=0(立即 Present + tearing fallback)避免与 wait_until 双重等待。
             const int64_t now_qpc     = pal::Clock::now_ns();
             const int64_t arrival_qpc = (frame.arrival_qpc_ns > 0)
                                             ? frame.arrival_qpc_ns : now_qpc;
             sync_est.observe(frame.pts_us);
             video_clock.master_update(arrival_qpc, frame.pts_us, /*rate=*/1.0);
 
+            const int64_t expected_arrival =
+                video_clock.convert_to_system(frame.pts_us, now_qpc);
+            const int64_t deadline_present =
+                expected_arrival + VideoClock::kRenderTargetLatencyNs;
+
             const uint64_t pcnt = presents.load(std::memory_order_relaxed);
             if (pcnt < 6 || (pcnt + 1) % 60 == 0) {
-                const int64_t vsync_period = frame_period_ns.load(std::memory_order_acquire);
-                const uint32_t si = sync_est.compute_sync_interval(vsync_period);
                 MCP_LOGF(pal::LogLevel::info,
-                    "T5[stat] #%llu pts=%lld src_period=%lld vsync_period=%lld "
-                    "sync_interval=%u queue_after=%zu",
+                    "T5[stat] #%llu pts=%lld arrival=%lld now=%lld expected=%lld deadline=%lld "
+                    "wait=%lld queue_after=%zu",
                     static_cast<unsigned long long>(pcnt),
                     static_cast<long long>(frame.pts_us),
-                    static_cast<long long>(sync_est.source_period_avg_ns.load()),
-                    static_cast<long long>(vsync_period),
-                    si, remaining_after_pop);
+                    static_cast<long long>(arrival_qpc),
+                    static_cast<long long>(now_qpc),
+                    static_cast<long long>(expected_arrival),
+                    static_cast<long long>(deadline_present),
+                    static_cast<long long>(deadline_present - now_qpc),
+                    remaining_after_pop);
             }
+
+            (void)video_clock.wait_until(deadline_present);
+            if (render_stop.load(std::memory_order_acquire)) break;
 
             (void)epoch->begin_epoch();
             // last_good anchor-only 更新:仅 IDR 帧覆盖 last_good(防 partial-decode 污染

@@ -20,6 +20,7 @@
 
 #include "media/dxva_h264.h"
 #include "pal/cache_line.h"
+#include "pal/clock.h"
 #include "pal/error.h"
 #include "pal/log.h"
 #include "pal/spsc_queue.h"
@@ -859,6 +860,19 @@ struct CodecDxvaVideo::Impl {
     int64_t                                    h264_emit_last_pts_us = INT64_MIN;
     uint64_t                                   h264_emit_pts_violations = 0;
 
+    // PTS-paced emit 节流(对齐用户指令 "codec 端节流 emit"):
+    //   - 第一次 emit 锚定 (first_pts, first_qpc=now);
+    //   - 后续帧 expected_emit_qpc = first_qpc + (pts - first_pts)*1000;
+    //   - now < expected_emit_qpc → sleep_for 直到 expected;否则立即 emit(GOP starve 后追赶)。
+    // 效果:codec emit 节奏严格 = source PTS 节奏(30fps),startup IDR + reorder drain
+    // 的 burst 21 帧不会一次性涌入 T5,T5 backlog 自然收敛到 buffer/source_period。
+    // codec decode 线程 wait 期间 RTP/jitter 无影响(在 T2);delayed reorder 队列容量
+    // 足够吸收一个 GOP 的 backlog(典型 < 40 帧 @ reorder=2 + 双 GOP)。
+    int64_t                                    h264_emit_pace_first_pts_us = INT64_MIN;
+    int64_t                                    h264_emit_pace_first_qpc_ns = 0;
+    // PTS-paced emit 节流 stats:本帧 wait_ns(用 stats 暴露给 controller)。
+    int64_t                                    h264_emit_pace_last_wait_ns = 0;
+
     // 当前解码完帧的属性(供 push_to_delayed_h264 用)。
     // 这两值在 flush_pending_pic_h264 里设;之前 emit 内联在 flush_pending_pic_h264 末尾,
     // 用 cur_pts_us / cur_dpb_idx 等局部变量。reorder 后帧实际 emit 跨多次 flush,
@@ -1261,6 +1275,36 @@ struct CodecDxvaVideo::Impl {
                          h264_delayed.size(), h264_next_output_poc);
             }
             h264_emit_last_pts_us = cur_pts;
+
+            // PTS-paced emit 节流 — 让 codec emit 节奏严格 = source PTS 节奏。
+            // 第一次锚定 (first_pts, first_now),后续 expected_now = first_now + (pts-first_pts)*1us。
+            // now < expected → sleep 到 expected;now > expected → 立即 emit(GOP starve 后追赶)。
+            // 注意:cur_pts 单位 us,QPC ns,1us=1000ns。
+            {
+                const int64_t now_qpc = pal::Clock::now_ns();
+                if (h264_emit_pace_first_pts_us == INT64_MIN) {
+                    h264_emit_pace_first_pts_us = cur_pts;
+                    h264_emit_pace_first_qpc_ns = now_qpc;
+                    h264_emit_pace_last_wait_ns = 0;
+                } else {
+                    const int64_t pts_delta_ns =
+                        (cur_pts - h264_emit_pace_first_pts_us) * 1000LL;
+                    const int64_t expected_qpc =
+                        h264_emit_pace_first_qpc_ns + pts_delta_ns;
+                    const int64_t wait_ns = expected_qpc - now_qpc;
+                    h264_emit_pace_last_wait_ns = wait_ns;
+                    // 上限保护:wait > 5s 视为异常(PTS jump / 时基异常),不 wait 跳过节流。
+                    // 下限:wait <= 0 立即 emit(catch-up 路径)。
+                    if (wait_ns > 0 && wait_ns < 5'000'000'000LL) {
+                        std::this_thread::sleep_for(std::chrono::nanoseconds(wait_ns));
+                    } else if (wait_ns >= 5'000'000'000LL) {
+                        // 异常重锚:可能 source PTS 跨越大(seek / wrap),用当前 (pts, now) 重新锚。
+                        h264_emit_pace_first_pts_us = cur_pts;
+                        h264_emit_pace_first_qpc_ns = pal::Clock::now_ns();
+                        h264_emit_pace_last_wait_ns = 0;
+                    }
+                }
+            }
 
             if (cfg.emit) cfg.emit(std::move(d.frame));
             ++emit_count;
@@ -1701,6 +1745,10 @@ struct CodecDxvaVideo::Impl {
         // 重启后 RTP TS 可能已大幅推进,与 reset 前的 last 已无可比性)。
         h264_emit_last_pts_us    = INT64_MIN;
         h264_emit_pts_violations = 0;
+        // PTS-paced emit 节流锚点:reset 后下一次 emit 重新锚定。
+        h264_emit_pace_first_pts_us = INT64_MIN;
+        h264_emit_pace_first_qpc_ns = 0;
+        h264_emit_pace_last_wait_ns = 0;
     }
 
     // ─── H.264 路径 ───────────────────────────────────────────────
