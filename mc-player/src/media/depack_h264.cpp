@@ -375,12 +375,21 @@ void DepackH264::on_rtp(int64_t pts_us, bool marker, std::span<const uint8_t> pa
             fu_in_progress_     = true;
             fu_nal_header_byte_ = static_cast<uint8_t>((fu_ind & 0xE0) | in_t);
             fu_buffer_.push_back(fu_nal_header_byte_);
+            // 早期(start bit) 标识 IDR/SEI(recovery_point) — 之前只在 end bit 设置,
+            // 中段丢包导致 end 永不到时 saw_idr_in_au_ 一直 false → emit_au
+            // with_extradata=false → SPS/PPS 不前置 → codec 永远 init_decoder 不了
+            // (rtsp://192.168.1.171/live/11 实测 root cause #2,丢包率高的 IPC 链路必触发)。
+            // FU start bit 已含 in_t,IDR 标识在收到首个分片时即可决定。
+            // 对齐 VLC modules/access/rtp/h264.c::rtp_h264_decode FU-A 路径:VLC 的 SDP
+            // sprop xps 在 packetizer 第一个 NAL 前自动前置,不依赖 IDR 完整重组。
+            if (in_t == kNalTypeIdr) saw_idr_in_au_ = true;
         }
         if (fu_in_progress_) {
             fu_buffer_.insert(fu_buffer_.end(), payload.begin() + 2, payload.end());
             if (end) {
                 append_annexb(au_buffer_, std::span<const uint8_t>(fu_buffer_));
-                if (in_t == kNalTypeIdr) saw_idr_in_au_ = true;
+                // saw_idr_in_au_ 已在 start 时 set;此处保留 SPS/PPS/SEI 完整重组路径
+                // (这些 NAL 必须完整才能 parse,FU 重组完整才提交)。
                 if (in_t == kNalTypeSps) {
                     sps_.assign(fu_buffer_.begin(), fu_buffer_.end());
                     parse_sps_locked();
@@ -441,16 +450,29 @@ void DepackH264::emit_au(int64_t pts_us, bool with_extradata) noexcept {
 
 void DepackH264::mark_reference_lost() noexcept {
     refs_lost_ = true;
-    // RTP seq gap → 任何正在重组的 FU-A 都不可信(丢的可能是中间分片,继续 push
-    // 后续分片到 fu_buffer_ 会得损坏 NAL,driver 解码出 partial 真实数据 + zero-fill
-    // / 错位 → 花屏顶部一条带真实数据 + 下方 UV 错位渐变)。同样 au_buffer_ 累积
-    // 的前序 NAL 也不可信(IDR slice 跨多 RTP 时丢中间分片导致 IDR 不完整,driver
-    // 解出顶部宏块 + 后续 zero-fill,直接 emit 给 render → 花屏)。
+    // RTP seq gap → 仅中断当前正在重组的 FU-A(丢的可能是 FU 中间分片,继续 push
+    // 后续分片到 fu_buffer_ 会得损坏 NAL,driver 解出 partial 真实数据 + zero-fill
+    // → 花屏)。其余状态保留,对齐 VLC modules/access/rtp/h264.c — VLC 在 seq gap
+    // 不主动丢 au_buffer/saw_idr,只让 packetizer/decoder 自己拒不完整 slice。
+    //
+    // 历史误清(导致 root cause):
+    //   旧代码同时清 au_buffer_ + saw_idr_in_au_。RTSP IPC 流的 IDR AU 通常 30KB+
+    //   (~20 RTPs) 中段丢包概率极高,清 au_buffer 把已收到的 SPS/PPS NAL 全丢掉,
+    //   清 saw_idr_in_au_ 让 emit_au with_extradata=false → 该 AU 不前置 SPS/PPS,
+    //   下游 codec 永远拿不到 extradata 启动解码。每秒 5-10 个 gap=1 + IDR 期 5s
+    //   一个 → 形成无限循环(rtsp://192.168.1.171/live/11 实测)。VLC 在同一流不会
+    //   回退是因为它从 SDP sprop xps 直接前置不依赖带内 SPS 完整重组。
+    //
+    // 现行策略对齐 VLC:
+    //   1. 不清 au_buffer_ — 已完整收到的 NAL(SPS/PPS/SEI/前 N 个 slice)留下;
+    //      不完整 slice 由 codec 解码失败时被忽略,SPS/PPS 仍能被 parse_sps 看到。
+    //   2. 不清 saw_idr_in_au_ — 已识别的 IDR 状态保留,emit_au 仍以 with_extradata=
+    //      true 前置 SPS/PPS。
+    //   3. 仅清 fu_buffer_ + fu_in_progress_ — in-flight FU 必须丢(append 后续 RTP
+    //      会得损坏 NAL)。后续 RTP 见 FU start 重新开始,Single/STAP-A 直接进 au_buffer。
+    //   4. refs_lost_ 仍 set — 让 codec 标记后续 frame.refs_armed=false,gate poison 配合。
     fu_buffer_.clear();
     fu_in_progress_ = false;
-    au_buffer_.clear();
-    saw_idr_in_au_      = false;
-    saw_recovery_in_au_ = false;
 }
 
 void DepackH264::reset() noexcept {

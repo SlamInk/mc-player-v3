@@ -812,6 +812,58 @@ struct CodecDxvaVideo::Impl {
     // SliceHdr 让 driver 在 slice override 时按错误 ref count 解码 → B 帧花屏。
     h264::SliceHdr                             cur_h264_slice_hdr{};
 
+    // ─── H.264 输出 reorder 队列(对齐 FFmpeg h264_select_output_frame) ─────
+    // 背景:DXVA-direct 与 MFT 不同,driver 不内置 picture reorder buffer,解完即 emit
+    // 走 decode order(I,P,B,B,B...);但 RTP timestamp 是 display order PTS,renderer
+    // 按到达顺序 present 会出现 PTS 来回跳 → 视觉卡顿(B-frame 流测试 rtsp://.../11
+    // 实测 root cause)。本队列把 emit 推迟到能按 POC 升序输出。
+    //
+    // 算法(对齐 FFmpeg libavcodec/h264_slice.c:1294 h264_select_output_frame):
+    //   1. flush_pending_pic_h264 解完帧后 push 到 delayed,**不**直接 emit。
+    //   2. 扫描 delayed 找最小 POC 的 frame(遇 IDR 即 break,IDR 作为 GOP 边界,
+    //      旧 GOP 的 B 帧先于新 IDR 输出)。
+    //   3. 决策:
+    //      - out_of_order = (out_poc < next_output_poc_)  // POC 倒退即出 GOP 切换
+    //      - over_buffer  = (delayed.size() > reorder_size_)
+    //      - emit when (out_of_order || over_buffer);否则等下一帧。
+    //   4. 输出 IDR 时 next_output_poc_ 重置为 INT_MIN(POC sequence 跨 GOP 重置)。
+    //   5. flush()/EOS 时 drain 全部按 POC 升序吐。
+    //
+    // reorder_size_ 容量来源:
+    //   a) SPS bitstream_restriction_flag=1 时取 max_num_reorder_frames(权威值);
+    //   b) 否则保守取 min(num_ref_frames, 4) — VUI 缺失时 IPC 现网典型 4 ref(覆盖
+    //      多数 IBBBP / IBP 模式)。
+    //   c) 运行期检测 POC 反序时按需上调(对应 FFmpeg has_b_frames 自适应,
+    //      h264_slice.c:1328)。
+    //
+    // DPB 槽保护:delayed 中的 dpb_slot 必须不被 alloc_dpb_slot_h264 选作 victim
+    // (driver 写新帧会污染 future emit 的 NV12 数据 → 花屏)。is_in_delayed_h264
+    // 在 alloc 双遍 + 兜底分支均跳过。
+    struct H264DelayedFrame {
+        VideoFrame frame;
+        int32_t    poc      = 0;
+        UINT       dpb_slot = UINT_MAX;
+        bool       is_idr   = false;
+    };
+    std::vector<H264DelayedFrame>              h264_delayed;
+    int32_t                                    h264_next_output_poc = INT32_MIN;
+    uint32_t                                   h264_reorder_size    = 0;
+    bool                                       h264_reorder_warmed  = false;     // log once
+
+    // PTS 单调性观测(reorder buffer 正确性自检):每次 emit 比较 emit_last_pts_us
+    // 与当前 frame.pts_us;倒退即 warn 上报。理论上 reorder 输出按 POC 升序,而
+    // progressive frame_mbs_only=1 流中 POC 升序 ⇔ PTS 升序 ⇔ display 升序;
+    // 跨 GOP 时 RTP timestamp 是 wall-clock 连续(server-side capture instant),
+    // 不会回退。倒退即 trace 异常路径(server PLI 重置 RTP TS / 32-bit RTP TS
+    // wrap @ ~13h / 解码失败 frame 携带脏 PTS)。
+    int64_t                                    h264_emit_last_pts_us = INT64_MIN;
+    uint64_t                                   h264_emit_pts_violations = 0;
+
+    // 当前解码完帧的属性(供 push_to_delayed_h264 用)。
+    // 这两值在 flush_pending_pic_h264 里设;之前 emit 内联在 flush_pending_pic_h264 末尾,
+    // 用 cur_pts_us / cur_dpb_idx 等局部变量。reorder 后帧实际 emit 跨多次 flush,
+    // 必须用 frame 自带 PTS / dpb_slot,无需新加成员。
+
     // ─── T4-DXVA worker（ADD §3.3）─────────────────────────────────
     // 原版 submit 同步在 RX (T2) 线程跑 NAL 解析 + DPB 管理 + DXVA EndFrame，
     // 占用 TIME_CRITICAL + P-core 的 socket 线程几 ms，期间 socket 内核缓冲堆积。
@@ -1077,11 +1129,23 @@ struct CodecDxvaVideo::Impl {
     // num_ref_frames=4 时 ref_list 含最多 4 个 ref;若 victim 选中其中任意一个 → ref
     // texture 数据被新 P 帧解码覆盖 → 后续 P 帧用错误 ref 解码 → 视觉花屏 (彩色错位
     // 渐变 + 马赛克 macroblock,2026-05-08 root cause #2)。
+    //
+    // 同样必须跳过 h264_delayed 队列中所有 dpb_slot — 这些帧已解完但等 reorder 输出,
+    // driver 写新帧会污染未来 emit 的 NV12 → render 显示错位的图像。
+    bool is_in_h264_delayed(UINT idx) const noexcept {
+        for (const auto& d : h264_delayed) {
+            if (d.dpb_slot == idx) return true;
+        }
+        return false;
+    }
+
     UINT alloc_dpb_slot_h264() noexcept {
-        // 第一遍:找未占用、不在 recent_emit ring、且非 anchor 的 slot (优先 — 让
-        // driver 不会在 render 还在 sample 的 in-flight slot 上写新帧)。
+        // 第一遍:找未占用、不在 recent_emit ring、不在 delayed reorder 队列、
+        // 且非 anchor 的 slot (优先 — 让 driver 不会在 render 还在 sample 的
+        // in-flight slot 或 reorder 队列里待 emit 的 slot 上写新帧)。
         for (UINT i = 1; i < dpb_size; ++i) {
             if (i == reserved_anchor_slot) continue;
+            if (is_in_h264_delayed(i))    continue;
             if (!dpb[i].used && !is_recently_emitted(i)) return i;
         }
         UINT    victim  = UINT_MAX;
@@ -1097,19 +1161,21 @@ struct CodecDxvaVideo::Impl {
             if (in_ref_list) continue;
             // 跳过最近 N 个 emit 出去的 slot — render 仍在 sample。
             if (is_recently_emitted(i)) continue;
+            // 跳过 reorder 队列中等 emit 的 slot — driver 写覆盖未来 emit 的图像。
+            if (is_in_h264_delayed(i)) continue;
             if (dpb[i].poc < min_poc) { min_poc = dpb[i].poc; victim = i; }
         }
-        // 全部都是 ref 的退化情形:取 ref_list 最旧(尾部) 的 dpb_index 强制覆盖。
-        // 这种情形理论不该出现 (dpb_size >= 16 给 num_ref<=8 留足够余量),作防御。
-        // anchor 永远不被覆盖,即便 ref_list 满了也另选。
+        // 全部都是 ref / delayed 的退化情形:取 ref_list 最旧(尾部) 的 dpb_index 强制覆盖。
+        // 这种情形理论不该出现 (dpb_size >= 16 给 num_ref<=8 + reorder<=4 留足余量),
+        // 作防御。anchor 永远不被覆盖,即便 ref_list / delayed 满了也另选。
         if (victim == UINT_MAX) {
             if (!h264_ref_list.empty()) {
-                // 从 ref_list 尾找第一个非 anchor 的 ref。
+                // 从 ref_list 尾找第一个非 anchor 且非 delayed 的 ref。
                 for (auto it = h264_ref_list.rbegin(); it != h264_ref_list.rend(); ++it) {
-                    if (it->dpb_index != reserved_anchor_slot) {
-                        victim = it->dpb_index;
-                        break;
-                    }
+                    if (it->dpb_index == reserved_anchor_slot) continue;
+                    if (is_in_h264_delayed(it->dpb_index))    continue;
+                    victim = it->dpb_index;
+                    break;
                 }
             }
             if (victim == UINT_MAX) {
@@ -1118,6 +1184,102 @@ struct CodecDxvaVideo::Impl {
         }
         dpb[victim] = DpbEntry{};
         return victim;
+    }
+
+    // FFmpeg h264_select_output_frame(libavcodec/h264_slice.c:1294)风格的输出选择。
+    // 队列含 N 张已解码帧;按 POC 升序输出,直到 IDR 边界或队列容量达 reorder_size。
+    //
+    // drain_all=true 时强制清空队列(flush()/EOS):按 POC 升序逐张吐。
+    //
+    // IDR 在队列中作为 "barrier":扫描时遇 IDR 即 break(从 idx 1 起),保证旧 GOP 的
+    // 所有帧先于新 IDR 输出;IDR 自身在队列首位时正常 emit(out_of_order 路径)。
+    void select_and_emit_h264(bool drain_all) noexcept {
+        while (!h264_delayed.empty()) {
+            // 找最小 POC 的 frame,扫描在 IDR 边界(从 idx 1 起)中断。
+            std::size_t out_idx = 0;
+            int32_t     out_poc = h264_delayed[0].poc;
+            for (std::size_t i = 1; i < h264_delayed.size(); ++i) {
+                if (h264_delayed[i].is_idr) break;     // 旧 GOP 必须先输出
+                if (h264_delayed[i].poc < out_poc) {
+                    out_idx = i;
+                    out_poc = h264_delayed[i].poc;
+                }
+            }
+
+            const bool out_of_order = (out_poc < h264_next_output_poc);
+            const bool over_buffer  = h264_delayed.size() > h264_reorder_size;
+
+            // FFmpeg 决策:
+            //   out_of_order || over_buffer → emit out
+            //   else 等下次决策(更多帧入队后再判)
+            if (!drain_all && !out_of_order && !over_buffer) {
+                break;     // 等更多帧
+            }
+
+            // 弹出并 emit
+            H264DelayedFrame d = std::move(h264_delayed[out_idx]);
+            h264_delayed.erase(h264_delayed.begin() + static_cast<std::ptrdiff_t>(out_idx));
+
+            // 仅在按序输出时更新 next_output_poc;out_of_order 路径不更新(对齐 FFmpeg)。
+            // IDR emit 后 next_output_poc 单独重置为 INT_MIN(POC sequence 跨 GOP 重置)。
+            if (!out_of_order) {
+                h264_next_output_poc = d.poc;
+            }
+            if (d.is_idr) {
+                h264_next_output_poc = INT32_MIN;     // 新 GOP 起,POC 已重置回 0+
+            }
+
+            // PTS 单调性自检 — reorder 输出语义保证 progressive 流 PTS 严格升序,
+            // 倒退一定是流异常或代码 bug。计入 mc.decode 计数 + warn 第一次出现。
+            const int64_t cur_pts = d.frame.pts_us;
+            const bool pts_back   = (h264_emit_last_pts_us != INT64_MIN
+                                     && cur_pts < h264_emit_last_pts_us);
+            if (pts_back) {
+                ++h264_emit_pts_violations;
+                if (h264_emit_pts_violations <= 5 || (h264_emit_pts_violations & 63) == 0) {
+                    MCP_LOGF(pal::LogLevel::warn,
+                             "CodecDxvaVideo: H.264 emit PTS regression #%llu "
+                             "prev=%lld cur=%lld delta=%lld (poc=%d slot=%u idr=%d) "
+                             "— 流异常或 reorder bug,renderer 端会出现倒退跳点",
+                             static_cast<unsigned long long>(h264_emit_pts_violations),
+                             static_cast<long long>(h264_emit_last_pts_us),
+                             static_cast<long long>(cur_pts),
+                             static_cast<long long>(cur_pts - h264_emit_last_pts_us),
+                             d.poc, d.dpb_slot, d.is_idr ? 1 : 0);
+                }
+            }
+            // emit 节奏 trace:头 6 帧 + 每 60 帧打一行,验证 reorder buffer 输出 PTS 单调升序。
+            if (emit_count < 6 || (emit_count + 1) % 60 == 0) {
+                MCP_LOGF(pal::LogLevel::info,
+                         "CodecDxvaVideo: H.264 emit #%u pts=%lld delta=%lld poc=%d slot=%u "
+                         "idr=%d delayed_post=%zu next_out_poc=%d",
+                         emit_count + 1, static_cast<long long>(cur_pts),
+                         h264_emit_last_pts_us == INT64_MIN
+                             ? 0LL
+                             : static_cast<long long>(cur_pts - h264_emit_last_pts_us),
+                         d.poc, d.dpb_slot, d.is_idr ? 1 : 0,
+                         h264_delayed.size(), h264_next_output_poc);
+            }
+            h264_emit_last_pts_us = cur_pts;
+
+            if (cfg.emit) cfg.emit(std::move(d.frame));
+            ++emit_count;
+
+            // 标记此 slot 最近 emit (kRecentEmitN=4 帧内 alloc victim 跳过它,防止
+            // driver 写新帧覆盖 render 仍在 sample 的 slot → 花屏)。
+            note_emit_slot(d.dpb_slot);
+
+            // IDR emit 后 reserve dpb_slot 为长期锚点 — renderer last_good 持有
+            // (dpb_tex, slice=anchor) 引用,该 slot 必须永远稳定承载 IDR 数据,
+            // 直到下一 IDR 到来释放。
+            if (d.is_idr) {
+                reserved_anchor_slot = d.dpb_slot;
+                MCP_LOGF(pal::LogLevel::info,
+                         "CodecDxvaVideo: H.264 anchor reserved slot=%u (IDR poc=%d pts=%lld) "
+                         "— last_good 长期保护点,alloc_dpb_slot 永远跳过",
+                         d.dpb_slot, d.poc, static_cast<long long>(cur_pts));
+            }
+        }
     }
 
     UINT alloc_dpb_slot() noexcept {
@@ -1527,6 +1689,18 @@ struct CodecDxvaVideo::Impl {
         h264_ref_list.clear();
         cur_h264_sps      = nullptr;
         cur_h264_pps      = nullptr;
+
+        // reorder 队列:reset 路径丢弃所有未 emit 的 frame(device-lost / flush
+        // 等场景上层会 mark_poisoned gate,gate 等下一 IDR 才解 freeze;丢这些帧
+        // 不会引入额外问题)。next_output_poc 重置 INT_MIN 让新 GOP 首帧不被
+        // 误判 out_of_order。
+        h264_delayed.clear();
+        h264_next_output_poc = INT32_MIN;
+        h264_reorder_warmed  = false;
+        // PTS 单调性观测状态 — reset 后首次 emit 不与历史 PTS 比较(device-lost
+        // 重启后 RTP TS 可能已大幅推进,与 reset 前的 last 已无可比性)。
+        h264_emit_last_pts_us    = INT64_MIN;
+        h264_emit_pts_violations = 0;
     }
 
     // ─── H.264 路径 ───────────────────────────────────────────────
@@ -1705,11 +1879,25 @@ struct CodecDxvaVideo::Impl {
         }
         dpb.assign(dpb_size, DpbEntry{});
 
+        // reorder buffer 容量(对齐 FFmpeg has_b_frames):
+        //   bitstream_restriction_flag=1 → max_num_reorder_frames(权威值);
+        //   否则保守取 num_ref_frames(IPC 现网典型 2~4,VUI 缺失场景 IBP/IBBBP 都覆盖)。
+        // 上限 8(防御异常 SPS 报极大值,真实 H.264 4K@60 reorder 也不超 4)。
+        // reorder_size=0 表示无 B 帧,fast path 立即 emit(算法天然成立)。
+        if (s.bitstream_restriction_flag) {
+            h264_reorder_size = std::min<uint32_t>(s.max_num_reorder_frames, 8u);
+        } else {
+            h264_reorder_size = std::min<uint32_t>(s.num_ref_frames, 4u);
+        }
+
         decoder_inited = true;
         MCP_LOGF(pal::LogLevel::info,
                  "CodecDxvaVideo: H.264 decoder ready %ux%u dpb=%u (Annex-B raw=%u) "
+                 "reorder=%u(brfp=%u maxR=%u nref=%u) "
                  "cfg{minRT=%u 4Coef=%u DecoderSpec=0x%X NoSliceCount=%u SpatRsdInter=%u}",
                  dec_w, dec_h, dpb_size, cfg_bitstream_raw,
+                 h264_reorder_size, s.bitstream_restriction_flag,
+                 s.max_num_reorder_frames, s.num_ref_frames,
                  cfg_used.ConfigMinRenderTargetBuffCount,
                  cfg_used.Config4GroupedCoefs,
                  cfg_used.ConfigDecoderSpecific,
@@ -2160,7 +2348,7 @@ struct CodecDxvaVideo::Impl {
             }
         }
 
-        // emit — 零拷贝路径:dxva_texture 直接是 dpb_tex,array_slice 即 cur_dpb_idx。
+        // 构造 VideoFrame — 零拷贝路径:dxva_texture 直接是 dpb_tex,array_slice 即 cur_dpb_idx。
         VideoFrame f;
         f.pts_us           = cur_pts_us;
         f.arrival_qpc_ns   = cur_arrival_qpc_ns;
@@ -2185,35 +2373,31 @@ struct CodecDxvaVideo::Impl {
         uint32_t mask = kValidityParams | kValidityColor | kValidityReorder | kValidityFence;
         if (refs_armed) mask |= kValidityRefs | kValidityRecovery;
         f.validity_mask = mask;
-        if (emit_count == 0 || (emit_count + 1) % 30 == 0) {
+        if (!h264_reorder_warmed) {
             MCP_LOGF(pal::LogLevel::info,
-                     "CodecDxvaVideo: H.264 emit #%u pts=%lld slice=%u poc=%d fnum=%u "
-                     "validity_mask=0x%02X is_keyframe=%d refs_armed=%d",
-                     emit_count + 1, static_cast<long long>(cur_pts_us), cur_dpb_idx, cur_poc,
-                     cur_h264_frame_num, f.validity_mask, f.is_keyframe, refs_armed);
+                     "CodecDxvaVideo: H.264 reorder buffer active size=%u "
+                     "(对齐 FFmpeg h264_select_output_frame; B-frame 流按 POC 升序输出)",
+                     h264_reorder_size);
+            h264_reorder_warmed = true;
         }
-        // 释放 video session lock — emit → render 走 immediate ctx 自身的 ID3D10Multithread
-        // 保护,不需要 video_session_mu。
-        if (session_lock.owns_lock()) session_lock.unlock();
-        if (cfg.emit) cfg.emit(std::move(f));
-        ++emit_count;
-        // 标记此 slot 最近 emit (kRecentEmitN=4 帧内 alloc victim 跳过它,防止
-        // driver 写新帧覆盖 render 仍在 sample 的 slot → 花屏)。
-        note_emit_slot(cur_dpb_idx);
-        // IDR emit 后 reserve cur_dpb_idx 为长期锚点 — renderer last_good 持有
-        // (dpb_tex, slice=cur_dpb_idx) 引用,该 slot 必须永远稳定承载 IDR 数据,
-        // 直到下一 IDR 到来释放。alloc_dpb_slot_h264 检查 reserved_anchor_slot
-        // 永远跳过它(victim 选择第一/第二遍 + 兜底分支均跳过)。这与 VLC
-        // picture_pool refcount 同等效果,简化为单 anchor。
-        if (idr_now) {
-            reserved_anchor_slot = cur_dpb_idx;
+        if (pic_count <= 3 || pic_count % 60 == 0) {
             MCP_LOGF(pal::LogLevel::info,
-                     "CodecDxvaVideo: H.264 anchor reserved slot=%u (IDR poc=%d fnum=%u) "
-                     "— last_good 长期保护点,alloc_dpb_slot 永远跳过",
-                     cur_dpb_idx, cur_poc, cur_h264_frame_num);
+                     "CodecDxvaVideo: H.264 decoded #%u pts=%lld slice=%u poc=%d fnum=%u "
+                     "validity_mask=0x%02X is_keyframe=%d refs_armed=%d delayed_pre=%zu",
+                     pic_count, static_cast<long long>(cur_pts_us), cur_dpb_idx, cur_poc,
+                     cur_h264_frame_num, f.validity_mask, f.is_keyframe, refs_armed,
+                     h264_delayed.size());
         }
 
-        // 更新 ref list：当前为 reference frame (nal_ref_idc!=0) 才入栈，IDR 时清空整条链。
+        // 释放 video session lock — emit → render 走 immediate ctx 自身的 ID3D10Multithread
+        // 保护,不需要 video_session_mu。提前 unlock 让后续 select_and_emit_h264 emit
+        // 流程不串行化 video session(emit 路径 zero-copy 但仍走 controller→gate→render
+        // 多层调用,session lock 不必扛着)。
+        if (session_lock.owns_lock()) session_lock.unlock();
+
+        // 更新 ref list:当前为 reference frame (nal_ref_idc!=0) 才入栈,IDR 时清空整条链。
+        // 必须在 push delayed 之前,因为 ref list 由 decode 顺序决定(下一帧 decode 用),
+        // 与 output(display)顺序解耦。
         if (idr_now) h264_ref_list.clear();
         if (cur_h264_nal_ref_idc != 0) {
             h264::RefPic r{};
@@ -2227,6 +2411,18 @@ struct CodecDxvaVideo::Impl {
             const std::size_t cap = std::max<std::size_t>(cur_h264_sps->num_ref_frames, 1);
             while (h264_ref_list.size() > cap) h264_ref_list.pop_back();
         }
+
+        // 推入 reorder 队列,触发输出选择(可能 emit 0 或 1 帧)。
+        // emit 路径 (note_emit_slot / anchor reservation / cfg.emit) 现统一在
+        // select_and_emit_h264 内执行。
+        H264DelayedFrame d;
+        d.frame    = std::move(f);
+        d.poc      = cur_poc;
+        d.dpb_slot = cur_dpb_idx;
+        d.is_idr   = idr_now;
+        h264_delayed.push_back(std::move(d));
+
+        select_and_emit_h264(false /*drain_all*/);
 
         has_pic = false;
         bitstream_buf.clear();
@@ -2511,6 +2707,13 @@ void CodecDxvaVideo::flush() noexcept {
     if (impl_->has_pic) {
         if (impl_->is_h264) impl_->flush_pending_pic_h264();
         else                 impl_->flush_pending_pic();
+    }
+    // EOS / device-lost 等场景:把 reorder 队列里待 emit 的帧按 POC 升序全部输出,
+    // 让 render last_good 至少持有最近一个 IDR(否则 reset_dpb 会丢掉它们)。
+    // 注:device-lost 场景 controller 通常会先 mark_poisoned gate,这些 emit 进 gate
+    // 会被 freeze 拦下;但 IDR 仍解 freeze,链路稳健。
+    if (impl_->is_h264) {
+        impl_->select_and_emit_h264(true /*drain_all*/);
     }
     impl_->reset_dpb();
 }

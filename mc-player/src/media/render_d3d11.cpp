@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <deque>
 #include <mutex>
 #include <thread>
 
@@ -94,7 +95,15 @@ struct RenderD3d11::Impl {
     // T5 自驱 watchdog（无需 main 周期 tick）。
     //
     // last_good / has_last_good 仅 T5 写入与读取，无需锁。
-    // 投递槽 pending_frame 由 codec 线程写、T5 读，drop-old 语义 → 一把短锁。
+    // 投递队列 pending_queue 由 codec 线程写、T5 读;codec 在 GOP 边界 reorder buffer
+    // drain 时会 burst emit 多帧(典型 IBBBP 跨 GOP:单次 push 触发 emit P_old + emit
+    // IDR_new 两帧),旧版单 slot drop-old 会丢失 P_old → 「跳跃」感。
+    //
+    // 改为容量 8 的 FIFO 小 queue:
+    //   - codec 端 push_back 入队;若满则 drop_oldest(最 stale 的 PTS)。
+    //   - T5 端 pop_front 按 PTS 顺序消费(reorder 已保证 emit 端 PTS 单调)。
+    // 容量 8 = ~270ms @30fps,覆盖 GOP 边界 burst(典型 1-3 帧)+ short-burst 网络重传。
+    // 对齐 VLC vout queue 风格但不做 PTS-vs-master_clock 调度(下个 plan)。
     VideoFrame                              last_good;
     bool                                    has_last_good = false;
     std::atomic<int64_t>                    frame_period_ns{0};   // 0 = 未知（watchdog 走 fallback）
@@ -102,9 +111,10 @@ struct RenderD3d11::Impl {
     std::thread                             render_thread;
     std::atomic<bool>                       render_stop{false};
     pal::HandleGuard                        wake_event;             // auto-reset
+    static constexpr std::size_t            kPendingQueueCap = 8;
     std::mutex                              pending_mu;
-    VideoFrame                              pending_frame;
-    bool                                    has_pending = false;
+    std::deque<VideoFrame>                  pending_queue;
+    std::atomic<uint64_t>                   pending_drops{0};       // 队列满时 drop_oldest 计数
 
     ComPtr<ID3D11DeviceContext>             ctx;
     ComPtr<ID3D11RenderTargetView>          rtv;
@@ -562,18 +572,23 @@ void RenderD3d11::stop() noexcept {
     impl_->last_good = VideoFrame{};
     {
         std::scoped_lock lk{impl_->pending_mu};
-        impl_->has_pending = false;
-        impl_->pending_frame = VideoFrame{};
+        impl_->pending_queue.clear();
     }
 }
 
 void RenderD3d11::on_admitted(const VideoFrame& frame) noexcept {
-    // 投递最新帧（drop-old 语义）+ signal T5。不直接渲染：渲染由 T5 完成。
+    // 入 pending_queue + signal T5。不直接渲染:渲染由 T5 完成。
+    // codec reorder buffer drain 时会 burst emit 多帧;FIFO queue 保留全部直到 T5 消费。
+    // 队列满时 drop oldest(最旧的 PTS),以跟上 codec 节奏 — VLC vout 同等策略(es_out 满
+    // 时丢最老 block 让最新内容能上屏)。
     if (!impl_->wake_event.valid()) return;
     {
         std::scoped_lock lk{impl_->pending_mu};
-        impl_->pending_frame = frame;
-        impl_->has_pending   = true;
+        if (impl_->pending_queue.size() >= Impl::kPendingQueueCap) {
+            impl_->pending_queue.pop_front();
+            impl_->pending_drops.fetch_add(1, std::memory_order_relaxed);
+        }
+        impl_->pending_queue.push_back(frame);
     }
     ::SetEvent(impl_->wake_event.get());
 }
@@ -633,16 +648,27 @@ void RenderD3d11::Impl::render_thread_loop() noexcept {
         (void)wr;
         if (render_stop.load(std::memory_order_acquire)) break;
 
-        // 取最新帧（drop-old 语义）。锁仅短暂保护 pending 槽。
+        // 从 FIFO queue 取一帧渲染。codec reorder buffer 已保证入队 PTS 单调,T5 按
+        // FIFO 顺序消费即等于 display 顺序。每次 wake 仅出 1 帧:配合 wait_for_frame_latency
+        // 节奏在 vsync 边界 Present,避免 burst-render 多帧瞬间堆到一个 vsync 内。
+        // queue 还有剩余时不复位 wake_event(auto-reset),下次 SetEvent 会再唤醒;若
+        // queue 当前次没消费完(后续多帧累积),T5 在下一 timeout 周期(~16ms)继续 pop。
         VideoFrame frame;
         bool got_frame = false;
+        std::size_t remaining_after_pop = 0;
         {
             std::scoped_lock lk{pending_mu};
-            if (has_pending) {
-                frame = std::move(pending_frame);
-                has_pending = false;
+            if (!pending_queue.empty()) {
+                frame = std::move(pending_queue.front());
+                pending_queue.pop_front();
+                remaining_after_pop = pending_queue.size();
                 got_frame = true;
             }
+        }
+        // queue 还有剩余 → 立即重置 wake_event 让下个 wait 立刻返回
+        // (auto-reset event:WaitForSingleObject 已消费 signal,需手动 set 让下次 wait 不阻塞 timeout)
+        if (got_frame && remaining_after_pop > 0) {
+            ::SetEvent(wake_event.get());
         }
 
         if (got_frame) {

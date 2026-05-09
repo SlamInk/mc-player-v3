@@ -1,71 +1,84 @@
 /*
- * 视频自适应 Jitter Buffer — 二维 Kalman frame_delay_variation 估计（ADD §5.3.1）。
+ * 视频 RTP jitter buffer — 短延时 reorder + RTCP NACK 触发(对齐 VLC live555 行为)。
  *
- * 状态 x = [1/channel_rate, queuing_delay_offset]ᵀ
- * 观测 H = [delta_frame_bytes, 1]
- * 观测 z = observed_frame_delay_variation
- * Q = diag(2.5e-10, 1e-10)
- * R 自适应（突发 vs 稳态）
- * target_delay = max(jitter_estimate, min_target) + max_decode_time
+ * 设计目标:
+ *   - 把 RTP datagram 按 sequence number 升序、连续地输出给上层 depack;
+ *   - 乱序到达的包(network reorder)在 dwell window 内重排;
+ *   - 真丢失的包通过 RTCP Generic NACK(RFC 4585 §6.2.1)请求重传;
+ *   - 超过 dwell window 仍未到达的 seq 标记为永久丢失,跳过该 seq 让管道继续;
+ *   - 重复包(NACK 重传到达,seq 已 emit)静默丢弃。
  *
- * 入：RTP datagram；出：按帧重组（按 marker bit）+ NACK 列表（移交 NackModule）。
- * v1 骨架：接口完整，Kalman 估计与 NACK 调度待 Chromium 主线对齐填充。
+ * 不变量:
+ *   - emit 顺序严格按 seq 升序、连续(中间空位会等到 dwell 超时才跳过);
+ *   - 32-bit extended seq 处理 RTP 16-bit wrap(每 13.6 小时 @ 90kHz 一次);
+ *   - 单线程 on_rtp(由 T2 RX 调用);stats 暴露原子读取给控制台 1Hz tick。
+ *
+ * 不实装(留给后续阶段):
+ *   - Kalman frame_delay_variation 估计(ADD §5.3.1);当前 fixed dwell。
+ *   - target_delay 自适应;当前固定 30 ms(IPC LAN 实测覆盖 95%+ jitter)。
  */
 
 #ifndef MC_PLAYER_MEDIA_JITTER_BUFFER_VIDEO_H_
 #define MC_PLAYER_MEDIA_JITTER_BUFFER_VIDEO_H_
 
+#include <atomic>
 #include <cstdint>
 #include <functional>
-#include <span>
+#include <memory>
 
 #include "transport/transport_session.h"
 
 namespace mcp::media {
 
-struct JitterFrame {
-    int64_t              pts_us         = 0;
-    std::vector<uint8_t> rtp_payload;
-    bool                 marker         = false;
-    uint16_t             rtp_seq        = 0;
-    bool                 has_seq_gap    = false;     // 进入此帧时检测到 gap
-};
-
 class JitterBufferVideo {
 public:
-    using EmitFn   = std::function<void(JitterFrame&&)>;
-    using NackFn   = std::function<void(uint16_t pid, uint16_t blp)>;
+    /// emit datagram 给 depack(按 seq 升序、可能跳过永久丢失的 seq)。
+    using EmitFn = std::function<void(const transport::RtpDatagram&)>;
 
-    JitterBufferVideo(EmitFn emit, NackFn nack) noexcept;
+    /// 触发 RTCP Generic NACK(RFC 4585 §6.2.1):pid + blp 16-bit bitmap。
+    /// pid = 首个 lost seq;blp 表示后续 16 个 seq 哪些也 lost(bit i = pid+1+i)。
+    using NackFn = std::function<void(uint16_t pid, uint16_t blp)>;
 
-    /// 配置上下界。0 = 用库默认。
-    void configure(uint32_t min_target_delay_ms, uint32_t max_target_delay_ms) noexcept;
+    /// 真丢失上报 — dwell 超时后该 seq 仍没到,通知 controller 让 gate poison。
+    /// expired_seq 是最旧的被跳过的 seq;如果连续多个跳过,逐个上报。
+    using LossFn = std::function<void(uint16_t expired_seq, uint32_t count)>;
 
+    JitterBufferVideo(EmitFn emit, NackFn nack, LossFn loss) noexcept;
+    ~JitterBufferVideo() noexcept;
+
+    JitterBufferVideo(const JitterBufferVideo&)            = delete;
+    JitterBufferVideo& operator=(const JitterBufferVideo&) = delete;
+
+    /// dwell:单包最大滞留时间(超此时间未到的 seq 跳过 emit),典型 30ms。
+    /// nack_min_interval:同一 pid 重发 NACK 的最小间隔(限频),典型 50ms。
+    /// 0 = 用内置默认。
+    void configure(int64_t dwell_us, int64_t nack_min_interval_us) noexcept;
+
+    /// 输入 RTP datagram(由 T2 RX 单线程调用)。
     void on_rtp(const transport::RtpDatagram& dg) noexcept;
+
+    /// 周期 tick(典型 1Hz / 60Hz),触发 dwell 超时 sweep。on_rtp 也会内联 check
+    /// 但稀疏流(暂停后恢复)需要 tick 推进。
+    void tick(int64_t now_qpc_ns) noexcept;
+
+    /// 重连/device-lost 时清空(下一个 RTP 重新 bootstrap)。
     void reset() noexcept;
 
-    [[nodiscard]] uint32_t target_delay_ms() const noexcept { return target_delay_ms_; }
-    [[nodiscard]] uint32_t jitter_estimate_ms() const noexcept { return jitter_estimate_ms_; }
-
-    // Phase 9.3 子目标 3:ZeroJitter mode(LAN-switched 链路替代 Kalman aggressive)。
-    //   target_delay 0~1ms,反馈链路最低延时;损失 jitter 容忍度。
-    //   非 LAN-switched 链路下 PresetApply graceful degrade 退到 Kalman aggressive。
-    enum class Mode : uint8_t {
-        Kalman_Aggressive = 0,
-        Kalman_Adaptive   = 1,
-        ZeroJitter        = 2,
+    struct Stats {
+        uint64_t emits;
+        uint64_t late_drops;        // 迟到包(seq < next_expected),drop
+        uint64_t duplicate_drops;   // 重复包(NACK 重传到达,slot 已 emit/已填),drop
+        uint64_t expired_gaps;      // dwell 超时跳过的 seq 数
+        uint64_t nacks_sent;
+        uint64_t reorder_events;    // 真乱序到达(seq 入队时 < highest_seen_)的次数
+        uint32_t pending_count;     // 当前队列里待 emit 的包数
+        uint32_t max_pending_seen;  // 历史最大 pending(诊断 buffer 是否太小)
     };
-    void set_mode(Mode m) noexcept;
-    [[nodiscard]] Mode mode() const noexcept { return mode_; }
+    [[nodiscard]] Stats stats() const noexcept;
 
 private:
-    EmitFn   emit_;
-    NackFn   nack_;
-    uint32_t min_target_ms_      = 0;
-    uint32_t max_target_ms_      = 0;
-    uint32_t target_delay_ms_    = 0;
-    uint32_t jitter_estimate_ms_ = 0;
-    Mode     mode_               = Mode::Kalman_Aggressive;
+    struct Impl;
+    std::unique_ptr<Impl> impl_;
 };
 
 }  // namespace mcp::media

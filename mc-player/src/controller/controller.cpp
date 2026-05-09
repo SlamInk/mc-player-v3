@@ -34,6 +34,7 @@
 #include "media/depack_h264.h"
 #include "media/depack_h265.h"
 #include "media/frame_validity_gate.h"
+#include "media/jitter_buffer_video.h"
 #include "media/render_d3d11.h"
 #include "media/ui_overlay.h"
 #include "pal/clock.h"
@@ -191,6 +192,7 @@ struct Controller::Impl {
     ComPtr<ID3D11Device>                       d3d_device;
 
     std::unique_ptr<transport::TransportSession>  transport;
+    std::unique_ptr<media::JitterBufferVideo>     jitter_video;     // RTP reorder + NACK
     std::unique_ptr<media::DepackH264>            depack_h264;
     std::unique_ptr<media::DepackH265>            depack_h265;
     std::unique_ptr<media::CodecMftVideo>         codec_video;
@@ -616,6 +618,39 @@ struct Controller::Impl {
         MCP_LOGF(pal::LogLevel::info,
                  "Controller: sent video PLI media_ssrc=0x%08X status=%d",
                  media_ssrc, static_cast<int>(s));
+    }
+
+    // RFC 4585 §6.2.1 Generic NACK — pid 是首个丢失 seq,blp 是后续 16 个 seq 的位图。
+    // 由 jitter_buffer_video 的 NackFn callback 触发(检测到 gap 立即请求重传)。
+    // 限频已在 jitter buffer 内做(同 pid nack_min_interval=50ms)。
+    void send_video_nack(uint16_t pid, uint16_t blp) noexcept {
+        if (!transport) return;
+        const uint32_t media_ssrc = video_remote_ssrc.load(std::memory_order_acquire);
+        if (media_ssrc == 0) return;     // 还没看到 RTP,SSRC 未知
+
+        std::array<uint8_t, 64> buf{};
+        std::size_t off = 0;
+        const auto rr_len = transport::RtcpWriter::write_receiver_report(
+            local_sender_ssrc, {}, std::span<uint8_t>{buf.data() + off, buf.size() - off});
+        if (rr_len == 0) return;
+        off += rr_len;
+        constexpr char kCname[] = "mc-player";
+        const auto sdes_len = transport::RtcpWriter::write_sdes_cname(
+            local_sender_ssrc,
+            std::span<const char>{kCname, sizeof(kCname) - 1},
+            std::span<uint8_t>{buf.data() + off, buf.size() - off});
+        if (sdes_len == 0) return;
+        off += sdes_len;
+        transport::RtcpNackEntry e{pid, blp};
+        const auto nack_len = transport::RtcpWriter::write_nack(
+            local_sender_ssrc, media_ssrc,
+            std::span<const transport::RtcpNackEntry>{&e, 1},
+            std::span<uint8_t>{buf.data() + off, buf.size() - off});
+        if (nack_len == 0) return;
+        off += nack_len;
+        (void)transport->send_rtcp(transport::MediaKind::video,
+                                   std::span<const uint8_t>{buf.data(), off});
+        pal::metric::Registry::instance().counter("mc.fb.nack_sent_count").inc();
     }
 
     // 音频管线启动（v1：仅 AAC；G.711 LUT 后续接入）。
@@ -1103,6 +1138,20 @@ struct Controller::Impl {
         // 综合 SDP profile-level-id + SPS VUI 决定 LowLatencyMode 是否启用 + 色彩三级兜底。
         decide_codec_policy(video);
 
+        // RTP 视频 jitter buffer:reorder window + RTCP NACK + 真丢包 loss 上报。
+        // 三个 callback:
+        //   - emit:按 seq 升序、连续输出 → 解 RTP header → 喂 depack
+        //   - nack:发现 gap → 立即 NACK pid+blp(限频在 jitter buffer 内做)
+        //   - loss:dwell 超时仍未到的 seq → poison gate + PLI(对齐旧 SEQ_GAP 路径)
+        // 单 seq 乱序 / 可补回的丢包在 jitter buffer 内吸收,不再触发 gate freeze;
+        // 真丢失才 freeze + 等下个 IDR(对齐 ADR-014 strict 但减少触发频次)。
+        jitter_video = std::make_unique<media::JitterBufferVideo>(
+            [this](const transport::RtpDatagram& d) { on_video_rtp_jittered(d); },
+            [this](uint16_t pid, uint16_t blp) { send_video_nack(pid, blp); },
+            [this](uint16_t seq, uint32_t cnt)  { on_video_rtp_loss(seq, cnt); });
+        // dwell 30ms = 95% LAN-IPC reorder 容忍 + 留 ~RTT 让 NACK 重传到达。
+        jitter_video->configure(30'000, 50'000);
+
         if (mc_status_t s = start_decode_pipeline(); s != MC_OK) {
             std::string msg = "decode pipeline start failed";
             if (s == MC_ERR_NO_HARDWARE && video_codec == MC_VIDEO_CODEC_H265) {
@@ -1165,16 +1214,17 @@ struct Controller::Impl {
         if (sink) sink(e);
     }
 
-    void on_rtp(const transport::RtpDatagram& dg) noexcept {
-        rtp_packets.fetch_add(1, std::memory_order_relaxed);
+    // jitter_buffer_video::EmitFn — 按 seq 升序、连续输出后才解 RTP 内容并喂 depack。
+    // 单 seq 乱序 / NACK 重传到达的包在 jitter buffer 内被 reorder/去重,这里收到的
+    // 一定是 sequence 连续的(中间真丢失的 seq 已由 loss callback 上报 + 跳过)。
+    void on_video_rtp_jittered(const transport::RtpDatagram& dg) noexcept {
         if (dg.bytes.size() < 12) return;
-
-        const uint8_t* p = dg.bytes.data();
-        const bool marker  = (p[1] & 0x80) != 0;
-        const uint32_t ts  = (static_cast<uint32_t>(p[4]) << 24) |
-                              (static_cast<uint32_t>(p[5]) << 16) |
-                              (static_cast<uint32_t>(p[6]) <<  8) |
-                               static_cast<uint32_t>(p[7]);
+        const uint8_t* p  = dg.bytes.data();
+        const bool marker = (p[1] & 0x80) != 0;
+        const uint32_t ts = (static_cast<uint32_t>(p[4]) << 24) |
+                             (static_cast<uint32_t>(p[5]) << 16) |
+                             (static_cast<uint32_t>(p[6]) <<  8) |
+                              static_cast<uint32_t>(p[7]);
         const uint8_t cc = p[0] & 0x0F;
         std::size_t off = 12 + cc * 4;
         if ((p[0] & 0x10) != 0 && off + 4 <= dg.bytes.size()) {
@@ -1185,15 +1235,50 @@ struct Controller::Impl {
         if (off >= dg.bytes.size()) return;
         std::span<const uint8_t> payload(p + off, dg.bytes.size() - off);
 
+        // 视频时钟固定 90 kHz:us = ts * 1e6 / 90000 = ts * 100 / 9
+        const int64_t pts_us = static_cast<int64_t>(ts) * 100 / 9;
+
+        if (depack_h264)      depack_h264->on_rtp(pts_us, marker, payload, dg.arrival_qpc_ns);
+        else if (depack_h265) depack_h265->on_rtp(pts_us, marker, payload, dg.arrival_qpc_ns);
+    }
+
+    // jitter_buffer_video::LossFn — 真丢包(超过 reorder window 仍未到)。
+    // 此时参考链可能断;按 ADR-014 strict gate poison + depack mark_reference_lost +
+    // 紧急 PLI 让 server 下 IDR。注意单 seq 乱序、可 NACK 补回的丢包在 jitter buffer
+    // 内已被吸收,不会触发本回调 — 即不再因抖动/小丢包冻结画面。
+    void on_video_rtp_loss(uint16_t expired_seq, uint32_t count) noexcept {
+        pal::metric::Registry::instance()
+            .counter("mc.tput.rtp_loss_count").inc(static_cast<uint64_t>(count));
+
+        char env_buf[8]; size_t env_n = 0;
+        const bool seqgap_poison_disabled =
+            getenv_s(&env_n, env_buf, sizeof(env_buf), "MCP_DISABLE_SEQGAP_POISON") == 0
+            && env_n > 0 && env_buf[0] == '1';
+        if (!seqgap_poison_disabled) {
+            if (gate) gate->mark_poisoned(MC_GATE_POISON_SEQ_GAP);
+            if (depack_h264) depack_h264->mark_reference_lost();
+            if (depack_h265) depack_h265->mark_reference_lost();
+            const uint32_t ssrc = video_remote_ssrc.load(std::memory_order_acquire);
+            if (ssrc != 0) {
+                try_send_video_pli(ssrc, "jitter_loss");
+            }
+        }
+        MCP_LOGF(pal::LogLevel::warn,
+                 "Controller: jitter buffer loss seq=%u count=%u%s",
+                 expired_seq, count,
+                 seqgap_poison_disabled ? " [poison disabled by env]" : "");
+    }
+
+    void on_rtp(const transport::RtpDatagram& dg) noexcept {
+        rtp_packets.fetch_add(1, std::memory_order_relaxed);
+        if (dg.bytes.size() < 12) return;
+
+        const uint8_t* p = dg.bytes.data();
+
         if (dg.kind == transport::MediaKind::video) {
-            // 视频时钟固定 90 kHz：us = ts * 1e6 / 90000 = ts * 100 / 9
-            const int64_t pts_us = static_cast<int64_t>(ts) * 100 / 9;
             // 首个视频 RTP:学到 remote SSRC 并触发首次 PLI。
-            // 摄像头收 PLI 立即下发 IDR,缩短首帧延时。多数低延时摄像头 GOP 几秒,
-            // 进流时若位于 GOP 中段,无 PLI 时要等下一个周期性 IDR;PLI 把这段空窗
-            // 压到一帧 RTT 之内(RFC 4585 §6.3.1)。
-            // SSRC 同步保存到 video_remote_ssrc 供 SEQ_GAP 路径复用 PLI(参考链断时
-            // 立即重请求 IDR,而不是等下次 GOP)。
+            // SSRC 学习不能延迟到 jitter buffer emit,因为乱序情况下首包可能 hold 在
+            // buffer 里;现在直接从 raw datagram 学(jitter buffer 不影响 SSRC 字段)。
             const uint32_t media_ssrc = (static_cast<uint32_t>(p[8])  << 24) |
                                           (static_cast<uint32_t>(p[9])  << 16) |
                                           (static_cast<uint32_t>(p[10]) <<  8) |
@@ -1202,59 +1287,32 @@ struct Controller::Impl {
             if (!first_pli_sent.test_and_set(std::memory_order_acq_rel)) {
                 try_send_video_pli(media_ssrc, "first_rtp");
             }
-            // Phase 2：RTP seq gap 检测（性能量度规范 §4.2 SEQ_GAP 触发源）。
-            // RTP header 第 2-3 字节是 16-bit sequence number（big endian）。
-            const uint16_t rtp_seq = static_cast<uint16_t>(
-                (static_cast<uint16_t>(p[2]) << 8) | p[3]);
-            if (!video_seq_inited) {
-                video_seq_inited = true;
-                video_seq_last   = rtp_seq;
-            } else {
-                const uint16_t expected = static_cast<uint16_t>(video_seq_last + 1);
-                const int16_t  diff     = static_cast<int16_t>(rtp_seq - expected);
-                if (diff > 0) {
-                    // gap > 0:丢了 diff 个包;标参考链断裂 + 上报 metric。
-                    pal::metric::Registry::instance()
-                        .counter("mc.tput.rtp_loss_count").inc(static_cast<uint64_t>(diff));
-                    // 诊断 env MCP_DISABLE_SEQGAP_POISON=1:跳过 mark_poisoned 让所有
-                    // emit 的 frame 都进 render — 用于检验 driver 实际是否解出真像素
-                    // (vs 全 0 silent fail)。生产场景不应禁。
-                    char dg[8]; size_t dn = 0;
-                    const bool seqgap_poison_disabled =
-                        getenv_s(&dn, dg, sizeof(dg), "MCP_DISABLE_SEQGAP_POISON") == 0
-                        && dn > 0 && dg[0] == '1';
-                    if (!seqgap_poison_disabled) {
-                        if (gate) gate->mark_poisoned(MC_GATE_POISON_SEQ_GAP);
-                        if (depack_h264) depack_h264->mark_reference_lost();
-                        if (depack_h265) depack_h265->mark_reference_lost();
-                        // RFC 4585 §6.3.1 PLI: SEQ_GAP 后参考链已断,gate poisoned 仅
-                        // anchor 帧能解。摄像头 GOP 几秒长,不主动请求 IDR 期间所有非
-                        // anchor 帧都被 gate drop → 黑屏 N 秒。这里立即发 PLI 让
-                        // server 紧急下 IDR,把恢复时间从一个 GOP 周期压到 RTT。
-                        // 限频在 try_send_video_pli 内部(200 ms),防丢包风暴下 PLI 风暴。
-                        const uint32_t ssrc = video_remote_ssrc.load(std::memory_order_acquire);
-                        if (ssrc != 0) {
-                            try_send_video_pli(ssrc, "seq_gap");
-                        }
-                    }
-                    MCP_LOGF(pal::LogLevel::warn,
-                             "Controller: RTP video seq gap = %d (expected=%u got=%u)%s",
-                             static_cast<int>(diff), expected, rtp_seq,
-                             seqgap_poison_disabled ? " [poison disabled by env]" : "");
-                } else if (diff < 0) {
-                    // 乱序（jitter buffer 实装后由它处理；当前仅 inc oo counter）
-                    pal::metric::Registry::instance()
-                        .counter("mc.tput.rtp_oo_count").inc();
-                }
-                // 即使 diff < 0（乱序），video_seq_last 不回退（与 RFC 3550 标准一致）
-                if (diff > 0) video_seq_last = rtp_seq;
-                else if (diff == 0) video_seq_last = rtp_seq;  // 正常顺序
-                // diff < 0 不更新 last
-            }
 
-            if (depack_h264)      depack_h264->on_rtp(pts_us, marker, payload, dg.arrival_qpc_ns);
-            else if (depack_h265) depack_h265->on_rtp(pts_us, marker, payload, dg.arrival_qpc_ns);
+            // 喂 jitter buffer:它会按 seq reorder + 触发 NACK + 真丢包时调 loss callback。
+            // jitter_video 不存在(早期 bootstrap)的 fallback 直接喂 depack。
+            if (jitter_video) {
+                jitter_video->on_rtp(dg);
+            } else {
+                on_video_rtp_jittered(dg);
+            }
         } else if (dg.kind == transport::MediaKind::audio) {
+            // 音频路径不走 jitter buffer(AAC frame 通常小、丢包对音频影响 ≪ 视频参考链);
+            // 直接解 RTP header 喂 depack/G.711 LUT。
+            const bool marker = (p[1] & 0x80) != 0;
+            const uint32_t ts = (static_cast<uint32_t>(p[4]) << 24) |
+                                 (static_cast<uint32_t>(p[5]) << 16) |
+                                 (static_cast<uint32_t>(p[6]) <<  8) |
+                                  static_cast<uint32_t>(p[7]);
+            const uint8_t cc = p[0] & 0x0F;
+            std::size_t off = 12 + cc * 4;
+            if ((p[0] & 0x10) != 0 && off + 4 <= dg.bytes.size()) {
+                const uint16_t ext_len = static_cast<uint16_t>(
+                    (static_cast<uint16_t>(p[off + 2]) << 8) | p[off + 3]);
+                off += 4 + static_cast<std::size_t>(ext_len) * 4u;
+            }
+            if (off >= dg.bytes.size()) return;
+            std::span<const uint8_t> payload(p + off, dg.bytes.size() - off);
+
             static std::atomic<uint64_t> n{0};
             const auto cnt = n.fetch_add(1, std::memory_order_relaxed) + 1;
             if (cnt == 1 || cnt == 10 || cnt == 50 || (cnt % 200) == 0) {
@@ -1372,6 +1430,8 @@ struct Controller::Impl {
         if (codec_audio)  { codec_audio->stop(); codec_audio.reset(); }
         if (audio_render) { audio_render->stop(); audio_render.reset(); }
         depack_aac.reset();
+        // 先停 jitter buffer(它持 EmitFn 闭包引用 depack;先释放它再 release depack)。
+        jitter_video.reset();
         depack_h264.reset();
         depack_h265.reset();
         d3d_device.Reset();

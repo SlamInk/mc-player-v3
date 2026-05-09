@@ -253,6 +253,10 @@ void DepackH265::on_rtp(int64_t pts_us, bool marker, std::span<const uint8_t> pa
             fu_layer_id_       = h265_layer_id(b0, b1);
             fu_tid_            = h265_tid_plus1(b1);
             fu_in_progress_    = true;
+            // 早期标识 IRAP — 与 H.264 同因(见 depack_h264.cpp::on_rtp FU-A 注释):
+            // FU 中段丢包导致 end 永不到时 saw_irap_in_au_ 一直 false → emit_au
+            // with_extradata=false → VPS/SPS/PPS 不前置 → codec 永远 init 不了。
+            if (is_irap(inner_t)) saw_irap_in_au_ = true;
         }
         if (fu_in_progress_) {
             fu_buffer_.insert(fu_buffer_.end(), payload.begin() + 3, payload.end());
@@ -319,13 +323,13 @@ void DepackH265::emit_au(int64_t pts_us, bool with_extradata) noexcept {
 
 void DepackH265::mark_reference_lost() noexcept {
     refs_lost_ = true;
-    // RTP seq gap → 丢正在重组的 FU 与 au_buffer_ 中累积的 NAL,等下一 IRAP 重 anchor。
-    // 与 H.264 同因:中间分片丢失会让 driver 解出 partial 真实数据 + zero-fill 花屏。
+    // RTP seq gap → 仅丢中断的 FU,保留 au_buffer_ 中已完整 NAL(VPS/SPS/PPS/SEI)。
+    // 详见 depack_h264.cpp::mark_reference_lost 注释 — 旧版同时清 au_buffer 让
+    // VPS/SPS/PPS 在 seq gap 频发的网络下永远到不了 codec,codec 无法 init_decoder。
+    // 对齐 VLC modules/access/rtp/h264.c:不在 RTP 层做 reference loss 阻断,让
+    // 下游 packetizer/decoder 自己拒不完整 slice。
     fu_buffer_.clear();
-    fu_in_progress_     = false;
-    au_buffer_.clear();
-    saw_irap_in_au_     = false;
-    saw_recovery_in_au_ = false;
+    fu_in_progress_ = false;
 }
 
 void DepackH265::reset() noexcept {
