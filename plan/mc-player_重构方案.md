@@ -3,7 +3,7 @@
 | 项目 | 内容 |
 |---|---|
 | 文档类型 | 实施性 roadmap（不属于 ADD / ADR / 性能量度规范）|
-| 上游依据 | `doc/mc-player_架构设计文档_v3.0.md` / `doc/mc-player_ADR.md` / `doc/mc-player_性能量度规范.md` / `doc/mc-player_capability_probe_设计.md` / `doc/hardware-decode-dependencies.md` / `CLAUDE.md` |
+| 上游依据 | `docs/mc-player_架构设计文档_v3.0.md` / `docs/mc-player_ADR.md` / `docs/mc-player_性能量度规范.md` / `docs/mc-player_capability_probe_设计.md` / `docs/hardware-decode-dependencies.md` / `CLAUDE.md` |
 | 落地节奏 | 20 commit / 14 个 phase（Phase 0 ~ 7 单 commit；Phase 8 拆 8-A/B/C/D/E 共 5 commit；Phase 9 拆 9.0/9.1/9.2/9.3/9.4/9.5 共 6 commit；Phase 10 单 commit），每 commit = 一次 `git commit + push` |
 | 验收门槛 | 每阶段必须达到对应**性能量度规范字段阈值**才进入下一阶段；未达不 commit |
 | 不在范围 | 具体 API 头文件签名、cmake target 名、UI 面板视觉稿——这些在阶段实施时按需细化 |
@@ -36,9 +36,9 @@
 ### 0.3 与文档体系的协同
 
 - 实施期发现 ADD 设计假设错误（如某 metric 永远到不了阈值）→ 先开 ADR 修正决策、回标 ADD 章节，**再写代码**。代码不解释决策，决策由文档解释。
-- 实施期发现性能量度规范字段名 / 阈值不合理 → 先修订 `doc/mc-player_性能量度规范.md` 并 commit 文档，**再用新字段名落地**。
-- 实施期发现 capability probe 的 struct 字段 / selector 算法 / preset 配置不合理（如新增 vendor-specific 字段、selector 边界条件需调整、preset 子系统参数表与实测不符）→ 先修订 `doc/mc-player_capability_probe_设计.md` 并回标 ADD §3.5 / §7.5，**再用新字段或新算法落地**。design-detail 层文档与 ADD/ADR 同等权威。
-- 阶段实施完成后若发现新的稳定性 / 性能模式（surprising），写入 `memory/`（auto memory 系统，跨会话），不写入 `doc/`（design-only）。
+- 实施期发现性能量度规范字段名 / 阈值不合理 → 先修订 `docs/mc-player_性能量度规范.md` 并 commit 文档，**再用新字段名落地**。
+- 实施期发现 capability probe 的 struct 字段 / selector 算法 / preset 配置不合理（如新增 vendor-specific 字段、selector 边界条件需调整、preset 子系统参数表与实测不符）→ 先修订 `docs/mc-player_capability_probe_设计.md` 并回标 ADD §3.5 / §7.5，**再用新字段或新算法落地**。design-detail 层文档与 ADD/ADR 同等权威。
+- 阶段实施完成后若发现新的稳定性 / 性能模式（surprising），写入 `memory/`（auto memory 系统，跨会话），不写入 `docs/`（design-only）。
 
 ### 0.4 测试基线
 

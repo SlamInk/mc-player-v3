@@ -2,7 +2,7 @@
  * HDCM (Hardware Decode Component Manager) Manifest Table —
  *   ADR-016 + ADR-021 静态组件表(7 类组件 × 4 类别)。
  *
- * 类别(详 doc/mc-player_hdcm_设计.md §2):
+ * 类别(详 docs/mc-player_hdcm_设计.md §2):
  *   A. Vendor SDK              — A_NVDEC / A_oneVPL / A_AMF
  *   B. Microsoft Store 媒体扩展 — B_HEVC_Ext / B_AV1_Ext
  *   C. Windows Optional Feature — C_MediaPlayback (启用 MFT registry)

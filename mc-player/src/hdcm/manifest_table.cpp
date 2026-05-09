@@ -3,7 +3,7 @@
 namespace mcp::hdcm {
 
 const std::vector<ComponentManifest>& manifest_table() noexcept {
-    // 7 类组件静态表(详 doc/mc-player_hdcm_设计.md §2)。
+    // 7 类组件静态表(详 docs/mc-player_hdcm_设计.md §2)。
     // download_url / sha256 留空: Phase 8-A 实装期再按 vendor 实际发布版本填入并入 ADR。
     static const std::vector<ComponentManifest> kTable = {
         // ─── 类别 A: Vendor SDK 直驱 ────────────────────────────

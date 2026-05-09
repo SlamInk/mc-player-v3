@@ -188,7 +188,7 @@
   - 与 §2 #10 "平台原生优先"：类别 B 调用 UWP `Windows.Services.Store`（C++/WinRT interop）/ 类别 C 调用 `DismApi.dll` 均是 OS 原生 API，不引第三方依赖。类别 A 沿用 ADR-016 既定例外口子。
   - 与性能量度规范：metric 字段集中在 §6 末"`mc.hdcm.*`"块，排障扩展到 §10.5。
   - 与 plan Phase 8：原 vendor SDK 单点下载面板扩为 HDCM 四类组件，改动文件清单按本 ADR 切分。
-  - 与 `doc/mc-player_hdcm_设计.md`（design-detail）：组件 manifest / 状态机伪代码 / helper.exe IPC 协议 / driver 阈值表 等实施细节统一在该 design-detail 文档。
+  - 与 `docs/mc-player_hdcm_设计.md`（design-detail）：组件 manifest / 状态机伪代码 / helper.exe IPC 协议 / driver 阈值表 等实施细节统一在该 design-detail 文档。
 
 ---
 
