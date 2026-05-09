@@ -132,6 +132,8 @@ set(MCP_MEDIA_SOURCES
     src/media/frame_validity_gate.cpp
     src/media/av_sync.h
     src/media/av_sync.cpp
+    src/media/video_clock.h
+    src/media/video_clock.cpp
     src/media/render_d3d11.h
     src/media/render_d3d11.cpp
     src/media/render_swap_chain.h

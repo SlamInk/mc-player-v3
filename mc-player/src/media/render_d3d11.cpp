@@ -12,6 +12,7 @@
 #include <thread>
 
 #include "media/ui_overlay.h"
+#include "media/video_clock.h"
 #include "pal/clock.h"
 #include "pal/error.h"
 #include "pal/log.h"
@@ -108,10 +109,18 @@ struct RenderD3d11::Impl {
     bool                                    has_last_good = false;
     std::atomic<int64_t>                    frame_period_ns{0};   // 0 = 未知（watchdog 走 fallback）
 
+    // VLC vlc_clock 完整对齐 — video 当 master(无 audio path),
+    // master_update 收 EMA coeff + 重算 offset,convert_to_system 算 deadline,
+    // wait_until 用 cv.wait_for 可被 wake/stop 中断。详见 video_clock.h 文件头注释。
+    VideoClock                              video_clock;
+
     std::thread                             render_thread;
     std::atomic<bool>                       render_stop{false};
     pal::HandleGuard                        wake_event;             // auto-reset
-    static constexpr std::size_t            kPendingQueueCap = 8;
+    // PTS-paced 模式下 T5 每帧 wait ~30ms(=kRenderTargetLatency - decode_delay),
+    // codec startup 期 reorder buffer drain 一次性 emit 20-40 帧 burst → cap 必须够大
+    // 容纳 burst 不丢中间帧。64 = ~2.1s @ 30fps,startup 后 1-2s 自然 drain 到稳态。
+    static constexpr std::size_t            kPendingQueueCap = 64;
     std::mutex                              pending_mu;
     std::deque<VideoFrame>                  pending_queue;
     std::atomic<uint64_t>                   pending_drops{0};       // 队列满时 drop_oldest 计数
@@ -550,6 +559,7 @@ void RenderD3d11::stop() noexcept {
     if (!impl_) return;
     // 阶段 1：通知 T5 退出并等其结束。在 T5 结束前不能销毁 swap_chain / epoch / dcomp。
     impl_->render_stop.store(true, std::memory_order_release);
+    impl_->video_clock.request_stop();         // 唤醒可能阻塞在 wait_until 的 T5
     if (impl_->wake_event.valid()) ::SetEvent(impl_->wake_event.get());
     if (impl_->render_thread.joinable()) impl_->render_thread.join();
     impl_->wake_event.reset();
@@ -570,6 +580,7 @@ void RenderD3d11::stop() noexcept {
     impl_->swap_chain.reset();
     impl_->has_last_good = false;
     impl_->last_good = VideoFrame{};
+    impl_->video_clock.reset();                // 清 anchor + coeff;stop 状态保持
     {
         std::scoped_lock lk{impl_->pending_mu};
         impl_->pending_queue.clear();
@@ -672,11 +683,49 @@ void RenderD3d11::Impl::render_thread_loop() noexcept {
         }
 
         if (got_frame) {
+            // PTS-paced present(完整对齐 VLC vout `DisplayPicture` + vlc_clock):
+            //   1. master_update(arrival_qpc, pts) — 用 RTP arrival(source 推流 wall clock
+            //      时序,稳定 30fps)学 EMA coeff,而不是 codec emit/Present 时刻(burst);
+            //   2. expected_arrival = ConvertToSystem(pts) — master 算的 arrival 时刻;
+            //   3. deadline_present = expected_arrival + kRenderTargetLatencyNs (~100ms);
+            //   4. wait_until(deadline_present) → cv.wait_for 可被 wake_all/stop 中断;
+            //   5. render_locked(frame).
+            //
+            // arrival_qpc_ns 来自 transport→depack→codec 全链透传(frame.h §47)。0 表示
+            // 上游未透传(MFT 黑盒等),fallback 用 now_qpc(此时 EMA 退化但仍可用)。
+            const int64_t now_qpc        = pal::Clock::now_ns();
+            const int64_t arrival_qpc    = (frame.arrival_qpc_ns > 0)
+                                              ? frame.arrival_qpc_ns : now_qpc;
+
+            video_clock.master_update(arrival_qpc, frame.pts_us, /*rate=*/1.0);
+
+            const int64_t expected_arrival = video_clock.convert_to_system(
+                                                  frame.pts_us, now_qpc);
+            const int64_t deadline_present = expected_arrival
+                                              + VideoClock::kRenderTargetLatencyNs;
+
+            // 调试:头 6 帧 + 每 60 帧打印 wait 实际值。
+            const uint64_t pcnt = presents.load(std::memory_order_relaxed);
+            if (pcnt < 6 || (pcnt + 1) % 60 == 0) {
+                MCP_LOGF(pal::LogLevel::info,
+                    "T5[stat] #%llu pts=%lld arrival=%lld now=%lld expected=%lld "
+                    "deadline=%lld wait=%lld queue_after=%zu",
+                    static_cast<unsigned long long>(pcnt),
+                    static_cast<long long>(frame.pts_us),
+                    static_cast<long long>(arrival_qpc),
+                    static_cast<long long>(now_qpc),
+                    static_cast<long long>(expected_arrival),
+                    static_cast<long long>(deadline_present),
+                    static_cast<long long>(deadline_present - now_qpc),
+                    remaining_after_pop);
+            }
+
+            (void)video_clock.wait_until(deadline_present);
+            if (render_stop.load(std::memory_order_acquire)) break;
+
             (void)epoch->begin_epoch();
-            // last_good anchor-only 更新:仅 IDR 帧覆盖 last_good。RTSP 流 packet loss
-            // 期间 codec emit 的 partial-decoded P 帧 + gate validity 漏检会污染 last_good
-            // 让 watchdog redraw 永久卡在花屏画面。anchor-only 保证 force_redraw 退到最后一个
-            // 完整 IDR;期间真实播放仍 render 当前帧(短暂可见 partial)但下一无帧周期回到 IDR。
+            // last_good anchor-only 更新:仅 IDR 帧覆盖 last_good(防 partial-decode 污染
+            // watchdog redraw)。
             if (frame.is_keyframe || !has_last_good) {
                 last_good     = frame;
                 has_last_good = true;
