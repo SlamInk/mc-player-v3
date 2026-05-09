@@ -113,10 +113,11 @@ struct RenderD3d11::Impl {
     ComPtr<ID3D11SamplerState>              samp;
     ComPtr<ID3D11RasterizerState>           raster;
 
-    // SRV 缓存（P1-8）：codec 自管 NV12 array pool 的 slice 是有限集（典型 4），
-    // 每帧都重建 SRV 浪费 driver allocation。按 (texture* + slice) 缓存 Y/UV SRV，
-    // pool 重建（dxva_texture 指针变更）或 ArraySize 变更时整组失效重建。
-    static constexpr int kSrvCacheSize = 8;
+    // SRV 缓存（P1-8）：codec 自管 NV12 array pool 的 slice 是有限集。
+    // 零拷贝路径下 frame.dxva_texture = codec dpb_tex，dpb_size 上限 24（H.264）/ 8（HEVC），
+    // 加 last_good anchor 缓冲取 32 避免 slice 模冲突重建。
+    // 按 (texture* + slice) 缓存 Y/UV SRV；pool 重建（dxva_texture 指针变更）整组失效重建。
+    static constexpr int kSrvCacheSize = 32;
     struct SrvSlot {
         ID3D11Texture2D*                  tex   = nullptr;     // 仅作 identity，不持引用
         uint32_t                          slice = 0;
@@ -646,9 +647,17 @@ void RenderD3d11::Impl::render_thread_loop() noexcept {
 
         if (got_frame) {
             (void)epoch->begin_epoch();
-            last_good     = std::move(frame);
-            has_last_good = true;
-            render_locked(last_good);
+            // last_good anchor-only 更新:仅 IDR 帧覆盖 last_good。RTSP 流 packet loss
+            // 期间 codec emit 的 partial-decoded P 帧 + gate validity 漏检会污染 last_good
+            // 让 watchdog redraw 永久卡在花屏画面。anchor-only 保证 force_redraw 退到最后一个
+            // 完整 IDR;期间真实播放仍 render 当前帧(短暂可见 partial)但下一无帧周期回到 IDR。
+            if (frame.is_keyframe || !has_last_good) {
+                last_good     = frame;
+                has_last_good = true;
+                render_locked(last_good);
+            } else {
+                render_locked(frame);
+            }
             continue;
         }
 

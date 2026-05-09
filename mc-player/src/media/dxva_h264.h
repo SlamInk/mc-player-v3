@@ -122,6 +122,12 @@ struct Pps {
     bool     valid                              = false;
 };
 
+// ref_pic_list_modification entry (H.264 §7.3.3.1)
+struct RefPicListModEntry {
+    uint8_t  modification_of_pic_nums_idc       = 3;     // 3 = end marker
+    uint32_t value                              = 0;     // abs_diff_pic_num_minus1 / long_term_pic_num
+};
+
 struct SliceHdr {
     uint32_t first_mb_in_slice                  = 0;
     uint32_t slice_type                         = 0;     // 0/5=P 1/6=B 2/7=I 3/8=SP 4/9=SI
@@ -134,6 +140,26 @@ struct SliceHdr {
     uint32_t pic_order_cnt_lsb                  = 0;
     int32_t  delta_pic_order_cnt_bottom         = 0;
     std::array<int32_t, 2> delta_pic_order_cnt{};
+
+    // B 帧 (slice_type%5==1) specific (H.264 §7.3.3)
+    uint8_t  direct_spatial_mv_pred_flag        = 0;
+
+    // P/SP/B 帧的 num_ref_idx 覆盖 (§7.3.3): driver 期望此值,而不是 PPS 默认
+    uint8_t  num_ref_idx_active_override_flag   = 0;
+    uint8_t  num_ref_idx_l0_active_minus1       = 0;     // 实际用,初始化 = PPS 默认
+    uint8_t  num_ref_idx_l1_active_minus1       = 0;     // 同上,B 帧才有意义
+
+    // ref_pic_list_modification (§7.3.3.1) — driver 在 ConfigBitstreamRaw=2 模式下
+    // 自己 parse slice header,mc-player 不需要应用 reordering 到 RefFrameList,
+    // 但 PicParams.num_ref_idx_lx_active_minus1 必须是 slice override 后的值。
+    // 保留字段供后续 ConfigBitstreamRaw=1 (long slice) 模式使用。
+    uint8_t  ref_pic_list_modification_flag_l0  = 0;
+    uint8_t  ref_pic_list_modification_flag_l1  = 0;
+    std::array<RefPicListModEntry, 32> rplm_l0{};
+    std::array<RefPicListModEntry, 32> rplm_l1{};
+    uint32_t rplm_l0_count                      = 0;
+    uint32_t rplm_l1_count                      = 0;
+
     bool     valid                              = false;
 };
 

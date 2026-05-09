@@ -30,8 +30,46 @@ mc-player-ui-ux/.design-canvas.state.json
 
 # Runtime artifacts
 mc-player.log
+mc-player.log.*
+mc-player.stdout.log
 mc-player-dump.h264
 mc-player-dump.h265
+
+# 排障参考资料（VLC / FFmpeg 源码 dump、抓包样本等，仅本地保留）
+resources/
+
+# DXVA / 解码 diagnostic dump（au / pic / picparams binary + 历史快照）
+dxva-h264-*.bin
+dxva-h264-*.bin.before
+dxva-h264-*.bin.zerocopy
+*.bin.before
+*.bin.zerocopy
+
+# 排障截图（baseline / 阶段对比 / VLC、ffplay 抓帧等）
+baseline-screen*.png
+c[0-9a-f]*.png
+mc-final*.png
+mc-screen-*.png
+mc-screen-shot.png
+mc-desktop*.png
+screenshot-*.png
+staging-*.png
+ffmpeg-aligned.png
+ffplay-*.png
+d3d11va-frame-*.png
+dump-*.png
+vlc-frame-*.png
+
+# VLC 对照流量与日志
+vlc-*.log
+vlc-*.h264
+vlc-*.ts
+vlc-*.txt
+vlc-new.log
+vlc-trace.log
+vlc-rtsp-dump.ts
+vlc-rtsp.h264
+vlc-help.txt
 
 # OS noise
 Thumbs.db

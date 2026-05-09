@@ -299,7 +299,8 @@ bool parse_slice_header_min(std::span<const uint8_t> rbsp,
                               SliceHdr&                out) noexcept {
     BitReader br{rbsp.data(), rbsp.size()};
     out.first_mb_in_slice = br.read_ue();
-    out.slice_type        = br.read_ue() % 5;          // 0/5,1/6,...,4/9 → mod 5 取基本类型
+    const uint32_t raw_slice_type = br.read_ue();
+    out.slice_type        = raw_slice_type % 5;          // 0=P 1=B 2=I 3=SP 4=SI
     out.pps_id            = static_cast<uint8_t>(br.read_ue());
     if (out.pps_id != pps.id) return false;
 
@@ -326,6 +327,43 @@ bool parse_slice_header_min(std::span<const uint8_t> rbsp,
     // type=1 的 delta_pic_order_cnt 已在 parse_sps 中拒绝。
     // type=2 不读 POC 字段，POC 由 frame_num 推导。
 
+    if (pps.redundant_pic_cnt_present_flag) {
+        (void)br.read_ue();      // redundant_pic_cnt
+    }
+
+    // 默认值取 PPS,后续 num_ref_idx_active_override_flag 命中时 slice 自己覆盖。
+    out.num_ref_idx_l0_active_minus1 = pps.num_ref_idx_l0_default_active_minus1;
+    out.num_ref_idx_l1_active_minus1 = pps.num_ref_idx_l1_default_active_minus1;
+
+    // §7.3.3:
+    //   slice_type%5==1 (B 帧) → 读 direct_spatial_mv_pred_flag
+    //   slice_type%5∈{0,3,1} (P/SP/B) → num_ref_idx_active_override_flag + 可选 override
+    //   ref_pic_list_modification (除 I/SI)
+    const bool is_b   = out.slice_type == 1;
+    const bool is_p   = out.slice_type == 0;
+    const bool is_sp  = out.slice_type == 3;
+    const bool needs_ref_list = is_p || is_sp || is_b;
+
+    if (is_b) {
+        out.direct_spatial_mv_pred_flag = static_cast<uint8_t>(br.read_bits(1));
+    }
+    if (needs_ref_list) {
+        out.num_ref_idx_active_override_flag = static_cast<uint8_t>(br.read_bits(1));
+        if (out.num_ref_idx_active_override_flag) {
+            const uint32_t l0 = br.read_ue();
+            out.num_ref_idx_l0_active_minus1 = static_cast<uint8_t>(l0 & 0x1Fu);
+            if (is_b) {
+                const uint32_t l1 = br.read_ue();
+                out.num_ref_idx_l1_active_minus1 = static_cast<uint8_t>(l1 & 0x1Fu);
+            }
+        }
+    }
+
+    // 关键字段读取完毕 — IntraPicFlag / num_ref_idx / direct_spatial_mv_pred_flag 全部到位。
+    // ref_pic_list_modification / pred_weight_table / dec_ref_pic_marking 等
+    // ConfigBitstreamRaw=2 模式下 driver 自行 parse;mc-player 当前不需要。
+    // 早 return 避免后续 read_ue 在 EBSP 边缘越界让 br.bad()=true → parse 整体返 false。
+    (void)raw_slice_type;
     if (br.bad()) return false;
     out.valid = true;
     return true;
@@ -503,6 +541,10 @@ void fill_pic_params(DXVA_PicParams_H264&         pp,
     pp.slice_group_change_rate_minus1        = 0;
     // SliceGroupMap 仅在 num_slice_groups_minus1 > 0 时使用,此处恒 0(已禁用 FMO)。
 
+    // num_ref_idx_lx_active_minus1: ConfigBitstreamRaw=2 模式下 driver 自己 parse
+    // slice header 拿 override 值;PicParams 字段填 PPS 默认即可,driver 会在内部
+    // 自动按 slice override 替换。实测填 sh.num_ref_idx 反而画面退化(driver 内部
+    // 双重 override 导致 ref 选错)。保持 PPS 默认对齐 mc-player 历史行为。
     pp.num_ref_idx_l0_active_minus1          = pps.num_ref_idx_l0_default_active_minus1;
     pp.num_ref_idx_l1_active_minus1          = pps.num_ref_idx_l1_default_active_minus1;
     pp.pic_init_qs_minus26                   = pps.pic_init_qs_minus26;

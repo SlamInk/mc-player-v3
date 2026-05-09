@@ -724,11 +724,6 @@ struct CodecDxvaVideo::Impl {
     std::vector<ComPtr<ID3D11VideoDecoderOutputView>>       dpb_views;
     UINT                                                     dpb_size = 8;
 
-    // ID3D11Query(EVENT) — 复用,每帧 End/GetData 等 video decode 真完成后再
-    // CopySubresourceRegion 到 out_pool。若不等 → driver partial-written DPB 拷给
-    // render → 花屏(详见 flush_pending_pic_h264 fence wait 注释)。
-    ComPtr<ID3D11Query>                                     decode_fence_query;
-
     struct DpbEntry {
         bool    used = false;
         int32_t poc = 0;
@@ -740,41 +735,49 @@ struct CodecDxvaVideo::Impl {
     // single-ref P-slice tracking（IPP 低延时流的简化 RPS）
     UINT    last_ref_dpb_idx = UINT_MAX;
     int32_t last_ref_poc     = 0;
-
-    // 输出 pool（BIND_SHADER_RESOURCE，喂 Renderer）
-    ComPtr<ID3D11Texture2D> out_pool;
-    UINT                    out_pool_size = 4;
-    UINT                    out_next       = 0;
-    bool                    out_pool_array_capable = true;
-
-    // 创建 + 烟测：对 NV12 用 R8/R8G8 plane SRV 试一次，避免 SetTexture 成功但 SRV 失败的驱动陷阱。
-    bool try_create_out_pool(const D3D11_TEXTURE2D_DESC& desc) noexcept {
-        ComPtr<ID3D11Texture2D> tex;
-        HRESULT hr = cfg.device->CreateTexture2D(&desc, nullptr, &tex);
-        if (FAILED(hr) || !tex) return false;
-        // 烟测：试创建 plane SRV，失败说明 driver 对该组合不支持 SR 路径。
-        D3D11_SHADER_RESOURCE_VIEW_DESC sd{};
-        sd.Format = DXGI_FORMAT_R8_UNORM;
-        if (desc.ArraySize > 1) {
-            sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
-            sd.Texture2DArray.MipLevels       = 1;
-            sd.Texture2DArray.FirstArraySlice = 0;
-            sd.Texture2DArray.ArraySize       = 1;
-        } else {
-            sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-            sd.Texture2D.MipLevels = 1;
-        }
-        ComPtr<ID3D11ShaderResourceView> probe_srv;
-        hr = cfg.device->CreateShaderResourceView(tex.Get(), &sd, &probe_srv);
-        if (FAILED(hr)) {
-            MCP_LOGF(pal::LogLevel::warn,
-                     "CodecDxvaVideo: out_pool SRV smoke-test failed bind=0x%X arr=%u hr=0x%08lX",
-                     desc.BindFlags, desc.ArraySize, hr);
-            return false;
-        }
-        out_pool = tex;
-        return true;
+    // ring buffer 记最近 emit 出去 (still in render in-flight) 的 dpb slot,
+    // alloc_dpb_slot_h264 victim 选择时跳过它们,防止 driver 写新帧覆盖 render
+    // 仍在 sample 的 slot → 视觉花屏 (B 帧 disposable non-ref slot 不在 h264_ref_list
+    // 中,之前只靠 ref_list 保护不够,2026-05-08 root cause #5)。
+    static constexpr UINT kRecentEmitN = 4;
+    // 0xFFFFFFFF = unused (注:default-init 是 0 = 有效 slot id,会让初始 alloc 把
+    // slot 0 误判为 recently emitted。显式构造为 UINT_MAX。reset_dpb 同步重置)。
+    std::array<UINT, kRecentEmitN> recent_emit_slots{
+        UINT_MAX, UINT_MAX, UINT_MAX, UINT_MAX };
+    UINT recent_emit_head = 0;
+    void note_emit_slot(UINT idx) noexcept {
+        recent_emit_slots[recent_emit_head] = idx;
+        recent_emit_head = (recent_emit_head + 1) % kRecentEmitN;
     }
+    bool is_recently_emitted(UINT idx) const noexcept {
+        for (UINT i = 0; i < kRecentEmitN; ++i) {
+            if (recent_emit_slots[i] == idx) return true;
+        }
+        return false;
+    }
+
+    // 锚点 slot — IDR 解码完毕后 reserve 其 dpb slot,alloc_dpb_slot_h264 永远跳过它,
+    // 直到下一 IDR 释放重新 reserve。renderer 端 last_good = IDR frame,持有
+    // (dpb_tex, slice=anchor_slot) 引用 — 该 slot 必须长期持稳 IDR 内容。
+    //
+    // 之前没此保护:ref_list cap = num_ref_frames=4,5 个 ref P 帧后 IDR 被 pop_back 出
+    // ref_list,recent_emit ring=4 也无法长期保护(第 5 个 emit 后 IDR 被 ring 淘汰),
+    // alloc 第二遍把 IDR slot 当 victim 写新帧 → driver 覆盖了 IDR 数据 → renderer
+    // watchdog redraw 用 last_good (slice=IDR_slot) sample 到的是新 P 帧 NV12 (但若
+    // 新 P 帧解码错或 shader/NV12 plane sample 错位 → 视觉花屏。2026-05-08 root cause #6)。
+    //
+    // 与 VLC picture_pool refcount 同等效果 — VLC 的 picture 在 codec/render 间 ref
+    // 计数,refcount>0 的 surface 不能被 alloc 选中。我们简化为单 anchor slot reservation,
+    // 因为 last_good 总是最近 IDR(anchor-only update)。
+    UINT reserved_anchor_slot = UINT_MAX;
+
+    // ADR-003 dual-bind 零拷贝:DPB texture 既是 decoder 输出也是 renderer SRV 输入。
+    // 取消 out_pool 中间层 — 跨 video_ctx (DecoderEndFrame, vendor private engine) ↔
+    // immediate ctx (CopySubresourceRegion, 3D engine) 的拷贝在 Intel UHD 730 driver
+    // 上未被同步 (EVENT query 是 submission-complete 而非 execution-complete),拷出
+    // partial-written NV12 → 紫色花屏 / Y 顶部全 0。VLC d3d11_fmt.cpp:107-158 与
+    // FFmpeg hwcontext_d3d11va.c:717 都直接对 dual-bind decoder texture 创 SRV,
+    // D3D11 runtime 在 shader sample 前自动等 decode 完成。
 
     // 当前 AU 累积
     std::vector<uint8_t>                 bitstream_buf;
@@ -804,6 +807,10 @@ struct CodecDxvaVideo::Impl {
     uint32_t                                   cur_h264_frame_num   = 0;
     uint8_t                                    cur_h264_nal_ref_idc = 0;
     uint16_t                                   h264_status_report_id = 0;
+    // 当前帧第一个 slice 的 header — fill_pic_params 用它的 num_ref_idx_l0/l1_active_minus1
+    // (slice override 已生效) 与 direct_spatial_mv_pred_flag。之前这里伪造 slice_type=0
+    // SliceHdr 让 driver 在 slice override 时按错误 ref count 解码 → B 帧花屏。
+    h264::SliceHdr                             cur_h264_slice_hdr{};
 
     // ─── T4-DXVA worker（ADD §3.3）─────────────────────────────────
     // 原版 submit 同步在 RX (T2) 线程跑 NAL 解析 + DPB 管理 + DXVA EndFrame，
@@ -1002,7 +1009,11 @@ struct CodecDxvaVideo::Impl {
         }
         if (dpb_size > 20) dpb_size = 20;
 
-        // DPB texture array（BIND_DECODER）。NV12 dim 必须偶数。driver 写入端无需 SR bind。
+        // DPB texture array(NV12 array,dual-bind)。NV12 dim 必须偶数。
+        // dual-bind: BIND_DECODER (driver 写入) | BIND_SHADER_RESOURCE (renderer 直接采样)
+        // 取消 out_pool 中间层后,DPB 同时承担 picture pool 角色,与 VLC/FFmpeg 对齐。
+        // 失败时降级 BIND_DECODER only — render 端 CreateShaderResourceView 将拒绝,
+        // 整条 tier 2 失效;controller 升 tier 3 软解兜底(ADR-015 四级链)。
         const UINT tex_w = (dec_w + 1u) & ~1u;
         const UINT tex_h = (dec_h + 1u) & ~1u;
         D3D11_TEXTURE2D_DESC td{};
@@ -1011,14 +1022,26 @@ struct CodecDxvaVideo::Impl {
         td.Format = DXGI_FORMAT_NV12;
         td.SampleDesc.Count = 1;
         td.Usage = D3D11_USAGE_DEFAULT;
-        td.BindFlags = D3D11_BIND_DECODER;
+        td.BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
         hr = cfg.device->CreateTexture2D(&td, nullptr, &dpb_tex);
+        if (FAILED(hr)) {
+            MCP_LOGF(pal::LogLevel::warn,
+                     "CodecDxvaVideo: HEVC DPB dual-bind CreateTexture2D failed hr=0x%08lX, "
+                     "fallback to BIND_DECODER only (render 路径将不可用)", hr);
+            td.BindFlags = D3D11_BIND_DECODER;
+            hr = cfg.device->CreateTexture2D(&td, nullptr, &dpb_tex);
+        }
         if (FAILED(hr)) {
             MCP_LOGF(pal::LogLevel::error,
                      "CodecDxvaVideo: DPB CreateTexture2D failed hr=0x%08lX %ux%u arr=%u",
                      hr, tex_w, tex_h, dpb_size);
             return hr;
         }
+        const bool dpb_dual_bind = (td.BindFlags & D3D11_BIND_SHADER_RESOURCE) != 0;
+        MCP_LOGF(pal::LogLevel::info,
+                 "CodecDxvaVideo: HEVC DPB created %ux%u arr=%u BindFlags=%s",
+                 tex_w, tex_h, dpb_size,
+                 dpb_dual_bind ? "DECODER|SHADER_RESOURCE" : "DECODER");
 
         dpb_views.resize(dpb_size);
         for (UINT i = 0; i < dpb_size; ++i) {
@@ -1037,47 +1060,6 @@ struct CodecDxvaVideo::Impl {
         }
         dpb.assign(dpb_size, DpbEntry{});
 
-        // 输出 pool — 创建一定要支持 SRV，否则 render_d3d11 无法采样视频。
-        // AMD 独显（含 RX 7000 系列）driver 对 NV12 + BIND_DECODER + ArraySize>1
-        // 的 BIND_SHADER_RESOURCE 路径在创建 SRV 时报 E_INVALIDARG，导致渲染端
-        // 静默丢帧。所以用预飞行测试探测能否真的拿到 SRV，挑选第一个能过的方案：
-        //   ① dual-bind + ArraySize=N
-        //   ② SR-only + ArraySize=N（去 DECODER bit；不少 AMD/NV 驱动接受 NV12 SR 阵列）
-        //   ③ SR-only + ArraySize=1（最兼容兜底）
-        out_pool_array_capable = true;
-        D3D11_TEXTURE2D_DESC ot = td;
-        ot.ArraySize = out_pool_size;
-        ot.BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
-        bool ok = try_create_out_pool(ot);
-        if (!ok) {
-            MCP_LOGF(pal::LogLevel::warn,
-                     "CodecDxvaVideo: out_pool dual-bind+arr=%u failed; retry SR-only arr=%u",
-                     out_pool_size, out_pool_size);
-            ot = td;
-            ot.ArraySize = out_pool_size;
-            ot.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-            ok = try_create_out_pool(ot);
-        }
-        if (!ok) {
-            MCP_LOGF(pal::LogLevel::warn,
-                     "CodecDxvaVideo: out_pool SR-only arr=%u failed; retry SR-only arr=1",
-                     out_pool_size);
-            out_pool_size = 1;
-            out_pool_array_capable = false;
-            ot = td;
-            ot.ArraySize = 1;
-            ot.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-            ok = try_create_out_pool(ot);
-        }
-        if (!ok) {
-            MCP_LOGF(pal::LogLevel::error,
-                     "CodecDxvaVideo: out_pool 全部 fallback 失败 %ux%u", tex_w, tex_h);
-            return E_FAIL;
-        }
-        MCP_LOGF(pal::LogLevel::info,
-                 "CodecDxvaVideo: out_pool ok bind=0x%X arr=%u",
-                 ot.BindFlags, ot.ArraySize);
-
         decoder_inited = true;
         MCP_LOGF(pal::LogLevel::info,
                  "CodecDxvaVideo: decoder ready %ux%u dpb=%u (Annex-B raw=%u)",
@@ -1090,15 +1072,50 @@ struct CodecDxvaVideo::Impl {
     // driver 上可能被误读为"unused slot"(0xFF 是标准 unused 标记,但 0x00 的 Index=0+Flag=0
     // 也是一个有效但语义模糊的边界 case)。让 CurrPic 始终从 DPB[1+]开始,bPicEntry≥0x01,
     // 与 0xFF unused 完全区分。slot 0 不参与 ref/curr,只作为"reserved sentinel"。
+    //
+    // victim 选择必须跳过 h264_ref_list 中所有 dpb_index — 不仅 last_ref_dpb_idx 单一槽。
+    // num_ref_frames=4 时 ref_list 含最多 4 个 ref;若 victim 选中其中任意一个 → ref
+    // texture 数据被新 P 帧解码覆盖 → 后续 P 帧用错误 ref 解码 → 视觉花屏 (彩色错位
+    // 渐变 + 马赛克 macroblock,2026-05-08 root cause #2)。
     UINT alloc_dpb_slot_h264() noexcept {
-        for (UINT i = 1; i < dpb_size; ++i) if (!dpb[i].used) return i;
+        // 第一遍:找未占用、不在 recent_emit ring、且非 anchor 的 slot (优先 — 让
+        // driver 不会在 render 还在 sample 的 in-flight slot 上写新帧)。
+        for (UINT i = 1; i < dpb_size; ++i) {
+            if (i == reserved_anchor_slot) continue;
+            if (!dpb[i].used && !is_recently_emitted(i)) return i;
+        }
         UINT    victim  = UINT_MAX;
         int32_t min_poc = INT32_MAX;
         for (UINT i = 1; i < dpb_size; ++i) {
+            if (i == reserved_anchor_slot) continue;     // anchor 永不被 victim
             if (i == last_ref_dpb_idx) continue;
+            // 跳过 h264_ref_list 中所有引用 — driver 仍需要它们解后续 P 帧。
+            bool in_ref_list = false;
+            for (const auto& r : h264_ref_list) {
+                if (r.used && r.dpb_index == i) { in_ref_list = true; break; }
+            }
+            if (in_ref_list) continue;
+            // 跳过最近 N 个 emit 出去的 slot — render 仍在 sample。
+            if (is_recently_emitted(i)) continue;
             if (dpb[i].poc < min_poc) { min_poc = dpb[i].poc; victim = i; }
         }
-        if (victim == UINT_MAX) victim = 1;
+        // 全部都是 ref 的退化情形:取 ref_list 最旧(尾部) 的 dpb_index 强制覆盖。
+        // 这种情形理论不该出现 (dpb_size >= 16 给 num_ref<=8 留足够余量),作防御。
+        // anchor 永远不被覆盖,即便 ref_list 满了也另选。
+        if (victim == UINT_MAX) {
+            if (!h264_ref_list.empty()) {
+                // 从 ref_list 尾找第一个非 anchor 的 ref。
+                for (auto it = h264_ref_list.rbegin(); it != h264_ref_list.rend(); ++it) {
+                    if (it->dpb_index != reserved_anchor_slot) {
+                        victim = it->dpb_index;
+                        break;
+                    }
+                }
+            }
+            if (victim == UINT_MAX) {
+                victim = (reserved_anchor_slot == 1) ? 2u : 1u;
+            }
+        }
         dpb[victim] = DpbEntry{};
         return victim;
     }
@@ -1250,10 +1267,6 @@ struct CodecDxvaVideo::Impl {
         pp.StatusReportFeedbackNumber = poc + 1;
     }
 
-    bool ensure_output_pool() noexcept {
-        return out_pool != nullptr;
-    }
-
     uint32_t pic_count{0};
     uint32_t emit_count{0};
 
@@ -1349,31 +1362,16 @@ struct CodecDxvaVideo::Impl {
         dpb[cur_dpb_idx].poc  = cur_poc;
         dpb[cur_dpb_idx].output_pending = true;
 
-        // 拷贝 DPB slice → output pool slice(BIND_DECODER → BIND_SHADER_RESOURCE 跨 BindFlag)。
-        // ArraySize=1 fallback pool 时 dst slice 必须是 0;DPB slice 仍按 cur_dpb_idx。
-        // D3D11 NV12 multi-plane:driver 视 (slice) 为 atomic 拷贝 Y+UV 整 NV12 帧,
-        // 不能手动 (slice + ArraySize) 拿 plane 1 subresource — UHD 730 driver crash。
-        const UINT out_slice = out_pool_array_capable ? out_next : 0;
-        if (out_pool_array_capable) {
-            out_next = (out_next + 1) % out_pool_size;
-        }
-        ctx->CopySubresourceRegion(out_pool.Get(), out_slice, 0, 0, 0,
-                                    dpb_tex.Get(), cur_dpb_idx, nullptr);
-        if (trace_first) {
-            MCP_LOGF(pal::LogLevel::info,
-                     "CodecDxvaVideo: flush#%u CopySubresourceRegion done dpb=%u→pool=%u",
-                     pic_count, cur_dpb_idx, out_slice);
-        }
-
-        // emit
+        // emit — 直接传 dpb_tex + cur_dpb_idx,renderer 对 dual-bind DPB 创 SRV
+        // (FirstArraySlice = cur_dpb_idx)。无 CopySubresourceRegion 跨 ctx 同步问题。
         VideoFrame f;
         f.pts_us           = cur_pts_us;
         f.arrival_qpc_ns   = cur_arrival_qpc_ns;
         f.width            = dec_w;
         f.height           = dec_h;
         f.source           = FrameSource::mft_dxva;
-        f.dxva_texture     = out_pool;
-        f.dxva_array_slice = out_slice;
+        f.dxva_texture     = dpb_tex;
+        f.dxva_array_slice = cur_dpb_idx;
         f.is_keyframe      = is_irap(cur_nal_type);
         f.color_primaries  = cur_sps->colour_desc_present ?
                               static_cast<mc_color_primaries_t>(cur_sps->colour_primaries) :
@@ -1392,7 +1390,7 @@ struct CodecDxvaVideo::Impl {
         if (emit_count == 0) {
             MCP_LOGF(pal::LogLevel::info,
                      "CodecDxvaVideo: first frame emit pts=%lld slice=%u poc=%d",
-                     static_cast<long long>(cur_pts_us), out_slice, cur_poc);
+                     static_cast<long long>(cur_pts_us), cur_dpb_idx, cur_poc);
         }
         // 释放 video session lock,emit → controller → gate.admit → render.on_admitted
         // 走 immediate ctx 由 ID3D10Multithread protect 自身保护,不需要 video_session_mu。
@@ -1520,6 +1518,9 @@ struct CodecDxvaVideo::Impl {
         prev_poc_lsb     = 0;
         last_ref_dpb_idx = UINT_MAX;
         last_ref_poc     = 0;
+        reserved_anchor_slot = UINT_MAX;
+        recent_emit_slots.fill(UINT_MAX);
+        recent_emit_head = 0;
 
         // H.264 路径状态同步重置（idr 出现时也会被显式 reset，但 flush() 走这条路径）。
         h264_poc          = h264::PocState{};
@@ -1704,35 +1705,6 @@ struct CodecDxvaVideo::Impl {
         }
         dpb.assign(dpb_size, DpbEntry{});
 
-        // out_pool — 与 HEVC 路径同样三档兜底。
-        out_pool_array_capable = true;
-        D3D11_TEXTURE2D_DESC ot = td;
-        ot.ArraySize = out_pool_size;
-        ot.BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
-        bool ok = try_create_out_pool(ot);
-        if (!ok) {
-            ot = td; ot.ArraySize = out_pool_size; ot.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-            ok = try_create_out_pool(ot);
-        }
-        if (!ok) {
-            out_pool_size = 1; out_pool_array_capable = false;
-            ot = td; ot.ArraySize = 1; ot.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-            ok = try_create_out_pool(ot);
-        }
-        if (!ok) {
-            MCP_LOGF(pal::LogLevel::error,
-                     "CodecDxvaVideo: H.264 out_pool 全部 fallback 失败 %ux%u", tex_w, tex_h);
-            return E_FAIL;
-        }
-
-        // 创建复用 EVENT query,emit 路径每帧 fence wait 用。
-        D3D11_QUERY_DESC qd_evt{};
-        qd_evt.Query = D3D11_QUERY_EVENT;
-        if (FAILED(cfg.device->CreateQuery(&qd_evt, &decode_fence_query))) {
-            MCP_LOG_WARN("CodecDxvaVideo: H.264 CreateQuery(EVENT) 失败 — emit 路径将不等 fence,可能花屏");
-            decode_fence_query.Reset();
-        }
-
         decoder_inited = true;
         MCP_LOGF(pal::LogLevel::info,
                  "CodecDxvaVideo: H.264 decoder ready %ux%u dpb=%u (Annex-B raw=%u) "
@@ -1757,6 +1729,10 @@ struct CodecDxvaVideo::Impl {
         }
         ++pic_count;
         const bool trace_first = pic_count <= 3;
+        // trace_short 给前 8 帧 dump slice_type / nal_ref_idc / ref_list — 诊断 ref 链
+        // 完整性,不需要全 hex bitstream(噪声)。validate ref_list 在 GOP 起始几帧的
+        // 维护正确(IDR + P × N + B 时 RefFrameList 是否含 backward ref 等)。
+        const bool trace_short = pic_count <= 8;
         if (trace_first) {
             MCP_LOGF(pal::LogLevel::info,
                      "CodecDxvaVideo: H.264 flush#%u nal=%u poc=%d dpb=%u slices=%zu bs_bytes=%zu fnum=%u refs=%zu raw=%u",
@@ -1785,6 +1761,38 @@ struct CodecDxvaVideo::Impl {
                          h264_slice_ctrl[k].wBadSliceChopping);
             }
         }
+        if (trace_short) {
+            // slice_type / nal_ref_idc / ref_list 一行 dump — 诊断 GOP 结构 + ref 维护。
+            // slice_type 编码:0=P 1=B 2=I 3=SP 4=SI(已 mod 5);nal_ref_idc 0=disposable
+            // (B 帧候选)>0=ref pic(P/I/IDR)。
+            char rl_hex[16 * 16 + 1] = {0};
+            std::size_t off = 0;
+            for (const auto& r : h264_ref_list) {
+                if (off >= sizeof(rl_hex) - 24) break;
+                int n = std::snprintf(rl_hex + off, sizeof(rl_hex) - off,
+                                       "[s=%u f=%u p=%d%s]",
+                                       r.dpb_index, r.frame_num,
+                                       r.field_order_cnt[0],
+                                       r.long_term ? "L" : "");
+                if (n > 0) off += static_cast<std::size_t>(n);
+            }
+            char anchor_buf[16];
+            const char* anchor_str = "none";
+            if (reserved_anchor_slot != UINT_MAX) {
+                std::snprintf(anchor_buf, sizeof(anchor_buf), "%u", reserved_anchor_slot);
+                anchor_str = anchor_buf;
+            }
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecDxvaVideo: H.264 flush#%u slice_type=%u nal_ref_idc=%u "
+                     "num_ref_idx_l0=%u l1=%u override=%u direct_spatial=%u "
+                     "ref_list=%s anchor_slot=%s",
+                     pic_count, cur_h264_slice_hdr.slice_type, cur_h264_nal_ref_idc,
+                     cur_h264_slice_hdr.num_ref_idx_l0_active_minus1,
+                     cur_h264_slice_hdr.num_ref_idx_l1_active_minus1,
+                     cur_h264_slice_hdr.num_ref_idx_active_override_flag,
+                     cur_h264_slice_hdr.direct_spatial_mv_pred_flag,
+                     rl_hex[0] ? rl_hex : "(empty)", anchor_str);
+        }
 
         // 把 deque 转 contiguous span 给 fill_pic_params（最多 16 ref）。
         std::array<h264::RefPic, 16> refs_arr{};
@@ -1796,19 +1804,11 @@ struct CodecDxvaVideo::Impl {
         ++h264_status_report_id;
         if (h264_status_report_id == 0) h264_status_report_id = 1;
         DXVA_PicParams_H264 pp{};
+        // 使用真实 cur_h264_slice_hdr (含 num_ref_idx_l0/l1_active_minus1 slice override
+        // 后值 + direct_spatial_mv_pred_flag B 帧标志)。删除伪造 SliceHdr (slice_type=0
+        // 让 driver 在 B 帧 + slice override 流上 ref count 错配 → 局部 macroblock 花屏)。
         h264::fill_pic_params(pp, *cur_h264_sps, *cur_h264_pps,
-                                /*sh=*/h264::SliceHdr{ /*first_mb_in_slice=*/0,
-                                                        /*slice_type=*/0,
-                                                        /*pps_id=*/cur_h264_pps->id,
-                                                        /*colour_plane_id=*/0,
-                                                        /*frame_num=*/cur_h264_frame_num,
-                                                        /*field_pic_flag=*/0,
-                                                        /*bottom_field_flag=*/0,
-                                                        /*idr_pic_id=*/0,
-                                                        /*pic_order_cnt_lsb=*/0,
-                                                        /*delta_pic_order_cnt_bottom=*/0,
-                                                        {},
-                                                        true},
+                                cur_h264_slice_hdr,
                                 cur_nal_type, cur_h264_nal_ref_idc,
                                 cur_dpb_idx, cur_poc, cur_h264_frame_num,
                                 std::span<const h264::RefPic>{refs_arr.data(), n_refs},
@@ -1837,16 +1837,21 @@ struct CodecDxvaVideo::Impl {
             return SUCCEEDED(video_ctx->ReleaseDecoderBuffer(decoder.Get(), type));
         };
 
-        // PicParams 字节级 dump(首帧),用于 spec 对照核验各字段在期望偏移上的值。
-        if (pic_count == 1) {
+        // PicParams 字节级 dump(前 3 帧),用于 spec 对照核验 RefFrameList / FrameNumList /
+        // FieldOrderCntList 在 IDR / 第一个 P / 第一个 B 时的填充。第 1 帧的 .bin 落盘以
+        // 便用 ffmpeg/Intel Media SDK 工具离线对照;后续帧只 hex 一行打印。
+        if (pic_count <= 3) {
             char path[64];
-            std::snprintf(path, sizeof(path), "dxva-h264-picparams%u.bin", pic_count);
-            if (FILE* fp = std::fopen(path, "wb")) {
-                std::fwrite(&pp, 1, sizeof(pp), fp);
-                std::fclose(fp);
-                MCP_LOGF(pal::LogLevel::info,
-                         "CodecDxvaVideo: H.264 dumped PicParams (%zu bytes) to %s",
-                         sizeof(pp), path);
+            // 仅 pic_count==1 落盘.bin(diag 用),后续 2/3 仅 hex 一行 + 关键字段。
+            if (pic_count == 1) {
+                std::snprintf(path, sizeof(path), "dxva-h264-picparams%u.bin", pic_count);
+                if (FILE* fp = std::fopen(path, "wb")) {
+                    std::fwrite(&pp, 1, sizeof(pp), fp);
+                    std::fclose(fp);
+                    MCP_LOGF(pal::LogLevel::info,
+                             "CodecDxvaVideo: H.264 dumped PicParams (%zu bytes) to %s",
+                             sizeof(pp), path);
+                }
             }
             // 关键字段 hex 一行打印 — 按 SDK 头文件偏移逐字段对照。
             const auto* pb = reinterpret_cast<const uint8_t*>(&pp);
@@ -1918,17 +1923,80 @@ struct CodecDxvaVideo::Impl {
             for (int j = 0; j < 64; ++j) qm.bScalingLists8x8[i][j] = 16;
 
         // 调用顺序对齐 ffmpeg/libavcodec/dxva2.c::ff_dxva2_common_end_frame:
-        // PP → IQM → BS → SC。Intel UHD 730 driver 实测对顺序敏感:SC 在 BS 之前 Get
-        // 会让 driver 在 BS Get 时拒绝 PP/QM(driver 内部 reorder pending state)。
+        // PP → IQM → BS → SC。Intel UHD 730 driver 实测对顺序敏感。
         const bool ok_pp = submit_buffer(D3D11_VIDEO_DECODER_BUFFER_PICTURE_PARAMETERS,
                                           &pp, sizeof(pp));
         const bool ok_qm = submit_buffer(D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX,
                                           &qm, sizeof(qm));
-        const bool ok_bs = submit_buffer(D3D11_VIDEO_DECODER_BUFFER_BITSTREAM,
-                                          bitstream_buf.data(), bitstream_buf.size());
-        const bool ok_sc = submit_buffer(D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL,
-                                          h264_slice_ctrl.data(),
-                                          h264_slice_ctrl.size() * sizeof(DXVA_Slice_H264_Short));
+
+        // commit_bitstream_and_slice_buffer (ffmpeg dxva2_h264.c:302-443 完整对齐):
+        //   1. GetDecoderBuffer(BITSTREAM, &dxva_size, &dxva_data)
+        //   2. 对每个 slice:
+        //      - 写 3-byte start code (`00 00 01`) 到 dxva_data + offset
+        //      - 写 raw NAL data (从 bitstream_buf[BSNALunitDataLocation], size=SliceBytesInBuffer)
+        //      - 重写 slice_ctrl[i].BSNALunitDataLocation = current - dxva_data
+        //      - 重写 slice_ctrl[i].SliceBytesInBuffer    = 3 + raw_size
+        //   3. 末 slice padding zeros 到 128-byte 对齐,**SliceBytesInBuffer += padding**
+        //   4. ReleaseDecoderBuffer
+        //   5. SubmitDecoderBuffers:bd[BS].DataSize = current - dxva_data (含 padding)
+        // 这是 mc-player 与 ffmpeg 解码路径**字节级对齐的最后一环**。之前 bitstream_buf
+        // 含 4-byte SC + 直接 memcpy 提交 = 不对齐 ffmpeg。
+        UINT  dxva_bs_size_avail = 0;
+        void* dxva_bs_ptr        = nullptr;
+        bool  ok_bs              = false;
+        UINT  dxva_bs_used       = 0;
+        if (SUCCEEDED(video_ctx->GetDecoderBuffer(decoder.Get(),
+                                                   D3D11_VIDEO_DECODER_BUFFER_BITSTREAM,
+                                                   &dxva_bs_size_avail, &dxva_bs_ptr))) {
+            uint8_t* const dxva_data = static_cast<uint8_t*>(dxva_bs_ptr);
+            uint8_t*       current   = dxva_data;
+            uint8_t* const end_buf   = dxva_data + dxva_bs_size_avail;
+            const uint8_t  start_code[3] = { 0, 0, 1 };
+            constexpr UINT sc_size = 3;
+            bool overflow = false;
+            for (auto& sc : h264_slice_ctrl) {
+                const UINT raw_size = sc.SliceBytesInBuffer;
+                if (sc_size + raw_size > static_cast<UINT>(end_buf - current)) {
+                    overflow = true;
+                    break;
+                }
+                const UINT new_loc = static_cast<UINT>(current - dxva_data);
+                std::memcpy(current, start_code, sc_size);
+                current += sc_size;
+                std::memcpy(current, bitstream_buf.data() + sc.BSNALunitDataLocation, raw_size);
+                current += raw_size;
+                sc.BSNALunitDataLocation = new_loc;
+                sc.SliceBytesInBuffer    = sc_size + raw_size;
+            }
+            if (!overflow && !h264_slice_ctrl.empty()) {
+                // 末 slice padding (ffmpeg dxva2_h264.c:386-392 一致):
+                //   padding = min(128 - ((current - dxva_data) & 127), end - current)
+                //   memset(current, 0, padding); current += padding
+                //   slice.SliceBytesInBuffer += padding
+                const UINT cur_off = static_cast<UINT>(current - dxva_data);
+                const UINT remain  = static_cast<UINT>(end_buf - current);
+                UINT padding       = (128u - (cur_off & 127u)) & 127u;
+                if (padding > remain) padding = remain;
+                if (padding > 0) {
+                    std::memset(current, 0, padding);
+                    current += padding;
+                    h264_slice_ctrl.back().SliceBytesInBuffer += padding;
+                }
+            }
+            dxva_bs_used = static_cast<UINT>(current - dxva_data);
+            ok_bs = SUCCEEDED(video_ctx->ReleaseDecoderBuffer(decoder.Get(),
+                                                                D3D11_VIDEO_DECODER_BUFFER_BITSTREAM));
+            if (overflow) {
+                MCP_LOGF(pal::LogLevel::warn,
+                         "CodecDxvaVideo: H.264 BS buffer overflow: avail=%u need~%zu",
+                         dxva_bs_size_avail, bitstream_buf.size() + h264_slice_ctrl.size() * 3);
+                ok_bs = false;
+            }
+        }
+        const bool ok_sc = ok_bs &&
+            submit_buffer(D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL,
+                          h264_slice_ctrl.data(),
+                          h264_slice_ctrl.size() * sizeof(DXVA_Slice_H264_Short));
 
         if (ok_pp && ok_qm && ok_sc && ok_bs) {
             D3D11_VIDEO_DECODER_BUFFER_DESC bd[4]{};
@@ -1936,10 +2004,10 @@ struct CodecDxvaVideo::Impl {
             bd[0].DataSize   = sizeof(pp);
             bd[1].BufferType = D3D11_VIDEO_DECODER_BUFFER_INVERSE_QUANTIZATION_MATRIX;
             bd[1].DataSize   = sizeof(qm);
-            bd[2].BufferType = D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL;
-            bd[2].DataSize   = static_cast<UINT>(h264_slice_ctrl.size() * sizeof(DXVA_Slice_H264_Short));
-            bd[3].BufferType = D3D11_VIDEO_DECODER_BUFFER_BITSTREAM;
-            bd[3].DataSize   = static_cast<UINT>(bitstream_buf.size());
+            bd[2].BufferType = D3D11_VIDEO_DECODER_BUFFER_BITSTREAM;
+            bd[2].DataSize   = dxva_bs_used;
+            bd[3].BufferType = D3D11_VIDEO_DECODER_BUFFER_SLICE_CONTROL;
+            bd[3].DataSize   = static_cast<UINT>(h264_slice_ctrl.size() * sizeof(DXVA_Slice_H264_Short));
             hr = video_ctx->SubmitDecoderBuffers(decoder.Get(), 4, bd);
             const bool have_vctx1 = false;     // SubmitDecoderBuffers1 测试无差异,回归 legacy。
             if (FAILED(hr)) {
@@ -1974,45 +2042,21 @@ struct CodecDxvaVideo::Impl {
             drain_d3d11_messages(tag);
         }
 
-        // ID3D11Query(EVENT) fence wait — DecoderEndFrame 在 immediate context 命令队列
-        // 上是异步入队;后续 CopySubresourceRegion(DPB → out_pool)若不等 video decode
-        // 真完成,driver 把 partial-written DPB 拷给 render 端 → out_pool 含 Y plane
-        // 顶部已写、UV plane 未写的混合内容 → render sample 出花屏(顶部真实图、下部
-        // UV 错位渐变)。Intel UHD 730 上 trace_first 实测首帧 spin=10000 才 done;
-        // 后续帧 spin~3-5k = 微秒级,生产路径加此等待对 30fps throughput 影响可忽略。
-        if (decode_fence_query) {
-            ctx->End(decode_fence_query.Get());
-            BOOL done = FALSE;
-            int  spin = 0;
-            while (ctx->GetData(decode_fence_query.Get(), &done, sizeof(done), 0) == S_FALSE
-                   && spin < 100000) {
-                ++spin;
-            }
-            if (trace_first) {
-                MCP_LOGF(pal::LogLevel::info,
-                         "CodecDxvaVideo: H.264 emit fence#%u done=%d spin=%d",
-                         pic_count, done ? 1 : 0, spin);
-            }
-        }
-
         // 标记 DPB 槽
         dpb[cur_dpb_idx].used = true;
         dpb[cur_dpb_idx].poc  = cur_poc;
         dpb[cur_dpb_idx].output_pending = true;
 
-        const UINT out_slice = out_pool_array_capable ? out_next : 0;
-        if (out_pool_array_capable) {
-            out_next = (out_next + 1) % out_pool_size;
-        }
-        // D3D11 NV12 array texture CopySubresourceRegion:driver 实际把 (slice) 视为
-        // atomic NV12 帧拷贝(plane 0 + plane 1 一起),Microsoft D3D11 runtime 通过
-        // ArraySize 直接告 driver 总共 N 个 NV12 slot,driver 内部按 (Y plane, UV plane)
-        // 联动写。手动加 plane 1 subresource(slice+ArraySize)在某些 driver 上是 invalid
-        // subresource → DXGI_ERROR_INVALID_CALL → RaiseException 0x087d driver crash
-        // (UHD 730 Win11 IoT LTSC 实测)。回归单 call,紫色花屏改用其他 plane 成因排查
-        // (out_pool ArraySize 跟 dpb 不同 / SRV1 PlaneSlice race / shader UV 采样路径)。
-        ctx->CopySubresourceRegion(out_pool.Get(), out_slice, 0, 0, 0,
-                                    dpb_tex.Get(), cur_dpb_idx, nullptr);
+        // ADR-003 零拷贝:不再 CopySubresourceRegion 到 out_pool 中间层。
+        // 历史:跨 video_ctx (DecoderEndFrame, vendor private engine) ↔ immediate ctx
+        // (CopySubresourceRegion, 3D engine) 在 Intel UHD 730 driver 上未被同步 —
+        // EVENT query 是 submission-complete 而非 execution-complete,fence_done=TRUE
+        // 但 video engine 实际还在写 DPB → 拷出 partial NV12 → 紫色花屏 / Y 顶部全 0
+        // (mc-player.log 实测:fence#3 spin=433≈50µs 远小于 fence#1 spin=32398≈3ms,
+        // readback#3 Y[0..15]=00 全 0 即跨 engine 同步失效证据)。
+        // 现在直接 emit dpb_tex + cur_dpb_idx,renderer 对 dual-bind DPB 创 SRV
+        // (FirstArraySlice = cur_dpb_idx),D3D11 runtime 在 shader sample 前自动等
+        // decode 完成 (resource state tracking 同 texture 上有效)。
 
         // 把首帧 bitstream 同步落盘,可独立用 ffmpeg/ffplay 验证编码是否正确。
         if (pic_count == 1) {
@@ -2025,32 +2069,15 @@ struct CodecDxvaVideo::Impl {
             }
         }
 
+        // 注:之前曾加 1×1 staging Map sync 强制 driver 真完成 video decode 才 emit。
+        // 但 ffmpeg-aligned commit_bitstream_and_slice_buffer 修复(buffer-internal 3-byte
+        // SC + 重写 BSNALunitDataLocation/SliceBytesInBuffer + last slice padding)生效后,
+        // driver 内部状态对齐 ffmpeg/VLC 路径,D3D11 runtime resource state tracking 在
+        // dual-bind dpb_tex 上正确等 video decode 完成才让 SRV sample → 不需要显式 sync。
+        // 移除以减少每帧 ~80µs 开销。Trace_first 路径仍保留 readback 用于诊断。
+
         // 首 3 帧 NV12 内容 readback — 验证 driver 是否真的写入了 DPB 纹理。
-        // 步骤:DecoderEndFrame → ID3D11Query(EVENT) flush 等待 GPU 命令队列(含 video
-        // decode engine)真完成 → CopySubresourceRegion DPB → staging → Map READ 求和。
-        //
-        // ID3D11Query(EVENT) 是诊断 silent fail 关键工具:D3D11 spec 文档表明 video context
-        // 命令进 immediate context 队列,EVENT query 应当能等到 video decode 完成。但
-        // Intel UHD 730 IoT LTSC 实测:不加 EVENT query → readback 全 0;加了 → 真实
-        // 像素出现。说明 driver 把 video decode 走 vendor 私有 engine,immediate context
-        // 在 EndFrame 返回时未必看到 fence。EVENT query 强制 GPU side 全队列 flush 。
         if (trace_first) {
-            ComPtr<ID3D11Query> evt_query;
-            D3D11_QUERY_DESC qd{};
-            qd.Query = D3D11_QUERY_EVENT;
-            qd.MiscFlags = 0;
-            HRESULT hr_q = cfg.device->CreateQuery(&qd, &evt_query);
-            if (SUCCEEDED(hr_q)) {
-                ctx->End(evt_query.Get());
-                BOOL  done = FALSE;
-                int   spin = 0;
-                while (ctx->GetData(evt_query.Get(), &done, sizeof(done), 0) == S_FALSE && spin < 10000) {
-                    ++spin;
-                }
-                MCP_LOGF(pal::LogLevel::info,
-                         "CodecDxvaVideo: H.264 EVENT query#%u done=%d spin=%d",
-                         pic_count, done ? 1 : 0, spin);
-            }
 
             ComPtr<ID3D11Texture2D> staging;
             D3D11_TEXTURE2D_DESC sd{};
@@ -2088,21 +2115,38 @@ struct CodecDxvaVideo::Impl {
                             if (b != 128) ++nonconst_count;
                         }
                     }
-                    // 取首行像素 hex 一段,直接判定 driver 写入了什么。
+                    // 取首行 / 中间行 / 倒数第 16 行的前 16 字节 — 验证 driver 是否
+                    // 写完整 Y plane(顶部全 0 + 中间有数据 = partial decode,driver 漏 MB)。
                     char first_row_hex[16 * 3 + 1] = {0};
+                    char mid_row_hex[16 * 3 + 1] = {0};
+                    char last_row_hex[16 * 3 + 1] = {0};
+                    const UINT mid_r  = dec_h / 2;
+                    const UINT last_r = (dec_h > 16) ? (dec_h - 16) : 0;
+                    const uint8_t* mid_row  = y_base + static_cast<std::size_t>(mid_r)  * m.RowPitch;
+                    const uint8_t* last_row = y_base + static_cast<std::size_t>(last_r) * m.RowPitch;
                     for (UINT c = 0; c < 16; ++c) {
                         std::snprintf(first_row_hex + c * 3, 4, "%02X ", y_base[c]);
+                        std::snprintf(mid_row_hex   + c * 3, 4, "%02X ", mid_row[c]);
+                        std::snprintf(last_row_hex  + c * 3, 4, "%02X ", last_row[c]);
                     }
                     MCP_LOGF(pal::LogLevel::info,
                              "CodecDxvaVideo: H.264 NV12 readback#%u Y全图[step=%u n=%u] "
-                             "sum=%llu avg=%llu min=%u max=%u nonconst=%llu/%u (%.1f%%) Y[0..15]=%s",
+                             "sum=%llu avg=%llu min=%u max=%u nonconst=%llu/%u (%.1f%%)",
                              pic_count, step, n_sampled,
                              static_cast<unsigned long long>(y_sum),
                              n_sampled ? static_cast<unsigned long long>(y_sum / n_sampled) : 0ull,
                              y_min, y_max,
                              static_cast<unsigned long long>(nonconst_count), n_sampled,
-                             n_sampled ? 100.0 * nonconst_count / n_sampled : 0.0,
-                             first_row_hex);
+                             n_sampled ? 100.0 * nonconst_count / n_sampled : 0.0);
+                    MCP_LOGF(pal::LogLevel::info,
+                             "CodecDxvaVideo: H.264 NV12 readback#%u Y[r=0    ,0..15]=%s",
+                             pic_count, first_row_hex);
+                    MCP_LOGF(pal::LogLevel::info,
+                             "CodecDxvaVideo: H.264 NV12 readback#%u Y[r=%-4u,0..15]=%s",
+                             pic_count, mid_r, mid_row_hex);
+                    MCP_LOGF(pal::LogLevel::info,
+                             "CodecDxvaVideo: H.264 NV12 readback#%u Y[r=%-4u,0..15]=%s",
+                             pic_count, last_r, last_row_hex);
                     ctx->Unmap(staging.Get(), 0);
                 } else {
                     MCP_LOGF(pal::LogLevel::warn,
@@ -2116,15 +2160,15 @@ struct CodecDxvaVideo::Impl {
             }
         }
 
-        // emit
+        // emit — 零拷贝路径:dxva_texture 直接是 dpb_tex,array_slice 即 cur_dpb_idx。
         VideoFrame f;
         f.pts_us           = cur_pts_us;
         f.arrival_qpc_ns   = cur_arrival_qpc_ns;
         f.width            = dec_w;
         f.height           = dec_h;
         f.source           = FrameSource::mft_dxva;
-        f.dxva_texture     = out_pool;
-        f.dxva_array_slice = out_slice;
+        f.dxva_texture     = dpb_tex;
+        f.dxva_array_slice = cur_dpb_idx;
         f.is_keyframe      = h264::is_idr(cur_nal_type);
         f.color_primaries  = cur_h264_sps->colour_description_present_flag ?
                               static_cast<mc_color_primaries_t>(cur_h264_sps->colour_primaries) :
@@ -2135,6 +2179,9 @@ struct CodecDxvaVideo::Impl {
         f.color_range      = cur_h264_sps->video_full_range_flag ? MC_COLOR_RANGE_FULL : MC_COLOR_RANGE_LIMITED;
         const bool idr_now    = h264::is_idr(cur_nal_type);
         const bool refs_armed = idr_now || !h264_ref_list.empty();
+        // 零拷贝后 D3D11 runtime 自动同步 shader sample 与 decode,kValidityFence 常 set
+        // (保持 6-bit 契约不破坏 frame_validity_gate)。trace_first readback 仍能验证
+        // driver silent fail (Y[0..15] 全 0 = driver 没真写 DPB)。
         uint32_t mask = kValidityParams | kValidityColor | kValidityReorder | kValidityFence;
         if (refs_armed) mask |= kValidityRefs | kValidityRecovery;
         f.validity_mask = mask;
@@ -2142,7 +2189,7 @@ struct CodecDxvaVideo::Impl {
             MCP_LOGF(pal::LogLevel::info,
                      "CodecDxvaVideo: H.264 emit #%u pts=%lld slice=%u poc=%d fnum=%u "
                      "validity_mask=0x%02X is_keyframe=%d refs_armed=%d",
-                     emit_count + 1, static_cast<long long>(cur_pts_us), out_slice, cur_poc,
+                     emit_count + 1, static_cast<long long>(cur_pts_us), cur_dpb_idx, cur_poc,
                      cur_h264_frame_num, f.validity_mask, f.is_keyframe, refs_armed);
         }
         // 释放 video session lock — emit → render 走 immediate ctx 自身的 ID3D10Multithread
@@ -2150,6 +2197,21 @@ struct CodecDxvaVideo::Impl {
         if (session_lock.owns_lock()) session_lock.unlock();
         if (cfg.emit) cfg.emit(std::move(f));
         ++emit_count;
+        // 标记此 slot 最近 emit (kRecentEmitN=4 帧内 alloc victim 跳过它,防止
+        // driver 写新帧覆盖 render 仍在 sample 的 slot → 花屏)。
+        note_emit_slot(cur_dpb_idx);
+        // IDR emit 后 reserve cur_dpb_idx 为长期锚点 — renderer last_good 持有
+        // (dpb_tex, slice=cur_dpb_idx) 引用,该 slot 必须永远稳定承载 IDR 数据,
+        // 直到下一 IDR 到来释放。alloc_dpb_slot_h264 检查 reserved_anchor_slot
+        // 永远跳过它(victim 选择第一/第二遍 + 兜底分支均跳过)。这与 VLC
+        // picture_pool refcount 同等效果,简化为单 anchor。
+        if (idr_now) {
+            reserved_anchor_slot = cur_dpb_idx;
+            MCP_LOGF(pal::LogLevel::info,
+                     "CodecDxvaVideo: H.264 anchor reserved slot=%u (IDR poc=%d fnum=%u) "
+                     "— last_good 长期保护点,alloc_dpb_slot 永远跳过",
+                     cur_dpb_idx, cur_poc, cur_h264_frame_num);
+        }
 
         // 更新 ref list：当前为 reference frame (nal_ref_idc!=0) 才入栈，IDR 时清空整条链。
         if (idr_now) h264_ref_list.clear();
@@ -2187,6 +2249,9 @@ struct CodecDxvaVideo::Impl {
         }
         std::size_t i = find_start_code(au, 0);
         while (i < au.size()) {
+            // Intel UHD 730 driver 在 raw=2 模式实测要求 4-byte start code
+            // (`00 00 00 01`,leading 0x00 + 3-byte SC) — 缺 leading 0x00 整图
+            // 解码 0x14。RTSP IPC 流自然就是 4-byte SC,保留之。
             const bool        leading_zero = (i > 0 && au[i - 1] == 0);
             const std::size_t sc_start     = leading_zero ? i - 1 : i;
             const std::size_t nal_start    = i + 3;
@@ -2294,14 +2359,19 @@ struct CodecDxvaVideo::Impl {
                         cur_pts_us           = pts_us;
                         cur_arrival_qpc_ns   = arrival_qpc_ns;
                         cur_h264_frame_num   = sh.frame_num;
+                        cur_h264_slice_hdr   = sh;     // 保存真实 first slice header
                         // IDR 时按 spec §8.2.4.3 标记所有 ref unused for ref。
+                        // 释放旧 anchor reservation — 旧 IDR 不再被任何持续 ref,
+                        // alloc 可重新选用旧 anchor 的 slot;新 IDR 的 anchor reservation
+                        // 在 emit 之后设(此时 cur_dpb_idx 才确定)。
                         if (h264::is_idr(nal_type)) {
                             for (auto& e : dpb) e.used = false;
                             h264_ref_list.clear();
                             h264_poc = h264::PocState{};
+                            reserved_anchor_slot = UINT_MAX;
                         }
                         cur_poc     = h264::compute_poc(h264_poc, s, sh, nal_type, nal_ref_idc);
-                        cur_dpb_idx = alloc_dpb_slot();
+                        cur_dpb_idx = alloc_dpb_slot_h264();
                         bitstream_buf.clear();
                         h264_slice_ctrl.clear();
                         has_pic = true;
@@ -2309,25 +2379,29 @@ struct CodecDxvaVideo::Impl {
 
                     if (!has_pic) break;
 
-                    // bitstream 累积形态依 picked cfg.ConfigBitstreamRaw 选择:
-                    //   raw=1: Annex-B include start code,SliceBytesInBuffer 含 SC;
-                    //   raw=2: 仅 NAL header+RBSP 不含 SC,driver 内部加 — ffmpeg/VLC
-                    //          H.264 默认走此模式 (Intel/AMD/NV 三厂 driver 都按 raw=2
-                    //          实测,raw=1 在部分 driver 上 silent fail 见 ADR-022)。
-                    // BSNALunitDataLocation 始终指向 bitstream_buf 中本切片起始 offset。
-                    const std::size_t nal_only_off  = nal_start - sc_start;     // SC 长度 (3/4)
-                    const auto*       payload_ptr   = (cfg_bitstream_raw == 2) ?
-                                                       (nal_full.data() + nal_only_off) :
-                                                       nal_full.data();
-                    const std::size_t payload_size  = (cfg_bitstream_raw == 2) ?
-                                                       (nal_full.size() - nal_only_off) :
-                                                       nal_full.size();
+                    // 完整对齐 ffmpeg dxva2_h264.c::dxva2_h264_decode_slice:
+                    //   bitstream_buf 储 raw EBSP NAL data **不含 start code prefix**,
+                    //   slice_ctrl[i].BSNALunitDataLocation = NAL 在 bitstream_buf 中 offset,
+                    //   slice_ctrl[i].SliceBytesInBuffer    = raw NAL size (no SC).
+                    // 真正的 dxva BITSTREAM buffer 由 commit_bitstream_and_slice_buffer 在
+                    // flush 时构造:GetDecoderBuffer + per-slice [3-byte SC + raw NAL] +
+                    //   tail padding;同时把 slice_ctrl[i] 的 BSNALunitDataLocation/SliceBytesInBuffer
+                    //   重写为 driver buffer 中的实际位置/含 SC + padding 的大小。
+                    // ebsp 是 nal_start+1..end,即跳过 NAL header 后的 RBSP_with_EPB(emulation
+                    // prevention byte 不 strip,driver 自行处理)。但 ffmpeg 的 buffer 是 NAL
+                    // header 起点,我们也对齐:用 nal_full minus leading start code prefix。
+                    const std::size_t sc_byte_count = (sc_start < i) ? (i + 3 - sc_start)
+                                                                     : 3;     // 3 or 4
+                    const std::size_t raw_nal_off   = sc_start + sc_byte_count;     // 跳过 SC
+                    const std::size_t raw_nal_size  = (sc_start + nal_full.size()) - raw_nal_off;
                     DXVA_Slice_H264_Short sc{};
                     sc.BSNALunitDataLocation = static_cast<UINT>(bitstream_buf.size());
-                    sc.SliceBytesInBuffer    = static_cast<UINT>(payload_size);
+                    sc.SliceBytesInBuffer    = static_cast<UINT>(raw_nal_size);
                     sc.wBadSliceChopping     = 0;
-                    bitstream_buf.insert(bitstream_buf.end(), payload_ptr,
-                                         payload_ptr + payload_size);
+                    // 累积 raw NAL 字节 (NAL header + RBSP_with_EPB),**不**含 start code。
+                    bitstream_buf.insert(bitstream_buf.end(),
+                                          au.begin() + raw_nal_off,
+                                          au.begin() + raw_nal_off + raw_nal_size);
                     h264_slice_ctrl.push_back(sc);
                     break;
                 }
@@ -2340,9 +2414,12 @@ struct CodecDxvaVideo::Impl {
             const std::size_t pad   = (align - (bitstream_buf.size() % align)) % align;
             bitstream_buf.insert(bitstream_buf.end(), pad, 0);
             // 注:之前尝试过 ffmpeg 风格 last_slice.SliceBytesInBuffer += pad,
-            // 但实测让 Intel UHD 730 driver 解码出 decode_error → gate poison drop
-            // 50% 帧。本 driver 似乎更喜欢 SliceBytesInBuffer 严格等于真实 NAL+起始码
-            // 长度,不含 padding。padding 字节存在于 bitstream buffer 但不计入 slice。
+            // 但实测让 Intel UHD 730 driver 解码出 IDR 顶部 Y 全 0x80(均匀灰),
+            // 因为 driver 把 padding 当 slice data 解析 → first slice 数据被多个
+            // 0x00 字节覆盖 → DCT 系数全 0 → 还原出中性灰。padding 字节存在于
+            // bitstream buffer 但不计入 slice。FFmpeg 那条路径在 Intel 集显上的实
+            // 测 OK 可能依赖于其他配套字段(start code 长度、bitstream 不含 sc 等),
+            // 单独移植此一项会破坏。
             flush_pending_pic_h264();
         }
     }
@@ -2351,7 +2428,6 @@ struct CodecDxvaVideo::Impl {
         decoder.Reset();
         dpb_views.clear();
         dpb_tex.Reset();
-        out_pool.Reset();
         video_ctx.Reset();
         video_device.Reset();
         ctx.Reset();
