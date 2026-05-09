@@ -51,8 +51,11 @@ public:
     /// 等待 Present 调度时机；返回 true = 可 Present。
     bool wait_for_frame_latency(uint32_t timeout_ms) noexcept;
 
-    /// 单次 Present。allow_tearing 控制 PRESENT_ALLOW_TEARING 标志。
-    mc_status_t present(bool allow_tearing) noexcept;
+    /// 单次 Present。
+    /// sync_interval:DXGI Present1 SyncInterval。
+    ///   0 = 立即 Present(不锁 vsync);1 = 等 1 vsync;2 = 等 2 vsync(30fps@60Hz frame doubling)。
+    /// allow_tearing:仅 sync_interval=0 时生效(Present1 限制 SyncInterval>0 不能 ALLOW_TEARING)。
+    mc_status_t present(uint32_t sync_interval, bool allow_tearing) noexcept;
 
     [[nodiscard]] mc_render_profile_t active_profile() const noexcept { return active_profile_; }
     [[nodiscard]] mc_present_mode_t   active_present_mode() const noexcept { return active_present_mode_; }

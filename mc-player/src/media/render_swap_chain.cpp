@@ -136,12 +136,14 @@ bool SwapChain::wait_for_frame_latency(uint32_t timeout_ms) noexcept {
     return ::WaitForSingleObjectEx(waitable_, timeout_ms, TRUE) == WAIT_OBJECT_0;
 }
 
-mc_status_t SwapChain::present(bool allow_tearing) noexcept {
+mc_status_t SwapChain::present(uint32_t sync_interval, bool allow_tearing) noexcept {
     if (!swap_chain_) return MC_ERR_INVALID_STATE;
     UINT flags = 0;
-    if (allow_tearing) flags |= DXGI_PRESENT_ALLOW_TEARING;
+    // DXGI 限制:SyncInterval>0 与 PRESENT_ALLOW_TEARING 互斥。仅 sync_interval=0 时
+    // 才允许 tearing,否则用 vsync 锁帧(SyncInterval=1/2 让 GPU 锁 1/2 vsync 周期)。
+    if (sync_interval == 0 && allow_tearing) flags |= DXGI_PRESENT_ALLOW_TEARING;
     DXGI_PRESENT_PARAMETERS pp{};
-    HRESULT hr = swap_chain_->Present1(allow_tearing ? 0 : 1, flags, &pp);
+    HRESULT hr = swap_chain_->Present1(sync_interval, flags, &pp);
     if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
         return MC_ERR_DEVICE_LOST;
     }
